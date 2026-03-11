@@ -12,6 +12,7 @@ pub struct Literal{
 impl fmt::Display for Literal{
 	fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
 		let sign = if self.negative {"¬"} else {""};
+		
 		write!(f,"{}{}",sign,self.variable.borrow())
 	}
 }
@@ -44,9 +45,10 @@ impl Literal{
 	
 	pub fn eval(&self)->Option<bool>{
 		let variable = self.variable.borrow();
-		if variable.already_assigned(){
-			return Some(self.negative ^ variable.get_value())
+		if let Some(value) = variable.get_value() {
+			return Some(self.negative ^ value)
 		}
+		
 		None
 	}
 	
@@ -62,11 +64,13 @@ impl Literal{
 		variable.assign(value);
 	}
 	
+	pub fn is_negated(&self)->bool{
+        self.negative
+    }
+	
 	pub fn already_assigned(&self)->bool{
 		let variable = self.variable.borrow();
 		
 		variable.already_assigned()
 	}
-
-	
 }

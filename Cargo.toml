@@ -3,4 +3,12 @@ name = "sat-playground"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "clsat"
+crate-type = ["cdylib","rlib"]
+
 [dependencies]
+pyo3 = {version =  "0.28.2", features = ["extension-module","experimental-inspect"]}
+
+[build-dependencies]
+pyo3-build-config = "0.28.2"

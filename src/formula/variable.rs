@@ -3,8 +3,7 @@ use std::fmt;
 #[derive(Clone)]
 pub struct Variable{
 	index: u64,
-	value: bool,
-	assigned: bool,
+	value: Option<bool>
 }
 	
 
@@ -22,13 +21,12 @@ impl fmt::Debug for Variable{
 
 impl Variable{
 	/// Creates a new variable with a given index meaning the variable is x_<index>, 
-	/// with value <value> = {true,false} (put false if not yet assigned) 
-	/// and if assigned at creation time put <assigned> to true.
-	pub fn new(index: u64, value: bool, assigned: bool)->Self{
+	/// with value <value> = {true,false,None} (put None if not yet assigned) 
+	pub fn new(index: u64, value: Option<bool>)->Self{
+	
 		Self {
 			index: index,
 			value: value,
-			assigned: assigned
 		}
 	}
 	
@@ -43,16 +41,19 @@ impl Variable{
 	
 	/// Assigns the value to the variable, nothing happens if it is already assigned, use already_assigned() to check
 	pub fn assign(&mut self, value: bool){
-		self.value = value;
-		self.assigned = true;
+		self.value = Some(value);
 	}
 	
-	pub fn get_value(&self)->bool {
+	pub fn get_value(&self)->Option<bool> {
 		self.value
 	}
 	
 	pub fn already_assigned(&self)->bool{
-		self.assigned
+	    if self.value.is_some() {
+            return true;
+        }
+        
+        false
 	}
 	
 	pub fn get_index(&self)->u64{

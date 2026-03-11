@@ -1,1 +1,8 @@
 /target
+.DS_Store
+.venv
+.zed
+.ropeproject
+clsat/__pycache__
+clsat/*.so
+clsat/libclsat.dylib.dSYM

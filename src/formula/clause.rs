@@ -1,7 +1,8 @@
-use super::literal::Literal;
-use std::fmt;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use super::literal::Literal;
+use std::collections::HashMap;
+use std::fmt;
+
 
 #[derive(Clone)]
 pub struct Clause{
@@ -95,11 +96,61 @@ impl Clause {
 			}
 		}
 	}
+	
+	/// Returns a reference to the literals of this clause, if there are no literals returns None.
+	pub fn get_literals(&self)->Option<Vec<Literal>>{
+        if self.literals.len() == 0 {
+            return None
+        }
+        Some(self.literals.values().cloned().collect())
+    }
+    
+    /// Returns a vector of the unassigned literals of this clause, if there are no unassigned literals returns an empty vector.
+    pub fn get_unassigned_literals(&self)->Vec<Literal>{
+        
+        
+        self.literals.values().filter(|lit| !lit.already_assigned()).cloned().collect()
+    }
 
 	///  Removes from this clause all of the literals which value has already been assigned, this method in-place modifies this clause.
 	pub fn simplify(&mut self){
-
 		self.literals.retain(|_,lit|!lit.already_assigned());
 	}
+	
+	/// Returns true if this clause contains a literal with index <index>, false otherwise.
+	pub fn contains_literal(&self, index: u64)->bool{
+        self.literals.contains_key(&index)
+    }
+    
+    /// Returns true if this clause is satisfied, false otherwise. A clause is satisfied if at least one of its literals resolves to true.
+    pub fn is_satisfied(&self)->bool{
+        self.literals.values().any(|lit| lit.eval() == Some(true))
+    }
+    
+    /// Returns true if this clause is a unit clause, false otherwise. A unit clause is a clause that contains exactly one unassigned literal.
+    pub fn is_unit(&self)->bool{
+        let seen = self.literals.values().filter(|lit| !lit.already_assigned()).count();
+        
+        seen == 1
+    }
+    
+    /// Returns true is this clause is empty, the clause is empty where it is not satisfied and contains no unassigned literals, false otherwise.
+    pub fn is_empty(&self)->bool{
+        self.literals.values().all(|lit| lit.already_assigned() && lit.eval() == Some(false))
+    }
+    
+    /// Unit propagates this clause, this method in-place modifies this clause. If this clause is not a unit clause this method panics.
+    pub fn unit_propagate(&mut self){
+        if self.is_unit() {
+            let lit = self.literals.values().find(|lit| !lit.already_assigned()).unwrap();
+            let value = !lit.is_negated();
+            let index = lit.get_index();
+            println!("Unit propagating clause {:?}, setting variable x_{} to {}", self, index, value);
+            self.set_value(index, value).expect("Failed to propagate unit clause");
+        }
+        else {
+            panic!("Cannot unit-propagate non-unit clause");
+        }
+    }
 	
 }
