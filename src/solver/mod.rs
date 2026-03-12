@@ -1,61 +1,32 @@
-use crate::python::interrupts::InterruptChecker;
+pub mod dpll;
+pub mod cdcl;
+
 use crate::formula::Formula;
 use pyo3::prelude::*;
+use pyo3::FromPyObject;
 
 pub enum Algorithm {
     DPLL,
     CDCL
 }
 
-pub fn solve<'py>(formula: &mut Formula, algorithm: Algorithm, ic: &mut InterruptChecker<'py>) -> PyResult<Option<Vec<bool>>> {
-    match algorithm {
-        Algorithm::DPLL => return solve_dpll(formula,ic),
-        Algorithm::CDCL => return solve_cdcl(formula,ic)
-    }
-}
-
-pub fn solve_dpll<'py>(formula: &mut Formula, ic: &mut InterruptChecker<'py>) -> PyResult<Option<Vec<bool>>> {
-    ic.checkpoint()?;
+impl FromPyObject<'_,'_> for Algorithm {
+    type Error = PyErr;
     
-    
-    while formula.contains_unit_clause() {
-        formula.unit_propagate();
-    }
-    
-    let mut pure_literals = formula.get_pure_literals();
-    while pure_literals.len() > 0 {
-         for (pure_literal,sign) in pure_literals {
-             let index = pure_literal.borrow().get_index();
-             formula.set_variable(index, sign).unwrap();
+    fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
+        let algo = obj.extract::<String>()?;
+        match algo.as_str() {
+            "dpll" => Ok(Algorithm::DPLL),
+            "cdcl" => Ok(Algorithm::CDCL),
+            _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Unknown algorithm: {}, allowed values are: dpll, cdcl", algo))),
         }
-        pure_literals = formula.get_pure_literals();
-    }
+}
     
-    if formula.is_empty() {
-        return Ok(Some(formula.get_model()));
-    }
-    
-    if formula.contains_empty_clause() {
-        return Ok(None);
-    }
-    
-    let lit = formula.get_unassigned_literal().unwrap();
-    
-    let mut formula_true = formula.clone();
-    formula_true.set_variable(lit.get_index(), true).unwrap();
-    if let Ok(Some(model)) = solve_dpll(&mut formula_true, ic) {
-        return Ok(Some(model));
-    }
-    
-    let mut formula_false = formula.clone();
-    formula_false.set_variable(lit.get_index(), false).unwrap();
-    if let Ok(Some(model)) = solve_dpll(&mut formula_false, ic) {
-        return Ok(Some(model));
-    }
-    Ok(None)
 }
 
-pub fn solve_cdcl<'py>(formula: &Formula, ic: &mut InterruptChecker<'py>) -> PyResult<Option<Vec<bool>>> {
-    // Placeholder for the CDCL algorithm implementation.
-    Ok(None)
+pub fn solve<'py>(formula: &mut Formula, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
+    match algorithm {
+        Algorithm::DPLL => return dpll::solve_dpll(formula),
+        Algorithm::CDCL => return cdcl::solve_cdcl(formula)
+    }
 }

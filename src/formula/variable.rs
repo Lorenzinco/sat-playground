@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Clone)]
+#[derive(Clone,Hash)]
 pub struct Variable{
 	index: u64,
 	value: Option<bool>
@@ -43,6 +43,11 @@ impl Variable{
 	pub fn assign(&mut self, value: bool){
 		self.value = Some(value);
 	}
+	
+	/// Removes the assignment of the variable, if it is already assigned, nothing happens otherwise, use already_assigned() to check
+	pub fn unset(&mut self){
+        self.value = None;
+    }
 	
 	pub fn get_value(&self)->Option<bool> {
 		self.value

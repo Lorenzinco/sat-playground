@@ -1,6 +1,7 @@
 pub mod formula;
 pub mod solver;
 pub mod python;
+pub mod implication_graph;
 
 #[pyo3::pymodule]
 mod clsat {

@@ -1,3 +1,4 @@
+from typing import Literal
 class Sat:
     """
     Class representing a SAT problem. It is initialized as a list of clauses and can be modified by adding new clauses. The solve method returns a solution to the problem, if it exists.
@@ -10,8 +11,9 @@ class Sat:
         :param clause: A list of integers representing a clause, where positive integers represent positive literals and negative integers represent negated literals.
         """
         ...
-    def solve(self): 
+    def solve(self, algorithm: Literal["dpll", "cdcl"]) -> None: 
         """
         Solves the SAT problem, to see the solution please inspect the model field of the class.
+        :param algorithm: The algorithm to use for solving the SAT problem. Currently, only "dpll" and "cdcl" are supported.
         """
         ...

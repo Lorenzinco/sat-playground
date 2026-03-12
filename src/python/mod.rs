@@ -1,8 +1,8 @@
 pub mod sat;
-pub mod interrupts;
 
+use crate::solver::Algorithm;
 use pyo3::prelude::*;
-use crate::python::interrupts::InterruptChecker;
+use ctrlc;
 
 /// Python bindings for the Sat struct, allocate an instance to then add clauses.
 #[pyclass]
@@ -57,10 +57,10 @@ impl Sat {
     }
     
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = () ,text_signature = "")]
-    pub fn solve(&mut self, py: Python<'_>)->PyResult<()> {
-        let mut ic = InterruptChecker::new(py,1000);
-        self.model = self.solve_rs(&mut ic)?;
+    #[pyo3(signature = (algorithm) ,text_signature = "algorithm")]
+    pub fn solve(&mut self, algorithm: Algorithm)->PyResult<()> {
+        ctrlc::set_handler(|| std::process::exit(2)).unwrap();
+        self.model = self.solve_rs(algorithm)?;
         Ok(())
     }
 }

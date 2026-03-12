@@ -8,7 +8,12 @@ name = "clsat"
 crate-type = ["cdylib","rlib"]
 
 [dependencies]
-pyo3 = {version =  "0.28.2", features = ["extension-module","experimental-inspect"]}
+ctrlc = "3.5.2"
+pyo3 = {version =  "0.28.2", features = ["macros", "experimental-inspect"]}
 
 [build-dependencies]
 pyo3-build-config = "0.28.2"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]

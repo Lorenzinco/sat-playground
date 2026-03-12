@@ -1,9 +1,9 @@
-use crate::python::interrupts::InterruptChecker;
 use crate::formula::variable::Variable;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::python::Sat;
+use crate::solver::Algorithm;
 use std::cell::RefCell;
 use pyo3::prelude::*;
 use std::rc::Rc;
@@ -21,7 +21,7 @@ impl Sat {
 			.collect()
 	}
 	
-	pub fn solve_rs<'py>(&mut self, ic: &mut InterruptChecker<'py>) -> PyResult<Option<Vec<bool>>> {
+	pub fn solve_rs<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
         
         let max = self.clauses.iter().flatten().map(|lit| lit.abs()).max().unwrap_or(0) as usize;
         let mut variables: Vec<Variable> = Vec::new();
@@ -53,7 +53,7 @@ impl Sat {
         let mut formula = Formula::from_clauses(clauses, variable_refs);
         
         
-        let result = formula.solve(ic);
+        let result = formula.solve(algorithm);
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());

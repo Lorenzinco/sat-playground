@@ -129,9 +129,19 @@ impl Clause {
     
     /// Returns true if this clause is a unit clause, false otherwise. A unit clause is a clause that contains exactly one unassigned literal.
     pub fn is_unit(&self)->bool{
-        let seen = self.literals.values().filter(|lit| !lit.already_assigned()).count();
-        
-        seen == 1
+        return self.get_unassigned_literals().len() == 1 && !self.is_satisfied()
+    }
+    
+    pub fn negate(&self)->Self{
+        let negated_literals = self.literals.values().map(|lit| lit.negated()).collect();
+        Self::from_literals(negated_literals)
+    }
+    
+    pub fn get_unit_literal(&self)->Option<Literal>{
+        if self.is_unit() {
+            return self.get_unassigned_literals().pop()
+        }
+        None
     }
     
     /// Returns true is this clause is empty, the clause is empty where it is not satisfied and contains no unassigned literals, false otherwise.
@@ -139,18 +149,40 @@ impl Clause {
         self.literals.values().all(|lit| lit.already_assigned() && lit.eval() == Some(false))
     }
     
-    /// Unit propagates this clause, this method in-place modifies this clause. If this clause is not a unit clause this method panics.
-    pub fn unit_propagate(&mut self){
-        if self.is_unit() {
-            let lit = self.literals.values().find(|lit| !lit.already_assigned()).unwrap();
-            let value = !lit.is_negated();
-            let index = lit.get_index();
-            println!("Unit propagating clause {:?}, setting variable x_{} to {}", self, index, value);
-            self.set_value(index, value).expect("Failed to propagate unit clause");
+    /// Unit propagates this clause, this method in-place modifies this clause and returns the literal that was propagated, if this clause is not a unit clause this method panics.
+    pub fn unit_propagate(&mut self)->Option<Literal>{
+        if !self.is_unit() {
+            return None
         }
-        else {
-            panic!("Cannot unit-propagate non-unit clause");
+        
+        if let Some(lit) = self.get_unit_literal(){
+            self.set_value(lit.get_index(), !lit.is_negated()).unwrap();
+            
+            return Some(lit)
         }
+        
+        None
     }
-	
+    
+    pub fn unit_propagate_with_graph(&mut self, ig: &mut crate::implication_graph::ImplicationGraph)->Option<Literal>{
+        if !self.is_unit() {
+            return None  
+        }
+        
+        if let Some(implied) = self.get_unit_literal(){
+            let mut impliant = Vec::new();
+            for other_lit in self.get_literals().unwrap_or_else(|| Vec::new()){
+                if other_lit.get_index() != implied.get_index() {
+                    impliant.push(other_lit);
+                }
+            }
+            
+            self.set_value(implied.get_index(), !implied.is_negated()).unwrap();
+            ig.add_neighbours(implied.clone(), ig.classify_literals(impliant));
+            
+            return Some(implied)
+        }
+        
+        None
+    }
 }

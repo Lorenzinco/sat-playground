@@ -1,8 +1,29 @@
 import clsat
+import multiprocessing as mp
 
-clauses = [[1, -2, 3], [-1, 2, 4], [7, 2, 3], [-3, 2 , 4], [1, -2, -3], [-1, 2, -4], [-7, -2, -3], [3, 2 , 4]]
+def parse_dimacs(filename):
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+    clauses = []
+    for line in lines:
+        if line.startswith('c') or line.startswith('p'):
+            continue
+        clause = [int(x) for x in line.split() if x != '0']
+        if clause:
+            clauses.append(clause)
+    return clauses
 
-s = clsat.Sat(clauses)
-s.add_clause([1, -2, 3])
-s.solve()
-print(s.model)
+
+def solve_sat(clauses):
+    s = clsat.Sat(clauses)
+    print("Solving SAT problem...",flush=True)
+    s.solve(algorithm="cdcl")
+    if s.model is not None:
+        print("SATISFIABLE", flush=True)
+    else:
+        print("UNSATISFIABLE",flush=True)
+
+if __name__ == "__main__":
+    p = mp.Process(target=solve_sat, args=(parse_dimacs('input.dimacs'),))
+    p.start()
+    p.join()
