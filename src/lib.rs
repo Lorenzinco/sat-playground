@@ -1,7 +1,7 @@
 pub mod formula;
 pub mod solver;
 pub mod python;
-pub mod implication_graph;
+pub mod history;
 
 #[pyo3::pymodule]
 mod clsat {

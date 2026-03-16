@@ -53,6 +53,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastbit"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "870357e6dfb281b1485dae155095ae1f24b0071c342515a33603f4bbf1832f82"
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -184,6 +190,7 @@ name = "sat-playground"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "fastbit",
  "pyo3",
  "pyo3-build-config",
 ]

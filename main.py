@@ -1,5 +1,6 @@
 import clsat
 import multiprocessing as mp
+import time
 
 def parse_dimacs(filename):
     with open(filename, 'r') as f:
@@ -17,11 +18,14 @@ def parse_dimacs(filename):
 def solve_sat(clauses):
     s = clsat.Sat(clauses)
     print("Solving SAT problem...",flush=True)
-    s.solve(algorithm="cdcl")
+    start = time.time() * 1000
+    s.solve(algorithm="dpll")
+    end = time.time() * 1000
+    print(f"Elapsed: {end-start}ms")
     if s.model is not None:
-        print("SATISFIABLE", flush=True)
+        print("SAT", flush=True)
     else:
-        print("UNSATISFIABLE",flush=True)
+        print("UNSAT",flush=True)
 
 if __name__ == "__main__":
     p = mp.Process(target=solve_sat, args=(parse_dimacs('input.dimacs'),))
