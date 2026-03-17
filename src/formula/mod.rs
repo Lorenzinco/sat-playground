@@ -42,7 +42,7 @@ impl fmt::Debug for Formula {
 		for (i,clause) in self.clauses.iter().enumerate() {
 		    write!(f,"(")?;
 		    for (j, literal) in clause.into_iter().enumerate(){
-				let color = match self.assignment.get_value(literal.get_index()){
+				let color = match literal.eval(&self.assignment){
                     Some(true) => "\x1b[34m",
                     Some(false) => "\x1b[31m",
                     None => "\x1b[2m",
@@ -76,7 +76,7 @@ impl Formula {
  	/// Creates a new empty formula, to create one starting from a dimacs file see from_dimacs(dimacs: &str).
 	/// 
 	/// ```
-	/// use sat_playground::formula::Formula;
+	/// use clsat::formula::Formula;
 	/// 
 	/// let literals: usize = 10000;
 	/// 
@@ -268,6 +268,7 @@ impl Formula {
     }
     
     
+    /// Propagates updating the history, thus adding implications to the current decision layer, returns true iff there has been implications
     pub fn pure_literals_propagate_history(&mut self, history: &mut History) -> bool {
         let mut progress = false;
         loop {
@@ -315,5 +316,4 @@ impl Formula {
 
 #[cfg(test)]
 mod tests {
-   
 }

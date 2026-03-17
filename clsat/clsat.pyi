@@ -4,6 +4,13 @@ class Sat:
     Class representing a SAT problem. It is initialized as a list of clauses and can be modified by adding new clauses. The solve method returns a solution to the problem, if it exists.
     :param clauses: A list of clauses, where each clause is a list of integers representing literals. Positive integers represent positive literals, while negative integers represent negated literals.
     """
+    
+    @property
+    def model(self)->list[bool] | None: ...
+    """
+    A list of booleans representing the solution to the problem.
+    """
+    
     def __init__(self, clauses: list[list[int]]) -> None: ...
     def add_clause(self, clause: list[int]) -> None: 
         """

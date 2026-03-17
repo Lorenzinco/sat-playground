@@ -10,6 +10,7 @@ crate-type = ["cdylib","rlib"]
 [dependencies]
 ctrlc = "3.5.2"
 fastbit = "0.11.1"
+indexmap = "2.13.0"
 pyo3 = {version =  "0.28.2", features = ["macros", "experimental-inspect"]}
 
 [build-dependencies]

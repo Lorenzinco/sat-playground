@@ -9,7 +9,7 @@ use crate::formula::literal::Literal;
 
 pub struct History {
     decision_levels: Vec<DecisionLevel>,
-    implication_levels_indexes: implication_level::ImplicationLevels
+    pub implication_levels_indexes: implication_level::ImplicationLevels
 }
 
 impl History {
@@ -31,12 +31,16 @@ impl History {
     /// Adds an implication inside the last level of decision, also keeps track of which clause this implication appears in
     /// Returns a literal if this decision created a conflict with that literal
     pub fn add_implication(&mut self, literal: &Literal, clause_index: Option<usize>)->Option<Literal>{
-        let level = self.decision_levels.last_mut().expect("No decisions yet!");
-        let negated = literal.negated();
         
+        let negated = literal.negated();
+        if let Some(_) = self.decision_levels.iter().filter(|il| il.get_decision_literal().is_some_and(|lit| lit == &negated)).next(){
+            return Some(negated)
+        }
         if let Some(_) = self.implication_levels_indexes.get_level(&negated){
             return Some(negated)
         }
+        
+        let level = self.decision_levels.last_mut().expect("No decisions yet!");
         
         level.add_implied_literal(literal, clause_index);
         self.implication_levels_indexes.set_level(literal, self.decision_levels.len().checked_sub(1).expect("No decisions yet!"));
@@ -71,4 +75,79 @@ impl History {
     }
     
     
+}
+
+#[cfg(test)]
+mod history{
+    use crate::formula::Formula;
+    use super::*;
+    
+    #[test]
+    fn no_decisions(){
+        let mut history = History::new();
+        
+        let lit = Literal::new(0,true);
+        
+        history.add_implication(&lit, None);
+        assert_eq!(history.get_decision_level(),0);
+    }
+    
+    #[test]
+    fn conflict(){
+        let mut history = History::new();
+        
+        let lit = Literal::new(0,true);
+        let neg = lit.negated();
+        
+        history.add_decision(&lit);
+        let conflict = history.add_implication(&neg, Some(2));
+        assert!(conflict.is_some());
+        assert_eq!(conflict.unwrap(),lit);   
+    }
+    
+    #[test]
+    fn revert_decision(){
+        let clauses:Vec<Vec<i64>> = vec![vec![-1,2],vec![-2,-3],vec![3,-4]];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+        
+        let lit1 = Literal::new(0,false);
+        
+        formula.assignment.assign_history(&lit1, &mut history);
+        assert!(formula.pure_literals_propagate_history(&mut history));
+        println!("{:?}",formula);
+        
+        assert!(formula.assignment.get_value(0).is_some());
+        assert!(formula.assignment.get_value(1).is_some());
+        assert!(formula.assignment.get_value(2).is_some());
+        assert!(formula.assignment.get_value(3).is_some());
+        
+        history.revert_last_decision(&mut formula.assignment);
+        
+        assert!(formula.assignment.get_value(0).is_none());
+        assert!(formula.assignment.get_value(1).is_none());
+        assert!(formula.assignment.get_value(2).is_none());
+        assert!(formula.assignment.get_value(3).is_none());
+    }
+    
+    #[test]
+    fn implication_level(){
+        let clauses:Vec<Vec<i64>> = vec![vec![-1,2],vec![-2,-3],vec![3,-4]];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+        let lit1 = Literal::new(0,false);
+        
+        formula.assignment.assign_history(&lit1, &mut history);
+        assert!(formula.pure_literals_propagate_history(&mut history));
+        println!("{:?}",formula);
+        
+        assert!(formula.assignment.get_value(0).is_some());
+        assert!(formula.assignment.get_value(1).is_some());
+        assert!(formula.assignment.get_value(2).is_some());
+        assert!(formula.assignment.get_value(3).is_some());
+        
+        let lit2 = Literal::new(1,false);
+        assert!(history.implication_levels_indexes.get_level(&lit2).is_some_and(|level| level == 1));
+        assert!(history.add_implication(&lit2.negated(),Some(2)).is_some_and(|conflict| conflict == lit2));
+    }
 }

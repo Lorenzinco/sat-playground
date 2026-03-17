@@ -1,10 +1,10 @@
 use crate::formula::literal::Literal;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 
 pub struct DecisionLevel{
     decision_literal: Option<Literal>,
-    implied_literals: HashMap<Literal,Option<usize>>    
+    implied_literals: IndexMap<Literal,Option<usize>>    
 }
 
 impl DecisionLevel{
@@ -12,14 +12,14 @@ impl DecisionLevel{
     pub fn new(decision_literal: &Literal) -> Self {
         Self {
             decision_literal: Some(decision_literal.clone()),
-            implied_literals: HashMap::new()
+            implied_literals: IndexMap::new()
         }
     }
     
     pub fn empty() -> Self {
         Self {
             decision_literal: None,
-            implied_literals: HashMap::new()
+            implied_literals: IndexMap::new()
         }
     }
     
@@ -40,7 +40,3 @@ impl DecisionLevel{
     }
 }
 
-#[cfg(test)]
-mod tests{
-    
-}
