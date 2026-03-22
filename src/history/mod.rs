@@ -1,10 +1,16 @@
 pub mod decision_level;
 pub mod implication_level;
 
+use fastbit::BitVec;
+use fastbit::BitRead;
+use fastbit::BitWrite;
+
 use crate::history::decision_level::DecisionLevel;
 use crate::history::implication_level::ImplicationLevels;
 use crate::formula::assignment::Assignment;
 use crate::formula::literal::Literal;
+use crate::formula::clause::Clause;
+use crate::formula::Formula;
 
 
 pub struct History {
@@ -25,7 +31,8 @@ impl History {
     
     /// Adds a decision and a new decision level, a decision is an arbitrary value choice for a variable.
     pub fn add_decision(&mut self, literal: &Literal) {
-        self.decision_levels.push(DecisionLevel::new(literal))
+        self.decision_levels.push(DecisionLevel::new(literal));
+        self.implication_levels_indexes.set_level(literal, self.get_decision_level());
     }
     
     /// Adds an implication inside the last level of decision, also keeps track of which clause this implication appears in
@@ -55,9 +62,14 @@ impl History {
         let to_revert = self.decision_levels.split_off(level);
         
         for decision in to_revert {
-            assignment.unset(decision.get_decision_literal().expect("Reverting unit implications").get_index());
+            if let Some(lit) = decision.get_decision_literal() {
+                assignment.unset(lit.get_index());
+                self.implication_levels_indexes.unset_level(lit); 
+            }
+            
             for implication in decision.get_implied_literals() {
-                assignment.unset(implication.get_index())
+                assignment.unset(implication.get_index());
+                self.implication_levels_indexes.unset_level(implication);
             }
         }
     }
@@ -70,11 +82,84 @@ impl History {
         self.decision_levels.len()-1
     }
     
+    fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
+        self.implication_levels_indexes.get_level(lit)
+            .or_else(|| self.implication_levels_indexes.get_level(&lit.negated()))
+}
+    
     pub fn last_decision_literal(&self)->Option<&Literal>{
         self.decision_levels.last().expect("at least one").get_decision_literal()
     }
     
     
+    
+    pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize) -> (Clause, usize) {
+        let current_level = self.get_decision_level();
+        if current_level == 0 { return (Clause::new(), 0); } // Unsat
+
+        let mut seen = BitVec::<u64>::new(formula.assignment.len());
+        let mut learned_lits: Vec<Literal> = Vec::new();
+        let mut path_count = 0;
+        
+        let mut current_clause_idx = Some(conflict_clause_index);
+        let mut resolved_lit: Option<Literal> = None;
+
+        let level_data = &self.decision_levels[current_level];
+        let mut trail_iter = level_data.get_implied_literals_rev()
+            .chain(level_data.get_decision_literal().into_iter());
+
+        loop {
+            if let Some(clause_idx) = current_clause_idx {
+                let clause = &formula.get_clauses()[clause_idx];
+                for lit in clause.iter() {
+                    if Some(lit) == resolved_lit.as_ref() { continue; }
+                    
+                    let var = lit.get_index() as usize;
+                    if !seen.test(var) {
+                        seen.set(var);
+                        if self.get_literal_level(lit) == Some(current_level) {
+                            path_count += 1;
+                        } else {
+                            learned_lits.push(lit.clone());
+                        }
+                    }
+                }
+            }
+
+            loop {
+                if let Some(lit) = trail_iter.next() {
+                    let var = lit.get_index() as usize;
+                    if seen.test(var) {
+                        resolved_lit = Some(lit.clone());
+                        path_count -= 1;
+                        current_clause_idx = level_data.get_reason(lit);
+                        break;
+                    }
+                } else {
+                    unreachable!("Trail is empty but path_count is > 0");
+                }
+            }
+
+            if path_count == 0 {
+                learned_lits.push(resolved_lit.unwrap().negated());
+                break;
+            }
+        }
+        
+        let last_idx = learned_lits.len() - 1;
+        learned_lits.swap(0, last_idx);
+
+        let mut backtrack_level = 0;
+        for lit in learned_lits.iter().skip(1) {
+            let level = self.get_literal_level(lit).unwrap_or(0);
+            if level > backtrack_level {
+                backtrack_level = level;
+            }
+        }
+        
+        (Clause::from_literals(&learned_lits), backtrack_level)
+    }
+
 }
 
 #[cfg(test)]
@@ -149,5 +234,149 @@ mod history{
         let lit2 = Literal::new(1,false);
         assert!(history.implication_levels_indexes.get_level(&lit2).is_some_and(|level| level == 1));
         assert!(history.add_implication(&lit2.negated(),Some(2)).is_some_and(|conflict| conflict == lit2));
+    }
+    
+    #[test]
+    fn analyze_conflict_basic() {
+        
+        let clauses: Vec<Vec<i64>> = vec![
+            vec![-1, 2],   // 0: -x1 v x2
+            vec![-2, 3],   // 1: -x2 v x3
+            vec![-3, 4],   // 2: -x3 v x4
+            vec![-1, -4]   // 3: -x1 v -x4  (conflict)
+        ];
+        
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+        
+        let x1 = Literal::new(0, false); // x1
+        
+        formula.assignment.assign_history(&x1, &mut history);
+        
+        let x2 = Literal::new(1, false);
+        formula.assignment.assign(x2.get_index(), true);
+        history.add_implication(&x2, Some(0)); // Reason: C0 (-1, 2)
+        
+        let x3 = Literal::new(2, false);
+        formula.assignment.assign(x3.get_index(), true);
+        history.add_implication(&x3, Some(1)); // Reason: C1 (-2, 3)
+        
+        let x4 = Literal::new(3, false);
+        formula.assignment.assign(x4.get_index(), true);
+        history.add_implication(&x4, Some(2)); // Reason: C2 (-3, 4)
+        
+        let (learned, backtrack_level) = history.analyze_conflict(&formula, 3);
+        
+        println!("Learned clause: {}", learned);
+        
+        assert_eq!(learned.len(), 1);
+        let lit = learned.iter().next().unwrap();
+        assert_eq!(lit.get_index(), 0);
+        assert!(lit.is_negated()); // -x1
+        
+        assert_eq!(backtrack_level, 0);
+    }
+    
+    #[test]
+    fn analyze_conflict_with_backtrack() {
+        
+        let clauses: Vec<Vec<i64>> = vec![
+            vec![-1, 2],      // 0: -x1 v x2
+            vec![-3, -2, 4],  // 1: -x3 v -x2 v x4
+            vec![-3, -4]      // 2: -x3 v -x4 (Conflict)
+        ];
+        
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+        
+        let x1 = Literal::new(0, false);
+        formula.assignment.assign_history(&x1, &mut history);
+        
+        let x2 = Literal::new(1, false);
+        formula.assignment.assign(x2.get_index(), true);
+        history.add_implication(&x2, Some(0));
+        
+        let x3 = Literal::new(2, false);
+        formula.assignment.assign_history(&x3, &mut history);
+        
+        let x4 = Literal::new(3, false);
+        formula.assignment.assign(x4.get_index(), true);
+        history.add_implication(&x4, Some(1));
+        
+        
+        let (learned, backtrack_level) = history.analyze_conflict(&formula, 2);
+        
+        println!("Learned: {}", learned);
+        
+        assert_eq!(learned.len(), 2);
+        assert_eq!(backtrack_level, 1);
+    }
+    
+    #[test]
+    fn conflict_analysis_unsat() {
+        let history = History::new();
+        let clauses: Vec<Vec<i64>> = vec![vec![1], vec![-1]]; // Unsat immediately
+        let formula = Formula::from_vec(clauses);
+        
+        let (clause, level) = history.analyze_conflict(&formula, 0);
+        assert!(clause.len() == 0); 
+        assert_eq!(level, 0);
+    }
+    
+    #[test]
+    fn conflict_analysis_simple() {
+        
+        let clauses: Vec<Vec<i64>> = vec![
+            vec![-1, 2],
+            vec![-2, 3],
+            vec![-3, 4],
+            vec![-4, -5],
+            vec![-4, 5]
+        ];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+
+        let lit1 = Literal::new(0, false); // 1
+        history.add_decision(&lit1);
+        formula.assignment.assign(0, true);
+
+        
+        // 1 implies 2
+        let lit2 = Literal::new(1, false);
+        formula.assignment.assign(1, true); 
+        history.add_implication(&lit2, Some(0));
+
+        // 2 implies 3
+        let lit3 = Literal::new(2, false);
+        formula.assignment.assign(2, true);
+        history.add_implication(&lit3, Some(1));
+
+        // 3 implies 4
+        let lit4 = Literal::new(3, false);
+        formula.assignment.assign(3, true);
+        history.add_implication(&lit4, Some(2));
+
+        // 4 implies -5
+        let lit5_neg = Literal::new(4, true); // -5
+        formula.assignment.assign(4, false);
+        history.add_implication(&lit5_neg, Some(3));
+
+
+        let (learned_clause, backtrack_level) = history.analyze_conflict(&formula, 4);
+        
+        // 1-UIP Analysis:
+        // Resolution on 5 (from C4 and C3): -4 v -4 = -4
+        // Resolution on 4 (from -4 and C2): -3
+        // Resolution on 3 (from -3 and C1): -2
+        // Resolution on 2 (from -2 and C0): -1
+        // 1 is decision literal, stop.
+        // Learned: {-1}
+        
+        assert_eq!(learned_clause.len(), 1);
+        let lits = learned_clause.get_literals();
+        println!("{:?}",learned_clause);
+        assert_eq!(lits[0].get_index(), 3);
+        assert!(lits[0].is_negated());
+        assert_eq!(backtrack_level, 0);
     }
 }

@@ -1,6 +1,6 @@
+use fastbit::BitWrite;
 use fastbit::BitRead;
 use fastbit::BitVec;
-use fastbit::BitWrite;
 
 use crate::formula::literal::Literal;
 use crate::history::History;
@@ -33,6 +33,10 @@ impl Assignment {
             assigned: BitVec::new(length),
             value: BitVec::new(length)
         }
+    }
+    
+    pub fn len(&self)->usize{
+        self.assigned.len()
     }
     
     pub fn assign(&mut self, index: u64, value: bool){

@@ -19,7 +19,7 @@ def solve_sat(clauses):
     s = clsat.Sat(clauses)
     print("Solving SAT problem...",flush=True)
     start = time.time() * 1000
-    s.solve(algorithm="dpll")
+    s.solve(algorithm="cdcl")
     end = time.time() * 1000
     print(f"Elapsed: {end-start}ms")
     if s.model is not None:

@@ -54,6 +54,10 @@ impl Clause {
 		}
 	}
 	
+	pub fn len(&self)->usize{
+	    self.into_iter().len()
+	}
+	
  // 	/// Assigns <value> to x_<index> if present and not already assigned, otherwhise returns an error
  // 	/// To set the value regardless of already assigned values please use pub fn set_value(index: u64, value: bool).
 	// pub fn assign(&mut self, index: u64, value: bool)->Result<(),&str>{
@@ -97,6 +101,10 @@ impl Clause {
 			return Ok(())
 		}
 		Err("Literal already inside clause")
+	}
+	
+	pub fn get_literals(&self)->&Vec<Literal>{
+	    &self.literals
 	}
     
     /// Returns a vector of the unassigned literals of this clause, if there are no unassigned literals returns an empty vector.

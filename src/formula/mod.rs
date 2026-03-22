@@ -15,8 +15,8 @@ use std::fmt;
 
 
     pub struct Formula{
-    	clauses: Vec<Clause>,
-    	pub assignment: Assignment,
+        clauses: Vec<Clause>,
+        pub assignment: Assignment,
     }
 
 impl Clone for Formula {
@@ -37,100 +37,100 @@ impl Clone for Formula {
 }
 
 impl fmt::Debug for Formula {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
-		let len = self.clauses.len();
-		for (i,clause) in self.clauses.iter().enumerate() {
-		    write!(f,"(")?;
-		    for (j, literal) in clause.into_iter().enumerate(){
-				let color = match literal.eval(&self.assignment){
+    fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
+        let len = self.clauses.len();
+        for (i,clause) in self.clauses.iter().enumerate() {
+            write!(f,"(")?;
+            for (j, literal) in clause.into_iter().enumerate(){
+                let color = match literal.eval(&self.assignment){
                     Some(true) => "\x1b[34m",
                     Some(false) => "\x1b[31m",
                     None => "\x1b[2m",
-				};
-				let trailing = if j < clause.into_iter().len() - 1 {"∨"} else {""};
-				let reset = "\x1b[0m";
-				write!(f,"{}{:?}{}{}",color,literal,reset,trailing)?;
-			} 
-			let trailing = if i < len-1 {"∧"} else {""};
-			write!(f,"){}",trailing)?;
-		}
-		
-		write!(f,"")
-	}
+                };
+                let trailing = if j < clause.into_iter().len() - 1 {"∨"} else {""};
+                let reset = "\x1b[0m";
+                write!(f,"{}{:?}{}{}",color,literal,reset,trailing)?;
+            } 
+            let trailing = if i < len-1 {"∧"} else {""};
+            write!(f,"){}",trailing)?;
+        }
+        
+        write!(f,"")
+    }
 }
 
 
 impl fmt::Display for Formula{
-	fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
-		let len = self.clauses.len();
-		for (i,clause) in self.clauses.iter().enumerate() {
-			let trailing = if i < len-1 {"∧"} else {""};
-			write!(f,"{}{}",clause,trailing)?;
-		}
-		write!(f,"")
-	}
+    fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
+        let len = self.clauses.len();
+        for (i,clause) in self.clauses.iter().enumerate() {
+            let trailing = if i < len-1 {"∧"} else {""};
+            write!(f,"{}{}",clause,trailing)?;
+        }
+        write!(f,"")
+    }
 }
 
 impl Formula {
 
- 	/// Creates a new empty formula, to create one starting from a dimacs file see from_dimacs(dimacs: &str).
-	/// 
-	/// ```
-	/// use clsat::formula::Formula;
-	/// 
-	/// let literals: usize = 10000;
-	/// 
-	/// let phi = Formula::new(literals);
-	/// ```
-	pub fn new(size: usize)->Self{
+    /// Creates a new empty formula, to create one starting from a dimacs file see from_dimacs(dimacs: &str).
+    /// 
+    /// ```
+    /// use clsat::formula::Formula;
+    /// 
+    /// let literals: usize = 10000;
+    /// 
+    /// let phi = Formula::new(literals);
+    /// ```
+    pub fn new(size: usize)->Self{
 
-		Formula{
-			clauses: vec!(),
-			assignment: Assignment::new(size)
-		}
-	}
-	
-	pub fn from_clauses(clauses: &Vec<Clause>)->Self{
-	    let max_index = clauses
-			.iter()
-			.flat_map(|clause| clause.iter())
-			.map(|lit| lit.get_index())
-			.max()
-			.expect("No literal in any formula found!");
-		
-		Self {
-			clauses: clauses.to_owned(),
-			assignment: Assignment::new(max_index as usize +1)
-		}
-	}
-	
-	pub fn from_vec(raw_clauses: Vec<Vec<i64>>)->Self {
-	    let mut clauses = Vec::new();
-		for raw_clause in raw_clauses.iter(){
-		    let mut clause = Clause::new();
-		    for raw_lit in raw_clause.iter(){
-				if *raw_lit == 0 as i64 { panic!("0 indexing is not allowed on dimacs") }
-				let lit = Literal::new((raw_lit.abs()-1) as u64,raw_lit.is_negative());
-				clause.add_literal(&lit).expect("Literal cannot be in the same clause twice");
-			} 
-			clauses.push(clause);
-		}
-		
-		Formula::from_clauses(&clauses)
-	}
-	
-	/// Returns a reference to the clauses of the formula.
-	pub fn get_clauses(&self)->&Vec<Clause>{
-	    &self.clauses
-	}
-	
-	/// Returns a mutable reference to the Clause.
-	pub fn get_clauses_mut(&mut self)->&mut Vec<Clause>{
-	    &mut self.clauses
-	}
-	
-	/// Returns a vector of mutable references to the unsatisfied clauses of the formula, this is used to modify the clauses during the solving process.
-	pub fn get_unsatisfied_clauses(&self)->Vec<(usize,&Clause)>{
+        Formula{
+            clauses: vec!(),
+            assignment: Assignment::new(size)
+        }
+    }
+    
+    pub fn from_clauses(clauses: &Vec<Clause>)->Self{
+        let max_index = clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .map(|lit| lit.get_index())
+            .max()
+            .expect("No literal in any formula found!");
+        
+        Self {
+            clauses: clauses.to_owned(),
+            assignment: Assignment::new(max_index as usize +1)
+        }
+    }
+    
+    pub fn from_vec(raw_clauses: Vec<Vec<i64>>)->Self {
+        let mut clauses = Vec::new();
+        for raw_clause in raw_clauses.iter(){
+            let mut clause = Clause::new();
+            for raw_lit in raw_clause.iter(){
+                if *raw_lit == 0 as i64 { panic!("0 indexing is not allowed on dimacs") }
+                let lit = Literal::new((raw_lit.abs()-1) as u64,raw_lit.is_negative());
+                clause.add_literal(&lit).expect("Literal cannot be in the same clause twice");
+            } 
+            clauses.push(clause);
+        }
+        
+        Formula::from_clauses(&clauses)
+    }
+    
+    /// Returns a reference to the clauses of the formula.
+    pub fn get_clauses(&self)->&Vec<Clause>{
+        &self.clauses
+    }
+    
+    /// Returns a mutable reference to the Clause.
+    pub fn get_clauses_mut(&mut self)->&mut Vec<Clause>{
+        &mut self.clauses
+    }
+    
+    /// Returns a vector of mutable references to the unsatisfied clauses of the formula, this is used to modify the clauses during the solving process.
+    pub fn get_unsatisfied_clauses(&self)->Vec<(usize,&Clause)>{
         self.get_clauses().iter().enumerate().filter(|(_,clause)| !clause.is_satisfied(&self.assignment)).collect()
     }
     
@@ -138,20 +138,20 @@ impl Formula {
     pub fn get_unsatisfied_clauses_mut(&mut self, assignment: &Assignment)->Vec<(usize, &mut Clause)>{
         self.get_clauses_mut().into_iter().enumerate().filter(|(_, clause)| !clause.is_satisfied(&assignment)).collect()
     }
-	
-	pub fn add_clause(&mut self, clause: Clause) {
-		self.clauses.push(clause);
-	}
-	
-	pub fn set_variable(&mut self, index: u64, value: bool){
-		self.assignment.assign(index, value)
-	}
-	
-	pub fn unset_variable(&mut self, index: u64){
+    
+    pub fn add_clause(&mut self, clause: Clause) {
+        self.clauses.push(clause);
+    }
+    
+    pub fn set_variable(&mut self, index: u64, value: bool){
+        self.assignment.assign(index, value)
+    }
+    
+    pub fn unset_variable(&mut self, index: u64){
         self.assignment.unset(index);
     }
-	
-	pub fn solve<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
+    
+    pub fn solve<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
         solve(self, algorithm)
     }
     
@@ -209,44 +209,47 @@ impl Formula {
     }
     
     /// Performs unit propagation on the formula, to also update an implication graph use unit_propagate_with_graph(ig: &mut ImplicationGraph) instead, this is used in the DPLL algorithm.
-    pub fn unit_propagate(&mut self) -> bool{
+    pub fn unit_propagate(&mut self) -> bool {
         let mut progress = false;
-        loop{
-            let mut assignment = self.assignment.clone();
-            let uc = self.get_unit_clauses_mut(&assignment);
-            if let Some((_,unit)) = uc.into_iter().next() {
-                let literal = unit.get_unit_literal(&assignment).expect("unreachable");
-                assignment.assign(literal.get_index(), !literal.is_negated());
+        loop {
+            let mut found = None;
+            for clause in self.clauses.iter() {
+                if clause.is_unit(&self.assignment) {
+                    found = Some(clause.get_unit_literal(&self.assignment).unwrap().clone());
+                    break;
+                }
+            }
+            if let Some(literal) = found {
+                self.assignment.assign(literal.get_index(), !literal.is_negated());
                 progress = true;
-            } 
-            else {
+            } else {
                 break;
             }
-            self.assignment = assignment;
         }
-        
         progress
     }
     
+
     pub fn unit_propagate_history(&mut self, history: &mut History)-> bool {
-        let mut progress = false;
-        loop{
-            let mut assignment = self.assignment.clone();
-            let uc = self.get_unit_clauses_mut(&assignment);
-            if let Some((i,unit)) = uc.into_iter().next() {
-                let literal = unit.get_unit_literal(&assignment).expect("unreachable");
-                assignment.assign(literal.get_index(), !literal.is_negated());
-                history.add_implication(literal, Some(i));
-                progress = true;
-            } 
-            else {
-                break;
+            let mut progress = false;
+            loop {
+                let mut found = None;
+                for (i, clause) in self.clauses.iter().enumerate() {
+                    if clause.is_unit(&self.assignment) {
+                        found = Some((i, clause.get_unit_literal(&self.assignment).unwrap().clone()));
+                        break;
+                    }
+                }
+                if let Some((i, literal)) = found {
+                    self.assignment.assign(literal.get_index(), !literal.is_negated());
+                    history.add_implication(&literal, Some(i));
+                    progress = true;
+                } else {
+                    break;
+                }
             }
-            self.assignment = assignment;
+            progress
         }
-        
-        progress
-    }
 
     
     pub fn pure_literals_propagate(&mut self) -> bool {
@@ -293,8 +296,8 @@ impl Formula {
         self.clauses.iter().any(|clause| clause.is_empty(assignment))
     }
     
-    pub fn get_empty_clause(&self, assignment: &Assignment)-> Option<&Clause> {
-        self.clauses.iter().filter(|clause| clause.is_empty(assignment)).next()
+    pub fn get_empty_clause(&self, assignment: &Assignment)-> Option<(usize,&Clause)> {
+        self.clauses.iter().enumerate().filter(|(_idx,clause)| clause.is_empty(assignment)).next()
     }
     
     pub fn get_unassigned_literal(&self, assignment: &Assignment) -> Option<Literal> {

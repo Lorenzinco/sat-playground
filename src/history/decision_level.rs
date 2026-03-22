@@ -38,5 +38,13 @@ impl DecisionLevel{
     pub fn get_implied_literals(&self) -> Vec<&Literal> {
         self.implied_literals.keys().collect()
     }
+    
+    pub fn get_implied_literals_rev(&self) -> impl Iterator<Item = &Literal> {
+        self.implied_literals.keys().rev()
+    }
+    
+    pub fn get_reason(&self, lit: &Literal) -> Option<usize> {
+        self.implied_literals.get(lit).copied().flatten()
+    }
 }
 
