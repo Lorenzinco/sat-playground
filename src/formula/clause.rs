@@ -1,11 +1,13 @@
 use super::literal::Literal;
 use crate::formula::Assignment;
+use crate::two_watched::Watched;
 use std::fmt;
 
 
 #[derive(Clone)]
 pub struct Clause{
-    literals: Vec<Literal>
+    literals: Vec<Literal>,
+    pub watched: Watched
 }
 
 impl<'a> IntoIterator for &'a Clause {
@@ -44,13 +46,27 @@ impl fmt::Debug for Clause{
 impl Clause {
 	pub fn new()->Self{
 		Self{
-			literals: vec!()
+			literals: vec!(),
+			watched: Watched::None,
 		}
 	}
 	
 	pub fn from_literals(literals: &Vec<Literal>)->Self{
+	
+	    let watched = match literals.len() {
+			0 => {
+			    Watched::None
+			},
+			1 => {
+                Watched::One(0)
+			},
+			_ => {
+			    Watched::Two(0, 1)
+			}
+		};
 		Self{
-			literals: literals.clone()
+			literals: literals.clone(),
+			watched: watched
 		}
 	}
 	
@@ -96,11 +112,18 @@ impl Clause {
 	
 	/// Adds a literal to the clause, returns an Error if the literal is already present inside the clause
 	pub fn add_literal(&mut self, literal: &Literal)->Result<(),&str>{
-		if !self.literals.contains(literal){
-		    self.literals.push(literal.clone());
-			return Ok(())
+		if self.literals.contains(literal){
+		    return Err("Literal already inside clause")
 		}
-		Err("Literal already inside clause")
+		
+	    match self.watched {
+			Watched::None => { self.watched = Watched::One(0) },
+			Watched::One(_)=> { self.watched = Watched::Two(0,1) },
+			Watched::Two(_, _)=> { /* Already ok */ }
+		}
+		self.literals.push(literal.clone());
+		
+		Ok(())
 	}
 	
 	pub fn get_literals(&self)->&Vec<Literal>{

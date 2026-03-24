@@ -48,7 +48,7 @@ pub fn solve_dpll(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
             continue;
         }
 
-        let lit = match formula.get_unassigned_literal(&formula.assignment) {
+        let lit = match formula.get_unassigned_literal() {
             Some(lit) => lit,
             None => return Ok(Some(formula.get_model())),
         };

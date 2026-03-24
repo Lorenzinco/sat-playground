@@ -2,6 +2,7 @@ pub mod formula;
 pub mod solver;
 pub mod python;
 pub mod history;
+pub mod two_watched;
 
 #[pyo3::pymodule]
 mod clsat {

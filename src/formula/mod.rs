@@ -3,9 +3,12 @@ pub mod literal;
 pub mod assignment;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use crate::history::History;
 use crate::solver::Algorithm;
 use crate::solver::solve;
+use crate::two_watched::Watch;
+use crate::two_watched::Watched;
 use clause::Clause;
 use literal::Literal;
 use assignment::Assignment;
@@ -17,11 +20,13 @@ use std::fmt;
     pub struct Formula{
         clauses: Vec<Clause>,
         pub assignment: Assignment,
+        watch: Watch
     }
 
 impl Clone for Formula {
     fn clone(&self) -> Self {
         let new_assignment = self.assignment.clone();
+        let new_watch = self.watch.clone();
         
         let mut new_clauses = Vec::new();
         for clause in &self.clauses {
@@ -32,6 +37,7 @@ impl Clone for Formula {
         Formula {
             clauses: new_clauses,
             assignment: new_assignment,
+            watch: new_watch
         }
     }
 }
@@ -83,10 +89,11 @@ impl Formula {
     /// let phi = Formula::new(literals);
     /// ```
     pub fn new(size: usize)->Self{
-
+        
         Formula{
             clauses: vec!(),
-            assignment: Assignment::new(size)
+            assignment: Assignment::new(size),
+            watch: Watch::new(size)
         }
     }
     
@@ -98,10 +105,26 @@ impl Formula {
             .max()
             .expect("No literal in any formula found!");
         
-        Self {
+        let mut formula = Formula{
             clauses: clauses.to_owned(),
-            assignment: Assignment::new(max_index as usize +1)
+            assignment: Assignment::new(max_index as usize +1),
+            watch: Watch::new(max_index as usize +1)
+        };
+        
+        for (i, clause) in formula.clauses.iter().enumerate() {
+            match clause.watched {
+                Watched::Two(idx1, idx2) => {
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx1]);
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx2]);
+                }
+                Watched::One(idx) => {
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx]);
+                }
+                Watched::None => {}
+            }
         }
+        
+        formula
     }
     
     pub fn from_vec(raw_clauses: Vec<Vec<i64>>)->Self {
@@ -124,6 +147,14 @@ impl Formula {
         &self.clauses
     }
     
+    pub fn get_clause_at_idx(&self, index: usize)->&Clause {
+        self.clauses.get(index).expect("Clause not present")
+    }
+    
+    pub fn get_clause_at_idx_mut(&mut self, index: usize)->&mut Clause {
+        self.clauses.get_mut(index).expect("Clause not present")
+    }
+    
     /// Returns a mutable reference to the Clause.
     pub fn get_clauses_mut(&mut self)->&mut Vec<Clause>{
         &mut self.clauses
@@ -140,6 +171,17 @@ impl Formula {
     }
     
     pub fn add_clause(&mut self, clause: Clause) {
+        let clause_idx = self.clauses.len();
+        match clause.watched {
+            Watched::None => {},
+            Watched::One(idx)=> {
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx]);
+            },
+            Watched::Two(idx1,idx2)=>{
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx1]);
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx2]);
+            }
+        }
         self.clauses.push(clause);
     }
     
@@ -290,6 +332,94 @@ impl Formula {
         
         progress
     }
+    
+    pub fn propagate_twl(
+        &mut self, 
+        history: &mut History, 
+        queue: &mut VecDeque<Literal>
+    ) -> Option<usize> {
+        while let Some(lit) = queue.pop_front() {
+            let false_lit = lit.negated();
+            
+            // We TAKE the list of clauses watching this literal so we can mutate the 
+            // formula's clause list and watchlist while iterating, ZERO allocations!
+            let watching_clauses = self.watch.take(&false_lit);
+            let mut keep_watchlist = Vec::new();
+            let mut conflict = None;
+            
+            for &clause_idx in &watching_clauses {
+                // If we already hit a conflict, just push the rest back
+                if conflict.is_some() {
+                    keep_watchlist.push(clause_idx);
+                    continue;
+                }
+                
+                let clause = &mut self.clauses[clause_idx];
+                
+                let (false_idx, other_idx) = match clause.watched {
+                    Watched::Two(i, j) => {
+                        if clause.get_literals()[i] == false_lit { (i, j) } else { (j, i) }
+                    },
+                    Watched::One(i) => {
+                        keep_watchlist.push(clause_idx);
+                        if clause.get_literals()[i] == false_lit {
+                            conflict = Some(clause_idx);
+                        }
+                        continue;
+                    },
+                    Watched::None => {
+                        keep_watchlist.push(clause_idx);
+                        continue;
+                    },
+                };
+                
+                let other_lit = clause.get_literals()[other_idx].clone();
+                
+                // 1. If the other watched literal is True, the clause is already satisfied.
+                if other_lit.eval(&self.assignment) == Some(true) {
+                    keep_watchlist.push(clause_idx);
+                    continue;
+                }
+                
+                // 2. Try to find a new unassigned (or true) literal in the clause to watch
+                let mut found_new_watch = false;
+                for k in 0..clause.get_literals().len() {
+                    if k == false_idx || k == other_idx { continue; }
+                    
+                    let candidate = clause.get_literals()[k].clone();
+                    if candidate.eval(&self.assignment) != Some(false) {
+                        clause.watched = Watched::Two(k, other_idx);
+                        // Add to candidate's watchlist (we don't remove from false_lit because we already took it!)
+                        self.watch.add_to_watchlist(clause_idx, &candidate);
+                        found_new_watch = true;
+                        break;
+                    }
+                }
+                
+                // 3. If we couldn't find a new literal to watch...
+                if !found_new_watch {
+                    keep_watchlist.push(clause_idx);
+                    if other_lit.eval(&self.assignment) == Some(false) {
+                        conflict = Some(clause_idx);
+                    } else {
+                        self.assignment.assign(other_lit.get_index(), !other_lit.is_negated());
+                        history.add_implication(&other_lit, Some(clause_idx));
+                        queue.push_back(other_lit);
+                    }
+                }
+            }
+            
+            // Set the remaining watchlist back
+            self.watch.set(&false_lit, keep_watchlist);
+            
+            if let Some(c) = conflict {
+                return Some(c);
+            }
+        }
+        
+        None 
+    }
+    
 
     
     pub fn contains_empty_clause(&self, assignment: &Assignment) -> bool {
@@ -300,13 +430,13 @@ impl Formula {
         self.clauses.iter().enumerate().filter(|(_idx,clause)| clause.is_empty(assignment)).next()
     }
     
-    pub fn get_unassigned_literal(&self, assignment: &Assignment) -> Option<Literal> {
-        for clause in self.clauses.iter() {
-            let literals = clause.get_unassigned_literals(assignment);
-            if literals.len() > 0 {
-                return Some(literals[0].clone());
+    pub fn get_unassigned_literal(&self) -> Option<Literal> {
+        for i in 0..self.assignment.len(){
+            if self.assignment.get_value(i as u64).is_none() {
+                return Some(Literal::new(i as u64,true))
             }
         }
+        
         None
     }
     

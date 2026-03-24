@@ -1,42 +1,74 @@
 use crate::formula::Formula;
 use crate::history::History;
+use crate::formula::literal::Literal;
 use pyo3::prelude::PyResult;
-
-fn propagate(formula: &mut Formula, history: &mut History) {
-    while formula.unit_propagate_history(history) {}
-    
-}
+use std::collections::VecDeque;
 
 pub fn solve_cdcl<'py>(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
-    propagate(formula, &mut history);
+    let mut queue: VecDeque<Literal> = VecDeque::new();
+    
+    let mut initial_units = Vec::new();
+       for (i, clause) in formula.get_clauses().iter().enumerate() {
+           if clause.len() == 1 {
+               initial_units.push((i, clause.get_literals()[0].clone()));
+           }
+       }
+   
+    for (i, lit) in initial_units {
+        if lit.eval(&formula.assignment) == Some(false) {
+            return Ok(None); // Conflict at level 0
+        } else if lit.eval(&formula.assignment) == None {
+            formula.assignment.assign(lit.get_index(), !lit.is_negated());
+            history.add_implication(&lit, Some(i));
+            queue.push_back(lit);
+        }
+    }
+
+    // Do initial propagation
+    if let Some(_conflict_idx) = formula.propagate_twl(&mut history, &mut queue) {
+        return Ok(None); // Conflict at decision level 0 means UNSAT
+    }
 
     loop {
-        while let Some((index, _clause)) = formula.get_empty_clause(&formula.assignment) {
-            if history.get_decision_level() == 0 {
-                return Ok(None); // UNSAT
-            }
-            let (learned, backtrack_level) = history.analyze_conflict(formula, index);
-            history.revert_decision(backtrack_level + 1, &mut formula.assignment);
-            assert!(learned.is_unit(&formula.assignment));
-            formula.add_clause(learned);
-            propagate(formula, &mut history);
-            continue;
-        }
 
-        if formula.is_satisfied() {
-            return Ok(Some(formula.get_model()));
-        }
-
-        let lit = match formula.get_unassigned_literal(&formula.assignment) {
+        let lit = match formula.get_unassigned_literal(){
             Some(lit) => lit,
             None => return Ok(Some(formula.get_model())),
         };
 
+        // Branching (Decision)
         history.add_decision(&lit);
         formula.assignment.assign(lit.get_index(), !lit.is_negated());
+        queue.push_back(lit); // Push our decision into the queue to propagate it
 
-        propagate(formula, &mut history);
+        // Inner conflict loop
+        while let Some(conflict_idx) = formula.propagate_twl(&mut history, &mut queue) {
+            if history.get_decision_level() == 0 {
+                return Ok(None); // UNSAT
+            }
+            
+            // Analyze the conflict and learn a new clause
+            let (learned, backtrack_level) = history.analyze_conflict(formula, conflict_idx);
+            
+            // Backtrack
+            history.revert_decision(backtrack_level + 1, &mut formula.assignment);
+            queue.clear(); // Important: flush the queue after a backtrack!
+            
+            // The learned clause should be unit at the backtrack level.
+            // In 1-UIP, the first literal in the learned clause is the asserting literal.
+            let asserting_lit = learned.get_literals()[0].clone();
+            
+            formula.add_clause(learned.clone());
+            let new_clause_idx = formula.get_clauses().len() - 1;
+            
+            // Force the implication of the learned clause
+            formula.assignment.assign(asserting_lit.get_index(), !asserting_lit.is_negated());
+            history.add_implication(&asserting_lit, Some(new_clause_idx));
+            
+            // Enqueue the asserting literal so it can propagate!
+            queue.push_back(asserting_lit);
+        }
     }
 }
 
