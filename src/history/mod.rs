@@ -92,7 +92,7 @@ impl History {
     }
     
     
-    
+    /// Returns the learned minimized clause at 1UIP and the conflict level the clause was found at.
     pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize) -> (Clause, usize) {
         let current_level = self.get_decision_level();
         if current_level == 0 { return (Clause::new(), 0); } // Unsat
@@ -149,15 +149,84 @@ impl History {
         let last_idx = learned_lits.len() - 1;
         learned_lits.swap(0, last_idx);
 
-        let mut backtrack_level = 0;
+        let mut min_seen = BitVec::<u64>::new(formula.assignment.len());
+        for lit in &learned_lits {
+            min_seen.set(lit.get_index() as usize);
+        }
+        
+        let mut poisoned = BitVec::<u64>::new(formula.assignment.len());
+        
+        let mut minimized_lits = Vec::new();
+        minimized_lits.push(learned_lits[0].clone());
+        
         for lit in learned_lits.iter().skip(1) {
+            let var = lit.get_index() as usize;
+            let level = self.get_literal_level(lit).unwrap_or(0);
+            
+            if level == 0 { continue; }
+            
+            let mut stack = vec![lit.clone()];
+            let mut local_seen = Vec::new();
+            let mut failed = false;
+            
+            while let Some(current) = stack.pop() {
+                let c_var = current.get_index() as usize;
+                
+                if c_var != var && min_seen.test(c_var) { continue; }
+                
+                if poisoned.test(c_var) { 
+                    failed = true; 
+                    break; 
+                }
+                
+                let c_level = self.get_literal_level(&current).unwrap_or(0);
+                if c_level == 0 { continue; }
+                
+                let reason_idx = self.decision_levels[c_level].get_reason(&current);
+                
+                match reason_idx {
+                    None => {
+                        failed = true;
+                        break;
+                    }
+                    Some(idx) => {
+                        let clause = &formula.get_clauses()[idx];
+                        
+                        if c_var != var {
+                            min_seen.set(c_var);
+                            local_seen.push(c_var);
+                        }
+                        
+                        for child in clause.get_literals() {
+                            let child_var = child.get_index() as usize;
+                            if child_var != c_var {
+                                stack.push(child.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if failed {
+                for &c_var in &local_seen {
+                    min_seen.reset(c_var);
+                    poisoned.set(c_var);
+                }
+                poisoned.set(var);
+                minimized_lits.push(lit.clone());
+            } else {
+            }
+        }
+        
+        let mut backtrack_level = 0;
+        for lit in minimized_lits.iter().skip(1) {
             let level = self.get_literal_level(lit).unwrap_or(0);
             if level > backtrack_level {
                 backtrack_level = level;
             }
         }
         
-        (Clause::from_literals(&learned_lits), backtrack_level)
+        (Clause::from_literals(&minimized_lits), backtrack_level)
     }
 
 }
