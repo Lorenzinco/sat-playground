@@ -11,6 +11,12 @@ class Sat:
     A list of booleans representing the solution to the problem.
     """
     
+    @property
+    def stats(self)->Stats|None: ...
+    """
+    Retrieve the stats of the execution.
+    """
+    
     def __init__(self, clauses: list[list[int]]) -> None: ...
     def add_clause(self, clause: list[int]) -> None: 
         """
@@ -24,3 +30,46 @@ class Sat:
         :param algorithm: The algorithm to use for solving the SAT problem. Currently, only "dpll" and "cdcl" are supported.
         """
         ...
+        
+class Stats:
+    """
+    Class representing the subclass inside sat to retrieve the stats of the execution, do not use it by itself.
+    """
+    
+    @property
+    def conflicts(self)-> int: ...
+    """
+    Retrieves the number of conflicts during the execution of the solver.
+    """
+    
+    @property
+    def clauses_learnt(self)->int: ...
+    """
+    The number of clauses learned during CDCL sat solving. It is 0 if the solver was DPLL.
+    """
+    
+    @property
+    def avg_clause_length(self)->int:...
+    """
+    The average length of the clauses learnet, it is often a good measure of relevance of the conflicts.
+    """
+    
+    def elapsed_secs(self)->int:...
+    """
+    Returns the elapsed time of the solving in seconds.
+    """
+    
+    def elapsed_nanos(self)->int:...
+    """
+    Returns the elapsed time of the solving in nanoseconds.
+    """
+    
+    def elapsed_millis(self)->int:...
+    """
+    Returns the elapsed time of the solving in milliseconds.
+    """
+    
+    def __str__(self)->str:...
+    """
+    Prints a formatted view of all the stats.
+    """

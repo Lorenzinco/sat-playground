@@ -50,7 +50,7 @@ pub fn solve_cdcl<'py>(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
             
             // Analyze the conflict and learn a new clause
             let (learned, backtrack_level) = history.analyze_conflict(formula, conflict_idx);
-            
+            formula.stats.add_conflict();
             // Backtrack
             history.revert_decision(backtrack_level + 1, &mut formula.assignment);
             queue.clear(); // Important: flush the queue after a backtrack!
@@ -59,7 +59,8 @@ pub fn solve_cdcl<'py>(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
             // In 1-UIP, the first literal in the learned clause is the asserting literal.
             let asserting_lit = learned.get_literals()[0].clone();
             
-            formula.add_clause(learned.clone());
+            formula.stats.add_learnt_clause(&learned);
+            formula.add_clause(learned);
             let new_clause_idx = formula.get_clauses().len() - 1;
             
             // Force the implication of the learned clause

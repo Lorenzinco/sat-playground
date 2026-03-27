@@ -1,5 +1,7 @@
 pub mod sat;
+pub mod stats;
 
+use crate::python::stats::Stats;
 use crate::solver::Algorithm;
 use pyo3::prelude::*;
 use ctrlc;
@@ -10,7 +12,9 @@ pub struct Sat {
     #[pyo3(get)]
     pub clauses: Vec<Vec<i64>>,
     #[pyo3(get)]
-    model : Option<Vec<bool>>
+    model : Option<Vec<bool>>,
+    #[pyo3(get)]
+    stats: Option<Stats>
 }
 
 #[pymethods]
@@ -28,12 +32,14 @@ impl Sat {
             Sat {
                 clauses: clauses,
                 model: None,
+                stats: None
             }
         }
         else {
             Sat {
                 clauses: vec!(),
-                model: None
+                model: None,
+                stats: None
             }
         }
     }
@@ -60,7 +66,9 @@ impl Sat {
     #[pyo3(signature = (algorithm) ,text_signature = "algorithm")]
     pub fn solve(&mut self, algorithm: Algorithm)->PyResult<()> {
         ctrlc::set_handler(|| std::process::exit(2)).unwrap();
-        self.model = self.solve_rs(algorithm)?;
+        let (result,stats) = self.solve_rs(algorithm)?;
+        self.stats = Some(stats);
+        self.model = result;
         Ok(())
     }
 }

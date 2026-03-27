@@ -1,6 +1,7 @@
 use crate::solver::Algorithm;
 use crate::formula::Formula;
 use crate::python::Sat;
+use crate::python::Stats;
 use pyo3::prelude::*;
 use std::fmt;
 
@@ -16,7 +17,7 @@ impl Sat {
 			.collect()
 	}
 	
-	pub fn solve_rs<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
+	pub fn solve_rs<'py>(&mut self, algorithm: Algorithm) -> PyResult<(Option<Vec<bool>>,Stats)> {
 
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
@@ -25,11 +26,11 @@ impl Sat {
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());
-                Ok(Some(model))
+                Ok((Some(model),formula.get_stats()))
             },
             Ok(None) => {
                 self.model = None;
-                Ok(None)
+                Ok((None,formula.get_stats()))
             }
             Err(e) => Err(e)
         }

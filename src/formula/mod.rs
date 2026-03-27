@@ -2,6 +2,13 @@ pub mod clause;
 pub mod literal;
 pub mod assignment;
 
+use std::io::{self, Write};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use crate::history::History;
@@ -9,6 +16,7 @@ use crate::solver::Algorithm;
 use crate::solver::solve;
 use crate::two_watched::Watch;
 use crate::two_watched::Watched;
+use crate::python::stats::Stats;
 use clause::Clause;
 use literal::Literal;
 use assignment::Assignment;
@@ -20,13 +28,15 @@ use std::fmt;
     pub struct Formula{
         clauses: Vec<Clause>,
         pub assignment: Assignment,
-        watch: Watch
+        watch: Watch,
+        pub stats: Stats,
     }
 
 impl Clone for Formula {
     fn clone(&self) -> Self {
         let new_assignment = self.assignment.clone();
         let new_watch = self.watch.clone();
+        let stats = self.stats.clone();
         
         let mut new_clauses = Vec::new();
         for clause in &self.clauses {
@@ -37,7 +47,8 @@ impl Clone for Formula {
         Formula {
             clauses: new_clauses,
             assignment: new_assignment,
-            watch: new_watch
+            watch: new_watch,
+            stats: stats,
         }
     }
 }
@@ -93,7 +104,8 @@ impl Formula {
         Formula{
             clauses: vec!(),
             assignment: Assignment::new(size),
-            watch: Watch::new(size)
+            watch: Watch::new(size),
+            stats: Stats::new()
         }
     }
     
@@ -108,7 +120,8 @@ impl Formula {
         let mut formula = Formula{
             clauses: clauses.to_owned(),
             assignment: Assignment::new(max_index as usize +1),
-            watch: Watch::new(max_index as usize +1)
+            watch: Watch::new(max_index as usize +1),
+            stats: Stats::new()
         };
         
         for (i, clause) in formula.clauses.iter().enumerate() {
@@ -170,6 +183,10 @@ impl Formula {
         self.get_clauses_mut().into_iter().enumerate().filter(|(_, clause)| !clause.is_satisfied(&assignment)).collect()
     }
     
+    pub fn get_stats(&self)->Stats{
+        self.stats
+    }
+    
     pub fn add_clause(&mut self, clause: Clause) {
         let clause_idx = self.clauses.len();
         match clause.watched {
@@ -194,7 +211,38 @@ impl Formula {
     }
     
     pub fn solve<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
-        solve(self, algorithm)
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+    
+        let timer = thread::spawn(move || {
+            let start = Instant::now();
+    
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                let elapsed = start.elapsed().as_secs();
+                let time_str = if elapsed >= 60 {
+                    let minutes = elapsed / 60;
+                    let seconds = elapsed % 60;
+                    format!("{}m {}s", minutes, seconds)
+                } else {
+                    format!("{}s", elapsed)
+                };
+            
+                print!("\r\x1b[2KSolving... {}", time_str);
+                io::stdout().flush().ok();
+            
+                thread::sleep(Duration::from_secs(1));
+            }
+    
+            print!("\r\x1b[2K");
+            io::stdout().flush().ok();
+        });
+    
+        let result = solve(self, algorithm);
+    
+        stop.store(true, Ordering::Relaxed);
+        let _ = timer.join();
+    
+        result
     }
     
     pub fn get_empty_clauses(&self) -> Option<Vec<&Clause>> {

@@ -25,8 +25,12 @@ impl FromPyObject<'_,'_> for Algorithm {
 }
 
 pub fn solve<'py>(formula: &mut Formula, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
-    match algorithm {
-        Algorithm::DPLL => return dpll::solve_dpll(formula),
-        Algorithm::CDCL => return cdcl::solve_cdcl(formula)
-    }
+    formula.stats.start();
+    let result = match algorithm {
+        Algorithm::DPLL => dpll::solve_dpll(formula),
+        Algorithm::CDCL => cdcl::solve_cdcl(formula)
+    };
+    formula.stats.stop();
+    
+    result
 }

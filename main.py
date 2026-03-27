@@ -18,14 +18,13 @@ def parse_dimacs(filename):
 def solve_sat(clauses):
     s = clsat.Sat(clauses)
     print("Solving SAT problem...",flush=True)
-    start = time.time() * 1000
     s.solve(algorithm="cdcl")
-    end = time.time() * 1000
-    print(f"Elapsed: {end-start}ms")
     if s.model is not None:
         print("SAT", flush=True)
     else:
         print("UNSAT",flush=True)
+    if s.stats is not None:
+        print(s.stats)
 
 if __name__ == "__main__":
     p = mp.Process(target=solve_sat, args=(parse_dimacs('input.dimacs'),))
