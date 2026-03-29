@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use crate::history::History;
 use crate::solver::Algorithm;
+use crate::history::ImplicationPoint;
 use crate::solver::solve;
 use crate::two_watched::Watch;
 use crate::two_watched::Watched;
@@ -25,12 +26,12 @@ use pyo3::prelude::*;
 use std::fmt;
 
 
-    pub struct Formula{
-        clauses: Vec<Clause>,
-        pub assignment: Assignment,
-        watch: Watch,
-        pub stats: Stats,
-    }
+pub struct Formula{
+    clauses: Vec<Clause>,
+    pub assignment: Assignment,
+    watch: Watch,
+    pub stats: Stats,
+}
 
 impl Clone for Formula {
     fn clone(&self) -> Self {
@@ -202,6 +203,12 @@ impl Formula {
         self.clauses.push(clause);
     }
     
+    pub fn add_literal(&mut self)->Literal{
+        let index = self.assignment.add_variable();
+        
+        Literal::new(index as u64,false)
+    }
+    
     pub fn set_variable(&mut self, index: u64, value: bool){
         self.assignment.assign(index, value)
     }
@@ -210,7 +217,7 @@ impl Formula {
         self.assignment.unset(index);
     }
     
-    pub fn solve<'py>(&mut self, algorithm: Algorithm) -> PyResult<Option<Vec<bool>>> {
+    pub fn solve<'py>(&mut self, algorithm: Algorithm, implication_point: ImplicationPoint) -> PyResult<Option<Vec<bool>>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
     
@@ -237,7 +244,7 @@ impl Formula {
             io::stdout().flush().ok();
         });
     
-        let result = solve(self, algorithm);
+        let result = solve(self, algorithm,implication_point);
     
         stop.store(true, Ordering::Relaxed);
         let _ = timer.join();

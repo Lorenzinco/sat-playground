@@ -1,4 +1,5 @@
 use crate::solver::Algorithm;
+use crate::history::ImplicationPoint;
 use crate::formula::Formula;
 use crate::python::Sat;
 use crate::python::Stats;
@@ -17,12 +18,12 @@ impl Sat {
 			.collect()
 	}
 	
-	pub fn solve_rs<'py>(&mut self, algorithm: Algorithm) -> PyResult<(Option<Vec<bool>>,Stats)> {
+	pub fn solve_rs<'py>(&mut self, algorithm: Algorithm, implication_point: ImplicationPoint) -> PyResult<(Option<Vec<bool>>,Stats)> {
 
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
         
-        let result = formula.solve(algorithm);
+        let result = formula.solve(algorithm,implication_point);
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());

@@ -1,17 +1,38 @@
 pub mod decision_level;
 pub mod implication_level;
+pub mod uip;
+pub mod dip;
 
-use fastbit::BitVec;
-use fastbit::BitRead;
-use fastbit::BitWrite;
+use pyo3::prelude::*;
 
 use crate::history::decision_level::DecisionLevel;
 use crate::history::implication_level::ImplicationLevels;
+use crate::history::uip::find_1uip;
+use crate::history::dip::find_dip;
+
 use crate::formula::assignment::Assignment;
 use crate::formula::literal::Literal;
 use crate::formula::clause::Clause;
 use crate::formula::Formula;
 
+#[derive(Clone,Copy)]
+pub enum ImplicationPoint{
+    UIP,
+    DIP
+}
+
+impl FromPyObject<'_,'_> for ImplicationPoint {
+    type Error = PyErr;
+    
+    fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
+        let implication_point = obj.extract::<String>()?;
+        match implication_point.as_str() {
+            "uip" => Ok(ImplicationPoint::UIP),
+            "dip" => Ok(ImplicationPoint::DIP),
+            _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Unknown implication point for cdcl solver {}, allowed values are: uip, dip", implication_point))),
+        }
+    }
+}
 
 pub struct History {
     decision_levels: Vec<DecisionLevel>,
@@ -93,140 +114,11 @@ impl History {
     
     
     /// Returns the learned minimized clause at 1UIP and the conflict level the clause was found at.
-    pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize) -> (Clause, usize) {
-        let current_level = self.get_decision_level();
-        if current_level == 0 { return (Clause::new(), 0); } // Unsat
-
-        let mut seen = BitVec::<u64>::new(formula.assignment.len());
-        let mut learned_lits: Vec<Literal> = Vec::new();
-        let mut path_count = 0;
-        
-        let mut current_clause_idx = Some(conflict_clause_index);
-        let mut resolved_lit: Option<Literal> = None;
-
-        let level_data = &self.decision_levels[current_level];
-        let mut trail_iter = level_data.get_implied_literals_rev()
-            .chain(level_data.get_decision_literal().into_iter());
-
-        loop {
-            if let Some(clause_idx) = current_clause_idx {
-                let clause = &formula.get_clauses()[clause_idx];
-                for lit in clause.iter() {
-                    if Some(lit) == resolved_lit.as_ref() { continue; }
-                    
-                    let var = lit.get_index() as usize;
-                    if !seen.test(var) {
-                        seen.set(var);
-                        if self.get_literal_level(lit) == Some(current_level) {
-                            path_count += 1;
-                        } else {
-                            learned_lits.push(lit.clone());
-                        }
-                    }
-                }
-            }
-
-            loop {
-                if let Some(lit) = trail_iter.next() {
-                    let var = lit.get_index() as usize;
-                    if seen.test(var) {
-                        resolved_lit = Some(lit.clone());
-                        path_count -= 1;
-                        current_clause_idx = level_data.get_reason(lit);
-                        break;
-                    }
-                } else {
-                    unreachable!("Trail is empty but path_count is > 0");
-                }
-            }
-
-            if path_count == 0 {
-                learned_lits.push(resolved_lit.unwrap().negated());
-                break;
-            }
+    pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize, implication_point: ImplicationPoint) -> (Clause, usize) {
+        match implication_point {
+            ImplicationPoint::UIP => {find_1uip(self, formula, conflict_clause_index)}
+            ImplicationPoint::DIP => {find_dip(self,formula,conflict_clause_index)}
         }
-        
-        let last_idx = learned_lits.len() - 1;
-        learned_lits.swap(0, last_idx);
-
-        let mut min_seen = BitVec::<u64>::new(formula.assignment.len());
-        for lit in &learned_lits {
-            min_seen.set(lit.get_index() as usize);
-        }
-        
-        let mut poisoned = BitVec::<u64>::new(formula.assignment.len());
-        
-        let mut minimized_lits = Vec::new();
-        minimized_lits.push(learned_lits[0].clone());
-        
-        for lit in learned_lits.iter().skip(1) {
-            let var = lit.get_index() as usize;
-            let level = self.get_literal_level(lit).unwrap_or(0);
-            
-            if level == 0 { continue; }
-            
-            let mut stack = vec![lit.clone()];
-            let mut local_seen = Vec::new();
-            let mut failed = false;
-            
-            while let Some(current) = stack.pop() {
-                let c_var = current.get_index() as usize;
-                
-                if c_var != var && min_seen.test(c_var) { continue; }
-                
-                if poisoned.test(c_var) { 
-                    failed = true; 
-                    break; 
-                }
-                
-                let c_level = self.get_literal_level(&current).unwrap_or(0);
-                if c_level == 0 { continue; }
-                
-                let reason_idx = self.decision_levels[c_level].get_reason(&current);
-                
-                match reason_idx {
-                    None => {
-                        failed = true;
-                        break;
-                    }
-                    Some(idx) => {
-                        let clause = &formula.get_clauses()[idx];
-                        
-                        if c_var != var {
-                            min_seen.set(c_var);
-                            local_seen.push(c_var);
-                        }
-                        
-                        for child in clause.get_literals() {
-                            let child_var = child.get_index() as usize;
-                            if child_var != c_var {
-                                stack.push(child.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            
-            if failed {
-                for &c_var in &local_seen {
-                    min_seen.reset(c_var);
-                    poisoned.set(c_var);
-                }
-                poisoned.set(var);
-                minimized_lits.push(lit.clone());
-            } else {
-            }
-        }
-        
-        let mut backtrack_level = 0;
-        for lit in minimized_lits.iter().skip(1) {
-            let level = self.get_literal_level(lit).unwrap_or(0);
-            if level > backtrack_level {
-                backtrack_level = level;
-            }
-        }
-        
-        (Clause::from_literals(&minimized_lits), backtrack_level)
     }
 
 }
@@ -306,7 +198,7 @@ mod history{
     }
     
     #[test]
-    fn analyze_conflict_basic() {
+    fn analyze_conflict_basic_uip() {
         
         let clauses: Vec<Vec<i64>> = vec![
             vec![-1, 2],   // 0: -x1 v x2
@@ -334,7 +226,7 @@ mod history{
         formula.assignment.assign(x4.get_index(), true);
         history.add_implication(&x4, Some(2)); // Reason: C2 (-3, 4)
         
-        let (learned, backtrack_level) = history.analyze_conflict(&formula, 3);
+        let (learned, backtrack_level) = history.analyze_conflict(&formula, 3, ImplicationPoint::UIP);
         
         println!("Learned clause: {}", learned);
         
@@ -347,7 +239,7 @@ mod history{
     }
     
     #[test]
-    fn analyze_conflict_with_backtrack() {
+    fn analyze_conflict_with_backtrack_uip() {
         
         let clauses: Vec<Vec<i64>> = vec![
             vec![-1, 2],      // 0: -x1 v x2
@@ -373,7 +265,7 @@ mod history{
         history.add_implication(&x4, Some(1));
         
         
-        let (learned, backtrack_level) = history.analyze_conflict(&formula, 2);
+        let (learned, backtrack_level) = history.analyze_conflict(&formula, 2, ImplicationPoint::UIP);
         
         println!("Learned: {}", learned);
         
@@ -382,18 +274,18 @@ mod history{
     }
     
     #[test]
-    fn conflict_analysis_unsat() {
+    fn conflict_analysis_unsat_uip() {
         let history = History::new();
         let clauses: Vec<Vec<i64>> = vec![vec![1], vec![-1]]; // Unsat immediately
         let formula = Formula::from_vec(clauses);
         
-        let (clause, level) = history.analyze_conflict(&formula, 0);
+        let (clause, level) = history.analyze_conflict(&formula, 0, ImplicationPoint::UIP);
         assert!(clause.len() == 0); 
         assert_eq!(level, 0);
     }
     
     #[test]
-    fn conflict_analysis_simple() {
+    fn conflict_analysis_simple_uip() {
         
         let clauses: Vec<Vec<i64>> = vec![
             vec![-1, 2],
@@ -431,7 +323,7 @@ mod history{
         history.add_implication(&lit5_neg, Some(3));
 
 
-        let (learned_clause, backtrack_level) = history.analyze_conflict(&formula, 4);
+        let (learned_clause, backtrack_level) = history.analyze_conflict(&formula, 4, ImplicationPoint::UIP);
         
         // 1-UIP Analysis:
         // Resolution on 5 (from C4 and C3): -4 v -4 = -4

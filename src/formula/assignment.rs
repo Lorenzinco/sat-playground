@@ -78,4 +78,13 @@ impl Assignment {
         
         None
     }
+    
+    /// Adds a variable to the assignment returning the index to be put inside the literal, thus len-1
+    pub fn add_variable(&mut self)->usize{
+        let idx = self.value.len();
+        self.value.resize(idx+1);
+        self.assigned.resize(idx+1);
+        
+        idx
+    }
 }

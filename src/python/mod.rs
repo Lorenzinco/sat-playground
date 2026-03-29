@@ -3,6 +3,7 @@ pub mod stats;
 
 use crate::python::stats::Stats;
 use crate::solver::Algorithm;
+use crate::history::ImplicationPoint;
 use pyo3::prelude::*;
 use ctrlc;
 
@@ -63,10 +64,10 @@ impl Sat {
     }
     
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm) ,text_signature = "algorithm")]
-    pub fn solve(&mut self, algorithm: Algorithm)->PyResult<()> {
+    #[pyo3(signature = (algorithm,implication_point) ,text_signature = "algorithm, implication_point")]
+    pub fn solve(&mut self, algorithm: Algorithm, implication_point: ImplicationPoint)->PyResult<()> {
         ctrlc::set_handler(|| std::process::exit(2)).unwrap();
-        let (result,stats) = self.solve_rs(algorithm)?;
+        let (result,stats) = self.solve_rs(algorithm,implication_point)?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())

@@ -1,10 +1,11 @@
 use crate::formula::Formula;
 use crate::history::History;
+use crate::history::ImplicationPoint;
 use crate::formula::literal::Literal;
 use pyo3::prelude::PyResult;
 use std::collections::VecDeque;
 
-pub fn solve_cdcl<'py>(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
+pub fn solve_cdcl<'py>(formula: &mut Formula, implication_point: ImplicationPoint) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
     let mut queue: VecDeque<Literal> = VecDeque::new();
     
@@ -49,7 +50,7 @@ pub fn solve_cdcl<'py>(formula: &mut Formula) -> PyResult<Option<Vec<bool>>> {
             }
             
             // Analyze the conflict and learn a new clause
-            let (learned, backtrack_level) = history.analyze_conflict(formula, conflict_idx);
+            let (learned, backtrack_level) = history.analyze_conflict(formula, conflict_idx,implication_point);
             formula.stats.add_conflict();
             // Backtrack
             history.revert_decision(backtrack_level + 1, &mut formula.assignment);
@@ -79,30 +80,30 @@ mod tests {
     use crate::formula::Formula;
 
     #[test]
-    fn test_cdcl_simple_sat() {
+    fn test_cdcl_simple_sat_uip() {
         // (x1 v x2) ^ (-x1 v x3)
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
 
-        let res = solve_cdcl(&mut formula).unwrap();
+        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
         assert!(res.is_some());
     }
 
     #[test]
-    fn test_cdcl_simple_unsat() {
+    fn test_cdcl_simple_unsat_uip() {
         // (x1) ^ (-x1)
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
 
-        let res = solve_cdcl(&mut formula).unwrap();
+        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
         assert!(res.is_none());
     }
 
     #[test]
-    fn test_cdcl_inner_conflict_loop() {
+    fn test_cdcl_inner_conflict_loop_uip() {
         // (x1 v x2) ^ (x1 v -x2) ^ (-x1 v x3) ^ (-x1 v -x3)
         let mut formula =
             Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
 
-        let res = solve_cdcl(&mut formula).unwrap();
+        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
         assert!(res.is_none());
     }
 }
