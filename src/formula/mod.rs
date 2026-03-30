@@ -2,6 +2,7 @@ pub mod clause;
 pub mod literal;
 pub mod assignment;
 pub mod extension;
+pub mod vsids;
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -238,20 +239,20 @@ impl Formula {
                 let time_str = if elapsed >= 60 {
                     let minutes = elapsed / 60;
                     let seconds = elapsed % 60;
-                    format!("{}m {}s", minutes, seconds)
+                    format!("c {}m {}s", minutes, seconds)
                 } else {
-                    format!("{}s", elapsed)
+                    format!("c {}s", elapsed)
                 };
             
                 // We cast the pointer back to read the struct properties.
                 // Technically a data race for printing purposes, but entirely benign.
                 let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
                 
-                print!("\r\x1b[2K\x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | \x1b[34mLearnt: {}\x1b[0m | Lits: {} | AvgLen: {:.2}", 
+                print!("\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | \x1b[34mLearnt: {}\x1b[0m | Lits: {} | AvgLen: {:.2}", 
                        time_str, stats.conflicts, stats.clauses_learnt, stats.literals_learnt, stats.avg_clause_length);
                 io::stdout().flush().ok();
             
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(100));
             }
     
             print!("\r\x1b[2K");

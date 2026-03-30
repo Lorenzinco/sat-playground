@@ -216,6 +216,7 @@ dependencies = [
  "indexmap",
  "pyo3",
  "pyo3-build-config",
+ "ultragraph",
 ]
 
 [[package]]
@@ -234,6 +235,12 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "ultragraph"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c226ce8b5e04038b4809d57b20d128b8a6dc02303bece62a333769cf199d75af"
 
 [[package]]
 name = "unicode-ident"

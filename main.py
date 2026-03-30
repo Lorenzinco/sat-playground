@@ -17,16 +17,16 @@ def parse_dimacs(filename):
 
 def solve_sat(clauses):
     s = clsat.Sat(clauses)
-    print("Solving SAT problem...",flush=True)
+    print("c Solving SAT problem...",flush=True)
     s.solve(algorithm="cdcl",implication_point="dip")
     if s.model is not None:
-        print("SAT", flush=True)
+        print("s SATISFIABLE", flush=True)
     else:
-        print("UNSAT",flush=True)
+        print("s UNSATISFIABLE",flush=True)
     if s.stats is not None:
         print(s.stats)
 
 if __name__ == "__main__":
-    p = mp.Process(target=solve_sat, args=(parse_dimacs('input.dimacs'),))
+    p = mp.Process(target=solve_sat, args=(parse_dimacs('sudoku.cnf'),))
     p.start()
     p.join()

@@ -3,7 +3,10 @@ use crate::history::History;
 use crate::history::ImplicationPoint;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
+use crate::formula::vsids::Vsids;
+
 use pyo3::prelude::PyResult;
+
 use std::collections::VecDeque;
 
 pub fn solve_cdcl<'py>(
@@ -12,6 +15,7 @@ pub fn solve_cdcl<'py>(
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
     let mut queue: VecDeque<Literal> = VecDeque::new();
+    let mut vsids = Vsids::new(formula.assignment.len());
 
     // Initial unit clauses
     let mut initial_units = Vec::new();
@@ -39,7 +43,7 @@ pub fn solve_cdcl<'py>(
     }
 
     loop {
-        let decision_lit = match formula.get_unassigned_literal() {
+        let decision_lit = match vsids.get_best_unassigned(formula) {
             Some(lit) => lit,
             None => return Ok(Some(formula.get_model())),
         };
@@ -99,19 +103,28 @@ pub fn solve_cdcl<'py>(
                 learned = Clause::from_literals(&new_lits);
             }
 
-            // Greedy extension substitution over the remaining clause
-            let mut final_lits = Vec::new();
-            let mut lits_iter = learned.get_literals().iter().peekable();
-
-            while let Some(current_lit) = lits_iter.next() {
-                if let Some(next_lit) = lits_iter.peek() {
-                    if let Some(substitute) = formula.extensions.substitute(current_lit, next_lit) {
-                        final_lits.push(substitute);
-                        lits_iter.next();
-                        continue;
+            // Extension substitution over the remaining clause
+            let mut final_lits = learned.get_literals().clone();
+            let mut changed = true;
+            
+            while changed {
+                changed = false;
+                'outer: for i in 0..final_lits.len() {
+                    for j in (i + 1)..final_lits.len() {
+                        if let Some(substitute) = formula.extensions.substitute(&final_lits[i], &final_lits[j]) {
+                            // Remove j first since it's the larger index, then remove i
+                            final_lits.remove(j);
+                            final_lits.remove(i);
+                            
+                            // Push the newly substituted literal
+                            final_lits.push(substitute);
+                            
+                            // Restart the search since the array changed
+                            changed = true;
+                            break 'outer;
+                        }
                     }
                 }
-                final_lits.push(current_lit.clone());
             }
 
             learned = Clause::from_literals(&final_lits);
@@ -124,6 +137,11 @@ pub fn solve_cdcl<'py>(
             formula.stats.add_learnt_clause(&learned);
             formula.add_clause(learned.clone());
             let new_clause_idx = formula.get_clauses().len() - 1;
+            
+            for lit in learned.get_literals() {
+                vsids.bump(lit.get_index() as usize);
+            }
+            vsids.decay_all();
 
             // Both UIP and DIP clauses are now asserting at the backtrack level.
             // For DIP, the extension variable `z` acts as the asserting unit literal.
@@ -145,10 +163,10 @@ pub fn solve_cdcl<'py>(
                     
                     // IF IT WAS A DIP, WE MUST FORCE BCP ON THE UNDERLYING VARIABLES
                     // TO PREVENT A DETERMINISTIC INFINITE LOOP
-                    if let Some((l1, _l2)) = dip_pair {
+                    if let Some((_l1, l2)) = dip_pair {
                         // We heuristically force one of the DIP literals to false 
                         // to force the other to true via the z definition clause.
-                        let force_false_lit = l1.negated();
+                        let force_false_lit = l2.negated();
                         if force_false_lit.eval(&formula.assignment).is_none() {
                             formula.assignment.assign(force_false_lit.get_index(), !force_false_lit.is_negated());
                             history.add_implication(&force_false_lit, None); // Driven by heuristics, no specific clause reason
