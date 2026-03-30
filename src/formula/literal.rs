@@ -57,7 +57,20 @@ impl Literal{
             negative: !self.negative
         }
     }
+    
+    pub fn from_real_index(real_index: u64)->Literal{
+        let negated = if real_index.is_multiple_of(2) { false } else { true };
+        let idx = real_index / 2;
+        
+        Literal::new(idx,negated)
+    }
 
+    pub fn get_signed_index(&self)->u64{
+        match self.is_negated() {
+            true => {self.get_index()*2+1}
+            false => {self.get_index()*2}
+        }
+    }
 	
 	pub fn get_index(&self)->u64{
 	    self.variable_index

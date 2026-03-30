@@ -6,13 +6,15 @@ use crate::formula::clause::Clause;
 #[derive(Clone,Copy)]
 pub struct Stats {
     #[pyo3(get)]
-    conflicts: u64,
+    pub conflicts: u64,
     #[pyo3(get)]
-    clauses_learnt: u64,
+    pub clauses_learnt: u64,
     #[pyo3(get)]
-    avg_clause_length: f64,
-    time_start: Option<Instant>,
-    time_stop: Option<Instant>,
+    pub literals_learnt: u64,
+    #[pyo3(get)]
+    pub avg_clause_length: f64,
+    pub time_start: Option<Instant>,
+    pub time_stop: Option<Instant>,
 }
 
 impl Stats {
@@ -20,10 +22,15 @@ impl Stats {
         Self {
             conflicts: 0,
             clauses_learnt: 0,
+            literals_learnt: 0,
             avg_clause_length: 0.0,
             time_start: None,
             time_stop: None,
         }
+    }
+    
+    pub fn add_literal(&mut self){
+        self.literals_learnt += 1
     }
     
     pub fn add_conflict(&mut self){
@@ -68,16 +75,19 @@ impl Stats {
             let learnt = self.clauses_learnt;
             let avg_len = self.avg_clause_length;
             let conflicts = self.conflicts;
+            let lits = self.literals_learnt;
     
             let elapsed_s = format!("{:>40.2}", elapsed);
             let learnt_s = format!("{:>40}", learnt);
             let avg_len_s = format!("{:>40.2}", avg_len);
             let conflicts_s = format!("{:>40}", conflicts);
+            let lits_s = format!("{:>40}",lits);
     
             format!(
                 "+------------------------------------------------------------------------+\n\
                  | {:^70} |\n\
                  +------------------------------------------------------------------------+\n\
+                 | {:<27} | {} |\n\
                  | {:<27} | {} |\n\
                  | {:<27} | {} |\n\
                  | {:<27} | {} |\n\
@@ -92,6 +102,8 @@ impl Stats {
                 avg_len_s,
                 "Conflicts",
                 format!("{red}{conflicts_s}{reset}"),
+                "Learnet lits",
+                format!("{blue}{lits_s}{reset}")
             )
         }
 

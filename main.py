@@ -18,7 +18,7 @@ def parse_dimacs(filename):
 def solve_sat(clauses):
     s = clsat.Sat(clauses)
     print("Solving SAT problem...",flush=True)
-    s.solve(algorithm="cdcl")
+    s.solve(algorithm="cdcl",implication_point="dip")
     if s.model is not None:
         print("SAT", flush=True)
     else:

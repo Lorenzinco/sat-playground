@@ -1,6 +1,7 @@
 pub mod clause;
 pub mod literal;
 pub mod assignment;
+pub mod extension;
 
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
@@ -17,6 +18,7 @@ use crate::history::ImplicationPoint;
 use crate::solver::solve;
 use crate::two_watched::Watch;
 use crate::two_watched::Watched;
+use crate::formula::extension::ExtensionMap;
 use crate::python::stats::Stats;
 use clause::Clause;
 use literal::Literal;
@@ -31,6 +33,7 @@ pub struct Formula{
     pub assignment: Assignment,
     watch: Watch,
     pub stats: Stats,
+    pub extensions: ExtensionMap
 }
 
 impl Clone for Formula {
@@ -38,6 +41,7 @@ impl Clone for Formula {
         let new_assignment = self.assignment.clone();
         let new_watch = self.watch.clone();
         let stats = self.stats.clone();
+        let new_extensions = self.extensions.clone();
         
         let mut new_clauses = Vec::new();
         for clause in &self.clauses {
@@ -50,6 +54,7 @@ impl Clone for Formula {
             assignment: new_assignment,
             watch: new_watch,
             stats: stats,
+            extensions: new_extensions
         }
     }
 }
@@ -105,8 +110,9 @@ impl Formula {
         Formula{
             clauses: vec!(),
             assignment: Assignment::new(size),
-            watch: Watch::new(size),
-            stats: Stats::new()
+            watch: Watch::new(size as u64),
+            stats: Stats::new(),
+            extensions: ExtensionMap::new()
         }
     }
     
@@ -121,18 +127,19 @@ impl Formula {
         let mut formula = Formula{
             clauses: clauses.to_owned(),
             assignment: Assignment::new(max_index as usize +1),
-            watch: Watch::new(max_index as usize +1),
-            stats: Stats::new()
+            watch: Watch::new(max_index +1),
+            stats: Stats::new(),
+            extensions: ExtensionMap::new()
         };
         
         for (i, clause) in formula.clauses.iter().enumerate() {
             match clause.watched {
                 Watched::Two(idx1, idx2) => {
-                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx1]);
-                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx2]);
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx1 as usize]);
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx2 as usize]);
                 }
                 Watched::One(idx) => {
-                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx]);
+                    formula.watch.add_to_watchlist(i, &clause.get_literals()[idx as usize]);
                 }
                 Watched::None => {}
             }
@@ -193,11 +200,11 @@ impl Formula {
         match clause.watched {
             Watched::None => {},
             Watched::One(idx)=> {
-                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx]);
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx as usize]);
             },
             Watched::Two(idx1,idx2)=>{
-                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx1]);
-                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx2]);
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx1 as usize]);
+                self.watch.add_to_watchlist(clause_idx,&clause.get_literals()[idx2 as usize]);
             }
         }
         self.clauses.push(clause);
@@ -205,6 +212,7 @@ impl Formula {
     
     pub fn add_literal(&mut self)->Literal{
         let index = self.assignment.add_variable();
+        self.watch.add_literal();
         
         Literal::new(index as u64,false)
     }
@@ -220,6 +228,7 @@ impl Formula {
     pub fn solve<'py>(&mut self, algorithm: Algorithm, implication_point: ImplicationPoint) -> PyResult<Option<Vec<bool>>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
+        let stats_ptr = &self.stats as *const _ as usize;
     
         let timer = thread::spawn(move || {
             let start = Instant::now();
@@ -234,7 +243,12 @@ impl Formula {
                     format!("{}s", elapsed)
                 };
             
-                print!("\r\x1b[2KSolving... {}", time_str);
+                // We cast the pointer back to read the struct properties.
+                // Technically a data race for printing purposes, but entirely benign.
+                let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
+                
+                print!("\r\x1b[2K\x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | \x1b[34mLearnt: {}\x1b[0m | Lits: {} | AvgLen: {:.2}", 
+                       time_str, stats.conflicts, stats.clauses_learnt, stats.literals_learnt, stats.avg_clause_length);
                 io::stdout().flush().ok();
             
                 thread::sleep(Duration::from_secs(1));
@@ -409,15 +423,15 @@ impl Formula {
                     continue;
                 }
                 
-                let clause = &mut self.clauses[clause_idx];
+                let clause = &mut self.clauses[clause_idx as usize];
                 
                 let (false_idx, other_idx) = match clause.watched {
                     Watched::Two(i, j) => {
-                        if clause.get_literals()[i] == false_lit { (i, j) } else { (j, i) }
+                        if clause.get_literals()[i as usize] == false_lit { (i, j) } else { (j, i) }
                     },
                     Watched::One(i) => {
                         keep_watchlist.push(clause_idx);
-                        if clause.get_literals()[i] == false_lit {
+                        if clause.get_literals()[i as usize] == false_lit {
                             conflict = Some(clause_idx);
                         }
                         continue;
@@ -428,7 +442,7 @@ impl Formula {
                     },
                 };
                 
-                let other_lit = clause.get_literals()[other_idx].clone();
+                let other_lit = clause.get_literals()[other_idx as usize].clone();
                 
                 // 1. If the other watched literal is True, the clause is already satisfied.
                 if other_lit.eval(&self.assignment) == Some(true) {
@@ -439,13 +453,13 @@ impl Formula {
                 // 2. Try to find a new unassigned (or true) literal in the clause to watch
                 let mut found_new_watch = false;
                 for k in 0..clause.get_literals().len() {
-                    if k == false_idx || k == other_idx { continue; }
+                    if k == false_idx as usize || k == other_idx as usize { continue; }
                     
                     let candidate = clause.get_literals()[k].clone();
                     if candidate.eval(&self.assignment) != Some(false) {
-                        clause.watched = Watched::Two(k, other_idx);
+                        clause.watched = Watched::Two(k as u64, other_idx);
                         // Add to candidate's watchlist (we don't remove from false_lit because we already took it!)
-                        self.watch.add_to_watchlist(clause_idx, &candidate);
+                        self.watch.add_to_watchlist(clause_idx as usize, &candidate);
                         found_new_watch = true;
                         break;
                     }
@@ -458,7 +472,7 @@ impl Formula {
                         conflict = Some(clause_idx);
                     } else {
                         self.assignment.assign(other_lit.get_index(), !other_lit.is_negated());
-                        history.add_implication(&other_lit, Some(clause_idx));
+                        history.add_implication(&other_lit, Some(clause_idx as usize));
                         queue.push_back(other_lit);
                     }
                 }
@@ -468,7 +482,7 @@ impl Formula {
             self.watch.set(&false_lit, keep_watchlist);
             
             if let Some(c) = conflict {
-                return Some(c);
+                return Some(c as usize);
             }
         }
         
