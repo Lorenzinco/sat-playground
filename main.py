@@ -27,6 +27,6 @@ def solve_sat(clauses):
         print(s.stats)
 
 if __name__ == "__main__":
-    p = mp.Process(target=solve_sat, args=(parse_dimacs('sudoku.cnf'),))
+    p = mp.Process(target=solve_sat, args=(parse_dimacs('input.dimacs'),))
     p.start()
     p.join()

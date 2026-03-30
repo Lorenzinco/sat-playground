@@ -4,6 +4,7 @@ use crate::history::ImplicationPoint;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::formula::vsids::Vsids;
+use crate::history::ConflictLearnResult;
 
 use pyo3::prelude::PyResult;
 
@@ -27,7 +28,7 @@ pub fn solve_cdcl<'py>(
 
     for (i, lit) in initial_units {
         match lit.eval(&formula.assignment) {
-            Some(false) => return Ok(None), // level-0 conflict
+            Some(false) => return Ok(None),
             Some(true) => {}
             None => {
                 formula.assignment.assign(lit.get_index(), !lit.is_negated());
@@ -61,120 +62,213 @@ pub fn solve_cdcl<'py>(
                 return Ok(None);
             }
 
-            let (mut learned, backtrack_level, dip_pair) =
-                history.analyze_conflict(formula, conflict_idx, implication_point);
-
-            // DIP compression: replace the two DIP literals by an extension variable z
-            if let Some((l1, l2)) = dip_pair.clone() {
-                let z = match formula.extensions.substitute(&l1, &l2) {
-                    Some(ext_lit) => {
-                        ext_lit
-                    },
-                    None => {
-                        let new_z = formula.add_literal();
-                        formula.stats.add_literal();
-                        formula.extensions.add_substitution(&l1, &l2, &new_z);
-
-                        // z <-> (l1 v l2)
-                        formula.add_clause(Clause::from_literals(&vec![
-                            new_z.negated(),
-                            l1.clone(),
-                            l2.clone(),
-                        ]));
-                        formula.add_clause(Clause::from_literals(&vec![
-                            new_z.clone(),
-                            l1.negated(),
-                        ]));
-                        formula.add_clause(Clause::from_literals(&vec![
-                            new_z.clone(),
-                            l2.negated(),
-                        ]));
-
-                        new_z
-                    }
-                };
-
-                // Replace the first two literals (the DIP pair) with z.
-                // This assumes analyze_conflict returns the DIP pair in the first two positions.
-                let mut new_lits = vec![z];
-                for lit in learned.get_literals().iter().skip(2) {
-                    new_lits.push(lit.clone());
-                }
-                learned = Clause::from_literals(&new_lits);
-            }
-
-            // Extension substitution over the remaining clause
-            let mut final_lits = learned.get_literals().clone();
-            let mut changed = true;
-            
-            while changed {
-                changed = false;
-                'outer: for i in 0..final_lits.len() {
-                    for j in (i + 1)..final_lits.len() {
-                        if let Some(substitute) = formula.extensions.substitute(&final_lits[i], &final_lits[j]) {
-                            // Remove j first since it's the larger index, then remove i
-                            final_lits.remove(j);
-                            final_lits.remove(i);
-                            
-                            // Push the newly substituted literal
-                            final_lits.push(substitute);
-                            
-                            // Restart the search since the array changed
-                            changed = true;
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-
-            learned = Clause::from_literals(&final_lits);
-
-            // Backtrack before adding/using the learned clause
             formula.stats.add_conflict();
-            history.revert_decision(backtrack_level + 1, &mut formula.assignment);
-            queue.clear();
 
-            formula.stats.add_learnt_clause(&learned);
-            formula.add_clause(learned.clone());
-            let new_clause_idx = formula.get_clauses().len() - 1;
-            
-            for lit in learned.get_literals() {
-                vsids.bump(lit.get_index() as usize);
-            }
-            vsids.decay_all();
+            match history.analyze_conflict(formula, conflict_idx, implication_point) {
+                ConflictLearnResult::Uip {
+                    clause,
+                    backtrack_level,
+                } => {
+                    let learned =
+                        Clause::from_literals(&apply_recursive_extension_substitution(formula, clause.get_literals().clone()));
 
-            // Both UIP and DIP clauses are now asserting at the backtrack level.
-            // For DIP, the extension variable `z` acts as the asserting unit literal.
-            let asserting_lit = learned.get_literals()[0].clone();
-            match asserting_lit.eval(&formula.assignment) {
-                Some(false) => {
-                    // Defensive: if this happens, the learned clause/backtrack level is inconsistent
-                    return Ok(None);
+                    history.revert_decision(backtrack_level + 1, &mut formula.assignment);
+                    queue.clear();
+
+                    formula.stats.add_learnt_clause(&learned);
+                    formula.add_clause(learned.clone());
+                    let clause_idx = formula.get_clauses().len() - 1;
+
+                    for lit in learned.get_literals() {
+                        vsids.bump(lit);
+                    }
+                    vsids.decay_all();
+
+                    let asserting_lit = match find_asserting_literal(&learned, &formula.assignment) {
+                        Some(lit) => lit,
+                        None => return Ok(None),
+                    };
+
+                    enqueue_asserting_literal(
+                        formula,
+                        &mut history,
+                        &mut queue,
+                        asserting_lit,
+                        clause_idx,
+                    )?;
                 }
-                Some(true) => {
-                    // Already assigned consistently; nothing to enqueue
-                }
-                None => {
-                    formula
-                        .assignment
-                        .assign(asserting_lit.get_index(), !asserting_lit.is_negated());
-                    history.add_implication(&asserting_lit, Some(new_clause_idx));
-                    queue.push_back(asserting_lit);
+
+                ConflictLearnResult::Dip {
+                    dip_a,
+                    dip_b,
+                    first_uip: _first_uip,
+                    pre_clause_without_z,
+                    post_clause_without_z,
+                    backtrack_level,
+                } => {
+                    let z = match formula.extensions.substitute(&dip_a, &dip_b) {
+                        Some(ext_lit) => ext_lit,
+                        None => {
+                            let new_z = formula.add_literal();
+                            formula.stats.add_literal();
+                            formula.extensions.add_substitution(&dip_a, &dip_b, &new_z);
+
+                            // Follow the encoding convention already used in your code:
+                            // z <-> (dip_a v dip_b)
+                            println!("{new_z} <-> ({dip_a}v{dip_b})");
+                            formula.add_clause(Clause::from_literals(&vec![
+                                new_z.negated(),
+                                dip_a.clone(),
+                                dip_b.clone(),
+                            ]));
+                            formula.add_clause(Clause::from_literals(&vec![
+                                new_z.clone(),
+                                dip_a.negated(),
+                            ]));
+                            formula.add_clause(Clause::from_literals(&vec![
+                                new_z.clone(),
+                                dip_b.negated(),
+                            ]));
+
+                            new_z
+                        }
+                    };
+
+                    // pre = pre_clause_without_z ∨ z
+                    let mut pre_lits = pre_clause_without_z;
+                    pre_lits.push(z.clone());
+                    let pre_clause =
+                        Clause::from_literals(&apply_recursive_extension_substitution(formula, pre_lits));
+
+                    // post = post_clause_without_z ∨ ¬z
+                    let mut post_lits = post_clause_without_z;
+                    post_lits.push(z.negated());
+                    let post_clause =
+                        Clause::from_literals(&apply_recursive_extension_substitution(formula, post_lits));
+
+                    let mut actual_backtrack = backtrack_level;
+                    // Dynamically fix the backtrack level if VSIDS guessed an extension variable wrongly
+                    while post_clause.is_empty(&formula.assignment) {
+                        println!("Guessed wrongly");
+                        if actual_backtrack == 0 {
+                            return Ok(None); // Truly UNSAT at level 0
+                        }
+                        actual_backtrack -= 1;
+                        history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
+                    }
+                    println!("Learning clauses: {pre_clause}{post_clause}");
                     
-                    // IF IT WAS A DIP, WE MUST FORCE BCP ON THE UNDERLYING VARIABLES
-                    // TO PREVENT A DETERMINISTIC INFINITE LOOP
-                    if let Some((_l1, l2)) = dip_pair {
-                        // We heuristically force one of the DIP literals to false 
-                        // to force the other to true via the z definition clause.
-                        let force_false_lit = l2.negated();
-                        if force_false_lit.eval(&formula.assignment).is_none() {
-                            formula.assignment.assign(force_false_lit.get_index(), !force_false_lit.is_negated());
-                            history.add_implication(&force_false_lit, None); // Driven by heuristics, no specific clause reason
-                            queue.push_back(force_false_lit);
+                    history.revert_decision(backtrack_level + 1, &mut formula.assignment);
+                    queue.clear();
+
+                    for lit in pre_clause.get_literals() {
+                        vsids.bump(lit);
+                    }
+                    for lit in post_clause.get_literals() {
+                        vsids.bump(lit);
+                    }
+                    formula.stats.add_learnt_clause(&pre_clause);
+                    formula.add_clause(pre_clause);
+                    let _pre_idx = formula.get_clauses().len() - 1;
+
+                    formula.stats.add_learnt_clause(&post_clause);
+                    formula.add_clause(post_clause);
+                    let post_idx = formula.get_clauses().len() - 1;
+
+                    vsids.decay_all();
+
+                    // After backtracking to l_D, the post-DIP clause should assert ¬z.
+                    let asserting_lit = z.negated();
+
+                    match asserting_lit.eval(&formula.assignment) {
+                        Some(false) => {
+                            return Ok(None);
+                        }
+                        Some(true) => {
+                            // Already assigned consistently.
+                        }
+                        None => {
+                            enqueue_asserting_literal(
+                                formula,
+                                &mut history,
+                                &mut queue,
+                                asserting_lit,
+                                post_idx,
+                            )?;
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+fn apply_recursive_extension_substitution(
+    formula: &Formula,
+    mut lits: Vec<Literal>,
+) -> Vec<Literal> {
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+
+        'outer: for i in 0..lits.len() {
+            for j in (i + 1)..lits.len() {
+                if let Some(substitute) = formula.extensions.substitute(&lits[i], &lits[j]) {
+                    lits.remove(j);
+                    lits.remove(i);
+                    lits.push(substitute);
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    lits
+}
+
+fn find_asserting_literal(
+    clause: &Clause,
+    assignment: &crate::formula::assignment::Assignment,
+) -> Option<Literal> {
+    let mut unassigned = None;
+
+    for lit in clause.get_literals() {
+        match lit.eval(assignment) {
+            Some(true) => return Some(lit.clone()),
+            Some(false) => {}
+            None => {
+                if unassigned.is_some() {
+                    return None;
+                }
+                unassigned = Some(lit.clone());
+            }
+        }
+    }
+
+    unassigned
+}
+
+fn enqueue_asserting_literal(
+    formula: &mut Formula,
+    history: &mut History,
+    queue: &mut VecDeque<Literal>,
+    lit: Literal,
+    reason_clause_idx: usize,
+) -> PyResult<()> {
+    match lit.eval(&formula.assignment) {
+        Some(false) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "asserting literal is false after backtrack",
+        )),
+        Some(true) => Ok(()),
+        None => {
+            formula
+                .assignment
+                .assign(lit.get_index(), !lit.is_negated());
+            history.add_implication(&lit, Some(reason_clause_idx));
+            queue.push_back(lit);
+            Ok(())
         }
     }
 }

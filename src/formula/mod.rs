@@ -239,9 +239,9 @@ impl Formula {
                 let time_str = if elapsed >= 60 {
                     let minutes = elapsed / 60;
                     let seconds = elapsed % 60;
-                    format!("c {}m {}s", minutes, seconds)
+                    format!(" {}m {}s", minutes, seconds)
                 } else {
-                    format!("c {}s", elapsed)
+                    format!(" {}s", elapsed)
                 };
             
                 // We cast the pointer back to read the struct properties.

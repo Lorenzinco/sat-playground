@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::HashSet;
 
 use crate::formula::literal::Literal;
+use crate::history::uip::find_1uip;
 use crate::formula::Formula;
 use crate::history::History;
 
@@ -296,6 +298,129 @@ fn exists_path_avoiding_pair(
     }
 
     false
+}
+
+pub fn find_clauses_from_dip_pair<W>(
+    graph: &impl GraphView<NodeType, W>,
+    history: &History,
+    formula: &Formula,
+    conflict_clause_idx: usize,
+    dip_a: &Literal,
+    dip_b: &Literal,
+) -> Option<(Literal, Vec<Literal>, Vec<Literal>)> {
+    let current_level = history.get_decision_level();
+    if current_level == 0 {
+        return None;
+    }
+
+    let last = graph.get_last_index()?;
+    
+    // Find literal nodes
+    let mut dip_a_node = None;
+    let mut dip_b_node = None;
+    
+    // We need 1uip for the start of the pre-region
+    let (uip_clause, _) = find_1uip(history, formula, conflict_clause_idx);
+    let mut first_uip = None;
+    for lit in uip_clause.iter() {
+        if history.get_literal_level(lit) == Some(current_level) {
+            first_uip = Some(lit.negated());
+            break;
+        }
+    }
+    let first_uip = first_uip?;
+    let mut first_uip_node = None;
+
+    let mut adj = vec![Vec::new(); last + 1];
+    let mut rev = vec![Vec::new(); last + 1];
+
+    for u in 0..=last {
+        if let Some(node) = graph.get_node(u) {
+            if let NodeType::Literal(lit) = node {
+                if lit == dip_a { dip_a_node = Some(u); }
+                if lit == dip_b { dip_b_node = Some(u); }
+                if lit == &first_uip { first_uip_node = Some(u); }
+            }
+            if let Some(edges) = graph.get_edges(u) {
+                for (v, _) in edges {
+                    if v <= last {
+                        adj[u].push(v);
+                        rev[v].push(u);
+                    }
+                }
+            }
+        }
+    }
+
+    let dip_a_node = dip_a_node?;
+    let dip_b_node = dip_b_node?;
+    let first_uip_node = first_uip_node?;
+
+    // Pre-region BFS (stops AT dips, but includes them)
+    let mut pre_region = HashSet::new();
+    let mut q = VecDeque::new();
+    pre_region.insert(first_uip_node);
+    q.push_back(first_uip_node);
+
+    while let Some(u) = q.pop_front() {
+        if u == dip_a_node || u == dip_b_node { continue; }
+        for &v in &adj[u] {
+            if pre_region.insert(v) {
+                q.push_back(v);
+            }
+        }
+    }
+    pre_region.insert(dip_a_node);
+    pre_region.insert(dip_b_node);
+
+    // Post-region BFS (starts strictly after dips)
+    let mut post_region = HashSet::new();
+    for &v in &adj[dip_a_node] {
+        if post_region.insert(v) { q.push_back(v); }
+    }
+    for &v in &adj[dip_b_node] {
+        if post_region.insert(v) { q.push_back(v); }
+    }
+
+    while let Some(u) = q.pop_front() {
+        for &v in &adj[u] {
+            if post_region.insert(v) {
+                q.push_back(v);
+            }
+        }
+    }
+
+    // Extraction lambda for lower level predecessors
+    let get_lower_level_preds = |region: &HashSet<usize>| -> Vec<Literal> {
+        let mut res = Vec::new();
+        let mut seen = HashSet::new();
+        for &node in region {
+            for &p in &rev[node] {
+                if let Some(NodeType::Literal(lit)) = graph.get_node(p) {
+                    if history.get_literal_level(lit).unwrap_or(0) < current_level {
+                        if seen.insert(lit.get_index()) {
+                            res.push(lit.clone());
+                        }
+                    }
+                }
+            }
+        }
+        res
+    };
+
+    // ¬f ∨ ¬C
+    let mut pre_lits = vec![first_uip.negated()];
+    for lit in get_lower_level_preds(&pre_region) {
+        pre_lits.push(lit.negated());
+    }
+
+    // ¬D
+    let mut post_lits = Vec::new();
+    for lit in get_lower_level_preds(&post_region) {
+        post_lits.push(lit.negated());
+    }
+
+    Some((first_uip, pre_lits, post_lits))
 }
 
 #[cfg(test)]

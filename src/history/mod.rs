@@ -22,6 +22,21 @@ pub enum ImplicationPoint{
     DIP
 }
 
+pub enum ConflictLearnResult {
+    Uip {
+        clause: Clause,
+        backtrack_level: usize,
+    },
+    Dip {
+        dip_a: Literal,
+        dip_b: Literal,
+        first_uip: Literal,
+        pre_clause_without_z: Vec<Literal>,   // ¬f ∨ ¬C
+        post_clause_without_z: Vec<Literal>,  // ¬D
+        backtrack_level: usize,               // = l_D
+    },
+}
+
 impl FromPyObject<'_,'_> for ImplicationPoint {
     type Error = PyErr;
     
@@ -115,13 +130,15 @@ impl History {
     
     
     /// Returns the learned minimized clause at 1UIP and the conflict level the clause was found at.
-    pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize, implication_point: ImplicationPoint) -> (Clause, usize, Option<(Literal,Literal)>) {
+    pub fn analyze_conflict(&self, formula: &Formula, conflict_clause_index: usize, implication_point: ImplicationPoint) -> ConflictLearnResult {
         match implication_point {
             ImplicationPoint::UIP => { 
                 let (clause,level) = find_1uip(self, formula, conflict_clause_index);
-                (clause,level,None)
+                return ConflictLearnResult::Uip{clause: clause, backtrack_level: level}
             }
-            ImplicationPoint::DIP => { find_dip(self,formula,conflict_clause_index) }
+            ImplicationPoint::DIP => { 
+                find_dip(self,formula,conflict_clause_index)
+            }
         }
     }
 
@@ -230,7 +247,10 @@ mod history{
         formula.assignment.assign(x4.get_index(), true);
         history.add_implication(&x4, Some(2)); // Reason: C2 (-3, 4)
         
-        let (learned, backtrack_level,_) = history.analyze_conflict(&formula, 3, ImplicationPoint::UIP);
+        let (learned, backtrack_level) = match history.analyze_conflict(&formula, 3, ImplicationPoint::UIP){
+            ConflictLearnResult::Uip { clause, backtrack_level } => {(clause,backtrack_level)}
+            _ => {panic!("Non-Uip")}
+        };
         
         println!("Learned clause: {}", learned);
         
@@ -269,7 +289,10 @@ mod history{
         history.add_implication(&x4, Some(1));
         
         
-        let (learned, backtrack_level,_) = history.analyze_conflict(&formula, 2, ImplicationPoint::UIP);
+        let (learned, backtrack_level) = match history.analyze_conflict(&formula, 2, ImplicationPoint::UIP){
+            ConflictLearnResult::Uip { clause, backtrack_level } => {(clause,backtrack_level)}
+            _ => {panic!("Non-Uip")}
+        };
         
         println!("Learned: {}", learned);
         
@@ -283,7 +306,10 @@ mod history{
         let clauses: Vec<Vec<i64>> = vec![vec![1], vec![-1]]; // Unsat immediately
         let formula = Formula::from_vec(clauses);
         
-        let (clause, level,_) = history.analyze_conflict(&formula, 0, ImplicationPoint::UIP);
+        let (clause, level) = match history.analyze_conflict(&formula, 0, ImplicationPoint::UIP){
+            ConflictLearnResult::Uip { clause, backtrack_level } => {(clause,backtrack_level)}
+            _ => {panic!("Non-Uip")}
+        };
         assert!(clause.len() == 0); 
         assert_eq!(level, 0);
     }
@@ -327,7 +353,10 @@ mod history{
         history.add_implication(&lit5_neg, Some(3));
 
 
-        let (learned_clause, backtrack_level,_) = history.analyze_conflict(&formula, 4, ImplicationPoint::UIP);
+        let (learned_clause, backtrack_level) = match history.analyze_conflict(&formula, 4, ImplicationPoint::UIP){
+            ConflictLearnResult::Uip { clause, backtrack_level } => {(clause,backtrack_level)}
+            _ => {panic!("Non-Uip")}
+        };
         
         // 1-UIP Analysis:
         // Resolution on 5 (from C4 and C3): -4 v -4 = -4
@@ -372,10 +401,11 @@ mod history{
         formula.assignment.assign(x4.get_index(), true);
         history.add_implication(&x4, Some(2));
         
-        let (learned, backtrack_level, dip_pair) =
-            history.analyze_conflict(&formula, 3, ImplicationPoint::DIP);
+        let (learned, backtrack_level) = match history.analyze_conflict(&formula, 3, ImplicationPoint::DIP){
+            ConflictLearnResult::Uip { clause, backtrack_level } => {(clause,backtrack_level)}
+            _ => {panic!("Non-Uip")}
+        };
         
-        assert!(dip_pair.is_none());
         assert_eq!(learned.len(), 1);
         assert_eq!(learned.get_literals()[0], x1.negated());
         assert_eq!(backtrack_level, 0);
@@ -418,11 +448,34 @@ mod history{
         history.add_implication(&lit5_neg, Some(3));
 
         // Conflict on C4 (-4 v 5)
-        let (learned_clause, backtrack_level, dip_pair) = history.analyze_conflict(&formula, 4, ImplicationPoint::DIP);
+        let (dip_a,
+        dip_b,
+        first_uip,
+        pre_clause_without_z,
+        post_clause_without_z,
+        backtrack_level) = match history.analyze_conflict(&formula, 4, ImplicationPoint::DIP){
+            ConflictLearnResult::Dip { 
+                dip_a,
+                dip_b,
+                first_uip,
+                pre_clause_without_z,
+                post_clause_without_z,
+                backtrack_level
+            } => {
+                (dip_a,
+                dip_b,
+                first_uip,
+                pre_clause_without_z,
+                post_clause_without_z,
+                backtrack_level)
+            },
+            _ => {panic!("Non-Uip")}
+        };
+        
+        println!("{dip_a},{dip_b},{first_uip},{:?},{:?},{backtrack_level}", pre_clause_without_z,post_clause_without_z);
         
         // It should extract a 2-cut right away instead of going down to the 1-UIP
-        assert!(dip_pair.is_some());
-        assert_eq!(learned_clause.len(), 2);
+        assert_eq!(pre_clause_without_z.len(), 1);
         assert_eq!(backtrack_level, 0);
     }
 }

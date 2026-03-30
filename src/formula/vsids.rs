@@ -4,6 +4,7 @@ use crate::formula::Literal;
 pub struct Vsids {
     scores: Vec<f64>,
     decay: f64,
+    saved_phases: Vec<bool>
 }
 
 impl Vsids {
@@ -11,14 +12,18 @@ impl Vsids {
         Self {
             scores: vec![0.0; num_vars],
             decay: 0.95,
+            saved_phases: vec![false; num_vars]
         }
     }
 
-    pub fn bump(&mut self, var: usize) {
+    pub fn bump(&mut self, lit: &Literal) {
+        let var = lit.get_index() as usize;
         if var >= self.scores.len() {
             self.scores.resize(var + 1, 0.0);
+            self.saved_phases.resize(var + 1, false);
         }
         self.scores[var] += 1.0;
+        self.saved_phases[var] = !lit.is_negated()
     }
 
     pub fn decay_all(&mut self) {
@@ -46,6 +51,6 @@ impl Vsids {
             }
         }
 
-        best_var.map(|var| Literal::new(var, false))
+        best_var.map(|var| Literal::new(var, !self.saved_phases[var as usize]))
     }
 }
