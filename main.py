@@ -21,6 +21,7 @@ def solve_sat(clauses):
     s.solve(algorithm="cdcl",implication_point="dip")
     if s.model is not None:
         print("s SATISFIABLE", flush=True)
+        print(s.model)
     else:
         print("s UNSATISFIABLE",flush=True)
     if s.stats is not None:

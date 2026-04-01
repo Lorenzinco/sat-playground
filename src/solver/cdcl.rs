@@ -72,7 +72,17 @@ pub fn solve_cdcl<'py>(
                     let learned =
                         Clause::from_literals(&apply_recursive_extension_substitution(formula, clause.get_literals().clone()));
 
+                    let mut actual_backtrack = backtrack_level;
                     history.revert_decision(backtrack_level + 1, &mut formula.assignment);
+                    // Dynamically fix the backtrack level if substitution falsified the clause
+                    while learned.is_empty(&formula.assignment) {
+                        if actual_backtrack == 0 {
+                            return Ok(None);
+                        }
+                        actual_backtrack -= 1;
+                        history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
+                    }
+                    
                     queue.clear();
 
                     formula.stats.add_learnt_clause(&learned);
@@ -84,18 +94,15 @@ pub fn solve_cdcl<'py>(
                     }
                     vsids.decay_all();
 
-                    let asserting_lit = match find_asserting_literal(&learned, &formula.assignment) {
-                        Some(lit) => lit,
-                        None => return Ok(None),
-                    };
-
-                    enqueue_asserting_literal(
-                        formula,
-                        &mut history,
-                        &mut queue,
-                        asserting_lit,
-                        clause_idx,
-                    )?;
+                    if let Some(asserting_lit) = find_asserting_literal(&learned, &formula.assignment) {
+                        enqueue_asserting_literal(
+                            formula,
+                            &mut history,
+                            &mut queue,
+                            asserting_lit,
+                            clause_idx,
+                        )?;
+                    }
                 }
 
                 ConflictLearnResult::Dip {
@@ -113,21 +120,19 @@ pub fn solve_cdcl<'py>(
                             formula.stats.add_literal();
                             formula.extensions.add_substitution(&dip_a, &dip_b, &new_z);
 
-                            // Follow the encoding convention already used in your code:
-                            // z <-> (dip_a v dip_b)
-                            println!("{new_z} <-> ({dip_a}v{dip_b})");
-                            formula.add_clause(Clause::from_literals(&vec![
-                                new_z.negated(),
-                                dip_a.clone(),
-                                dip_b.clone(),
-                            ]));
+                            // z <-> (dip_a ∧ dip_b)
                             formula.add_clause(Clause::from_literals(&vec![
                                 new_z.clone(),
                                 dip_a.negated(),
+                                dip_b.negated(),
                             ]));
                             formula.add_clause(Clause::from_literals(&vec![
-                                new_z.clone(),
-                                dip_b.negated(),
+                                new_z.negated(),
+                                dip_a.clone(),
+                            ]));
+                            formula.add_clause(Clause::from_literals(&vec![
+                                new_z.negated(),
+                                dip_b.clone(),
                             ]));
 
                             new_z
@@ -149,14 +154,12 @@ pub fn solve_cdcl<'py>(
                     let mut actual_backtrack = backtrack_level;
                     // Dynamically fix the backtrack level if VSIDS guessed an extension variable wrongly
                     while post_clause.is_empty(&formula.assignment) {
-                        println!("Guessed wrongly");
                         if actual_backtrack == 0 {
                             return Ok(None); // Truly UNSAT at level 0
                         }
                         actual_backtrack -= 1;
                         history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
                     }
-                    println!("Learning clauses: {pre_clause}{post_clause}");
                     
                     history.revert_decision(backtrack_level + 1, &mut formula.assignment);
                     queue.clear();
@@ -174,7 +177,6 @@ pub fn solve_cdcl<'py>(
                     formula.stats.add_learnt_clause(&post_clause);
                     formula.add_clause(post_clause);
                     let post_idx = formula.get_clauses().len() - 1;
-
                     vsids.decay_all();
 
                     // After backtracking to l_D, the post-DIP clause should assert ¬z.
