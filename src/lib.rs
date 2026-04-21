@@ -3,6 +3,7 @@ pub mod solver;
 pub mod python;
 pub mod history;
 pub mod two_watched;
+pub mod drat;
 
 #[pyo3::pymodule]
 mod clsat {

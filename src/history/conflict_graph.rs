@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::collections::HashSet;
 
 use crate::formula::literal::Literal;
+use crate::formula::clause::Clause;
 use crate::history::uip::find_1uip;
 use crate::formula::Formula;
 use crate::history::History;
@@ -307,7 +308,7 @@ pub fn find_clauses_from_dip_pair<W>(
     conflict_clause_idx: usize,
     dip_a: &Literal,
     dip_b: &Literal,
-) -> Option<(Literal, Vec<Literal>, Vec<Literal>)> {
+) -> Option<(Clause, Vec<Literal>, Vec<Literal>)> {
     let current_level = history.get_decision_level();
     if current_level == 0 {
         return None;
@@ -372,6 +373,18 @@ pub fn find_clauses_from_dip_pair<W>(
     }
     pre_region.insert(dip_a_node);
     pre_region.insert(dip_b_node);
+    
+    // println!("c --- DIP DEBUG ---");
+    // println!("c DIP A: {}, DIP B: {}", dip_a, dip_b);
+    // println!("c Pre-region nodes:");
+    // for &node in &pre_region {
+    //     if let Some(crate::history::conflict_graph::NodeType::Literal(lit)) = graph.get_node(node) {
+    //         println!("c   - Lit: {} (Level: {:?})", lit, history.get_literal_level(lit));
+    //         if let Some(reason_idx) = history.decision_levels[history.get_literal_level(lit).unwrap_or(0)].get_reason(lit) {
+    //             println!("c       Reason clause idx: {}", reason_idx);
+    //         }
+    //     }
+    // }
 
     // Post-region BFS (starts strictly after dips)
     let mut post_region = HashSet::new();
@@ -389,17 +402,47 @@ pub fn find_clauses_from_dip_pair<W>(
             }
         }
     }
+    
+    // // After Post-region BFS finishes:
+    // println!("c Post-region nodes:");
+    // for &node in &post_region {
+    //     if let Some(crate::history::conflict_graph::NodeType::Literal(lit)) = graph.get_node(node) {
+    //         println!("c   - Lit: {} (Level: {:?})", lit, history.get_literal_level(lit));
+    //         if let Some(reason_idx) = history.decision_levels[history.get_literal_level(lit).unwrap_or(0)].get_reason(lit) {
+    //             println!("c       Reason clause idx: {}", reason_idx);
+    //         }
+    //     }
+    // }
 
-    // Extraction lambda for lower level predecessors
     let get_lower_level_preds = |region: &HashSet<usize>| -> Vec<Literal> {
         let mut res = Vec::new();
         let mut seen = HashSet::new();
         for &node in region {
-            for &p in &rev[node] {
-                if let Some(NodeType::Literal(lit)) = graph.get_node(p) {
-                    if history.get_literal_level(lit).unwrap_or(0) < current_level {
-                        if seen.insert(lit.get_index()) {
-                            res.push(lit.clone());
+            if let Some(NodeType::Literal(lit)) = graph.get_node(node) {
+                let lit_level = history.get_literal_level(lit).unwrap_or(0);
+                if lit_level == current_level {
+                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit) {
+                        let reason = &formula.get_clauses()[reason_idx];
+                        for reason_lit in reason.get_literals() {
+                            if reason_lit == lit { continue; }
+                            let pred = reason_lit.negated();
+                            let pred_level = history.get_literal_level(&pred).unwrap_or(0);
+                            if pred_level > 0 && pred_level < current_level {
+                                if seen.insert(pred.get_index()) {
+                                    res.push(pred.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(NodeType::Conflict) = graph.get_node(node) {
+                let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
+                for conflict_lit in conflict_clause.get_literals() {
+                    let pred = conflict_lit.negated();
+                    let pred_level = history.get_literal_level(&pred).unwrap_or(0);
+                    if pred_level > 0 && pred_level < current_level {
+                        if seen.insert(pred.get_index()) {
+                            res.push(pred.clone());
                         }
                     }
                 }
@@ -420,7 +463,7 @@ pub fn find_clauses_from_dip_pair<W>(
         post_lits.push(lit.negated());
     }
 
-    Some((first_uip, pre_lits, post_lits))
+    Some((uip_clause, pre_lits, post_lits))
 }
 
 #[cfg(test)]

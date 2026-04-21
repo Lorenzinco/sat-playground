@@ -30,7 +30,7 @@ pub enum ConflictLearnResult {
     Dip {
         dip_a: Literal,
         dip_b: Literal,
-        first_uip: Literal,
+        uip_clause: Clause,
         pre_clause_without_z: Vec<Literal>,   // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>,  // ¬D
         backtrack_level: usize,               // = l_D
@@ -450,21 +450,21 @@ mod history{
         // Conflict on C4 (-4 v 5)
         let (dip_a,
         dip_b,
-        first_uip,
+        uip_clause,
         pre_clause_without_z,
         post_clause_without_z,
         backtrack_level) = match history.analyze_conflict(&formula, 4, ImplicationPoint::DIP){
             ConflictLearnResult::Dip { 
                 dip_a,
                 dip_b,
-                first_uip,
+                uip_clause,
                 pre_clause_without_z,
                 post_clause_without_z,
                 backtrack_level
             } => {
                 (dip_a,
                 dip_b,
-                first_uip,
+                uip_clause,
                 pre_clause_without_z,
                 post_clause_without_z,
                 backtrack_level)
@@ -472,7 +472,7 @@ mod history{
             _ => {panic!("Non-Uip")}
         };
         
-        println!("{dip_a},{dip_b},{first_uip},{:?},{:?},{backtrack_level}", pre_clause_without_z,post_clause_without_z);
+        println!("{dip_a},{dip_b},{uip_clause},{:?},{:?},{backtrack_level}", pre_clause_without_z,post_clause_without_z);
         
         // It should extract a 2-cut right away instead of going down to the 1-UIP
         assert_eq!(pre_clause_without_z.len(), 1);

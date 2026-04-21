@@ -1,14 +1,16 @@
-use crate::formula::Formula;
-use crate::history::History;
-use crate::history::ImplicationPoint;
+use crate::drat::DratLogger;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::formula::vsids::Vsids;
+use crate::formula::Formula;
 use crate::history::ConflictLearnResult;
+use crate::history::History;
+use crate::history::ImplicationPoint;
 
 use pyo3::prelude::PyResult;
 
 use std::collections::VecDeque;
+use std::fs::File;
 
 pub fn solve_cdcl<'py>(
     formula: &mut Formula,
@@ -17,6 +19,7 @@ pub fn solve_cdcl<'py>(
     let mut history = History::new();
     let mut queue: VecDeque<Literal> = VecDeque::new();
     let mut vsids = Vsids::new(formula.assignment.len());
+    let mut logger = DratLogger::new(File::create("proof.drat").unwrap());
 
     // Initial unit clauses
     let mut initial_units = Vec::new();
@@ -28,7 +31,10 @@ pub fn solve_cdcl<'py>(
 
     for (i, lit) in initial_units {
         match lit.eval(&formula.assignment) {
-            Some(false) => return Ok(None),
+            Some(false) => {
+                let _ = logger.log_empty_clause();
+                return Ok(None);
+            }
             Some(true) => {}
             None => {
                 formula.assignment.assign(lit.get_index(), !lit.is_negated());
@@ -40,6 +46,7 @@ pub fn solve_cdcl<'py>(
 
     // Initial propagation
     if formula.propagate_twl(&mut history, &mut queue).is_some() {
+        let _ = logger.log_empty_clause();
         return Ok(None);
     }
 
@@ -49,16 +56,15 @@ pub fn solve_cdcl<'py>(
             None => return Ok(Some(formula.get_model())),
         };
 
-        // Decision
         history.add_decision(&decision_lit);
         formula
             .assignment
             .assign(decision_lit.get_index(), !decision_lit.is_negated());
         queue.push_back(decision_lit);
 
-        // Conflict loop
         while let Some(conflict_idx) = formula.propagate_twl(&mut history, &mut queue) {
             if history.get_decision_level() == 0 {
+                let _ = logger.log_empty_clause();
                 return Ok(None);
             }
 
@@ -69,20 +75,23 @@ pub fn solve_cdcl<'py>(
                     clause,
                     backtrack_level,
                 } => {
-                    let learned =
-                        Clause::from_literals(&apply_recursive_extension_substitution(formula, clause.get_literals().clone()));
+                    let learned = clause.clone();
+
+                    // Proof logging: standard UIP clause only.
+                    let _ = logger.log_add(learned.get_literals());
 
                     let mut actual_backtrack = backtrack_level;
-                    history.revert_decision(backtrack_level + 1, &mut formula.assignment);
-                    // Dynamically fix the backtrack level if substitution falsified the clause
+                    history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
+
                     while learned.is_empty(&formula.assignment) {
                         if actual_backtrack == 0 {
+                            let _ = logger.log_empty_clause();
                             return Ok(None);
                         }
                         actual_backtrack -= 1;
                         history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
                     }
-                    
+
                     queue.clear();
 
                     formula.stats.add_learnt_clause(&learned);
@@ -94,7 +103,9 @@ pub fn solve_cdcl<'py>(
                     }
                     vsids.decay_all();
 
-                    if let Some(asserting_lit) = find_asserting_literal(&learned, &formula.assignment) {
+                    if let Some(asserting_lit) =
+                        find_asserting_literal(&learned, &formula.assignment)
+                    {
                         enqueue_asserting_literal(
                             formula,
                             &mut history,
@@ -108,86 +119,111 @@ pub fn solve_cdcl<'py>(
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    first_uip: _first_uip,
+                    uip_clause,
                     pre_clause_without_z,
                     post_clause_without_z,
                     backtrack_level,
                 } => {
+                    // PROOF SIDE: Log the standard 1UIP clause first!
+                    // This acts as the logical anchor for drat-trim to verify the pre_clause!
+                    let _ = logger.log_add(uip_clause.get_literals());
+
+                    // Get or create z for z <-> (dip_a ∧ dip_b)
                     let z = match formula.extensions.substitute(&dip_a, &dip_b) {
                         Some(ext_lit) => ext_lit,
                         None => {
                             let new_z = formula.add_literal();
                             formula.stats.add_literal();
-                            formula.extensions.add_substitution(&dip_a, &dip_b, &new_z);
 
-                            // z <-> (dip_a ∧ dip_b)
-                            formula.add_clause(Clause::from_literals(&vec![
+                            formula
+                                .extensions
+                                .add_substitution(&dip_a, &dip_b, &new_z);
+                            
+                            let extension_axiom = Clause::from_literals(&vec![
                                 new_z.clone(),
                                 dip_a.negated(),
                                 dip_b.negated(),
-                            ]));
-                            formula.add_clause(Clause::from_literals(&vec![
+                            ]);
+                            let ext_a = Clause::from_literals(&vec![
                                 new_z.negated(),
                                 dip_a.clone(),
-                            ]));
-                            formula.add_clause(Clause::from_literals(&vec![
+                            ]);
+                            let ext_b = Clause::from_literals(&vec![
                                 new_z.negated(),
                                 dip_b.clone(),
-                            ]));
-
+                            ]);
+                           
+                            let _ = logger.log_add(&extension_axiom.get_literals());
+                            formula.add_clause(extension_axiom);
+                            let _ = logger.log_add(&ext_a.get_literals());
+                            formula.add_clause(ext_a);
+                            let _ = logger.log_add(&ext_b.get_literals());
+                            formula.add_clause(ext_b);
+                           
                             new_z
                         }
                     };
 
-                    // pre = pre_clause_without_z ∨ z
-                    let mut pre_lits = pre_clause_without_z;
-                    pre_lits.push(z.clone());
-                    let pre_clause =
-                        Clause::from_literals(&apply_recursive_extension_substitution(formula, pre_lits));
-
-                    // post = post_clause_without_z ∨ ¬z
-                    let mut post_lits = post_clause_without_z;
+                    // Internal DIP learned clauses:
+                    let mut post_lits = Vec::with_capacity(post_clause_without_z.len() + 1);
                     post_lits.push(z.negated());
-                    let post_clause =
-                        Clause::from_literals(&apply_recursive_extension_substitution(formula, post_lits));
+                    post_lits.extend(post_clause_without_z.into_iter());
+                    let post_clause = Clause::from_literals(&post_lits);
+
+                    let mut pre_lits = Vec::with_capacity(pre_clause_without_z.len() + 1);
+                    pre_lits.push(z.clone());
+                    pre_lits.extend(pre_clause_without_z.into_iter());
+                    let pre_clause = Clause::from_literals(&pre_lits);
 
                     let mut actual_backtrack = backtrack_level;
-                    // Dynamically fix the backtrack level if VSIDS guessed an extension variable wrongly
+                    history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
+
                     while post_clause.is_empty(&formula.assignment) {
                         if actual_backtrack == 0 {
-                            return Ok(None); // Truly UNSAT at level 0
+                            let _ = logger.log_empty_clause();
+                            return Ok(None);
                         }
                         actual_backtrack -= 1;
                         history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
                     }
-                    
-                    history.revert_decision(backtrack_level + 1, &mut formula.assignment);
+
                     queue.clear();
 
-                    for lit in pre_clause.get_literals() {
-                        vsids.bump(lit);
-                    }
                     for lit in post_clause.get_literals() {
                         vsids.bump(lit);
                     }
-                    formula.stats.add_learnt_clause(&pre_clause);
-                    formula.add_clause(pre_clause);
-                    let _pre_idx = formula.get_clauses().len() - 1;
-
-                    formula.stats.add_learnt_clause(&post_clause);
-                    formula.add_clause(post_clause);
-                    let post_idx = formula.get_clauses().len() - 1;
+                    for lit in pre_clause.get_literals() {
+                        vsids.bump(lit);
+                    }
                     vsids.decay_all();
 
-                    // After backtracking to l_D, the post-DIP clause should assert ¬z.
+                    // PROOF & SOLVER SIDE: Add post_clause FIRST
+                    formula.stats.add_learnt_clause(&post_clause);
+                    let _ = logger.log_add(&post_clause.get_literals());
+                    formula.add_clause(post_clause);
+                    
+                    let post_idx = formula.get_clauses().len() - 1;
+
+                    // PROOF & SOLVER SIDE: Add pre_clause SECOND
+                    formula.stats.add_learnt_clause(&pre_clause);
+                    let _ = logger.log_add(&pre_clause.get_literals());
+                    formula.add_clause(pre_clause);
+
+                    // After backtracking, post should assert ¬z.
                     let asserting_lit = z.negated();
 
                     match asserting_lit.eval(&formula.assignment) {
                         Some(false) => {
-                            return Ok(None);
+                            if actual_backtrack == 0 {
+                                let _ = logger.log_empty_clause();
+                                return Ok(None);
+                            }
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                "DIP post clause asserts a falsified literal after backtrack",
+                            ));
                         }
                         Some(true) => {
-                            // Already assigned consistently.
+                            // Already satisfied
                         }
                         None => {
                             enqueue_asserting_literal(
@@ -203,31 +239,6 @@ pub fn solve_cdcl<'py>(
             }
         }
     }
-}
-
-fn apply_recursive_extension_substitution(
-    formula: &Formula,
-    mut lits: Vec<Literal>,
-) -> Vec<Literal> {
-    let mut changed = true;
-
-    while changed {
-        changed = false;
-
-        'outer: for i in 0..lits.len() {
-            for j in (i + 1)..lits.len() {
-                if let Some(substitute) = formula.extensions.substitute(&lits[i], &lits[j]) {
-                    lits.remove(j);
-                    lits.remove(i);
-                    lits.push(substitute);
-                    changed = true;
-                    break 'outer;
-                }
-            }
-        }
-    }
-
-    lits
 }
 
 fn find_asserting_literal(
@@ -282,56 +293,44 @@ mod tests {
 
     #[test]
     fn test_cdcl_simple_sat_uip() {
-        // (x1 v x2) ^ (-x1 v x3)
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-
-        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
+        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
         assert!(res.is_some());
     }
 
     #[test]
     fn test_cdcl_simple_unsat_uip() {
-        // (x1) ^ (-x1)
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-
-        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
+        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
         assert!(res.is_none());
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_uip() {
-        // (x1 v x2) ^ (x1 v -x2) ^ (-x1 v x3) ^ (-x1 v -x3)
         let mut formula =
             Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-
-        let res = solve_cdcl(&mut formula,ImplicationPoint::UIP).unwrap();
+        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
         assert!(res.is_none());
     }
-    
+
     #[test]
     fn test_cdcl_simple_sat_dip() {
-        // (x1 v x2) ^ (-x1 v x3)
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-
         let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
         assert!(res.is_some());
     }
 
     #[test]
     fn test_cdcl_simple_unsat_dip() {
-        // (x1) ^ (-x1)
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-
         let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
         assert!(res.is_none());
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_dip() {
-        // (x1 v x2) ^ (x1 v -x2) ^ (-x1 v x3) ^ (-x1 v -x3)
         let mut formula =
             Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-
         let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
         assert!(res.is_none());
     }

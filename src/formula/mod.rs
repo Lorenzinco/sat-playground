@@ -25,6 +25,7 @@ use clause::Clause;
 use literal::Literal;
 use assignment::Assignment;
 
+
 use pyo3::prelude::*;
 use std::fmt;
 
@@ -34,7 +35,7 @@ pub struct Formula{
     pub assignment: Assignment,
     watch: Watch,
     pub stats: Stats,
-    pub extensions: ExtensionMap
+    pub extensions: ExtensionMap,
 }
 
 impl Clone for Formula {

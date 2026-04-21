@@ -39,7 +39,7 @@ pub fn find_dip(
 
     let (a, b) = choose_best_dip_pair(&mut dips, history);
 
-    let Some((first_uip, mut pre_lits, mut post_lits)) = find_clauses_from_dip_pair(
+    let Some((uip_clause, mut pre_lits, mut post_lits)) = find_clauses_from_dip_pair(
         &graph,
         history,
         formula,
@@ -63,7 +63,7 @@ pub fn find_dip(
     ConflictLearnResult::Dip {
         dip_a: a,
         dip_b: b,
-        first_uip,
+        uip_clause,
         pre_clause_without_z: pre_lits,
         post_clause_without_z: post_lits,
         backtrack_level,
