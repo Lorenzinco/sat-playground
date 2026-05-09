@@ -174,6 +174,8 @@ pub fn solve_cdcl<'py>(
                     pre_lits.push(z.clone());
                     pre_lits.extend(pre_clause_without_z.into_iter());
                     let pre_clause = Clause::from_literals(&pre_lits);
+                    
+                    // println!("Preclause: {:?}, post clause: {:?}",pre_clause,post_clause);
 
                     let mut actual_backtrack = backtrack_level;
                     history.revert_decision(actual_backtrack + 1, &mut formula.assignment);
