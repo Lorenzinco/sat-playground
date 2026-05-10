@@ -8,11 +8,13 @@ use crate::history::History;
 use crate::history::ImplicationPoint;
 
 use pyo3::prelude::PyResult;
+use pyo3::Python;
 
 use std::collections::VecDeque;
 use std::fs::File;
 
 pub fn solve_cdcl<'py>(
+    py: Python<'_>,
     formula: &mut Formula,
     implication_point: ImplicationPoint,
 ) -> PyResult<Option<Vec<bool>>> {
@@ -20,7 +22,8 @@ pub fn solve_cdcl<'py>(
     let mut queue: VecDeque<Literal> = VecDeque::new();
     let mut vsids = Vsids::new(formula.assignment.len());
     let mut logger = DratLogger::new(File::create("proof.drat").unwrap());
-
+    let mut steps = 0;
+    
     // Initial unit clauses
     let mut initial_units = Vec::new();
     for (i, clause) in formula.get_clauses().iter().enumerate() {
@@ -51,6 +54,12 @@ pub fn solve_cdcl<'py>(
     }
 
     loop {
+
+        steps += 1;
+        if steps % 100 == 0{
+            py.check_signals()?;
+        }
+        
         let decision_lit = match vsids.get_best_unassigned(formula) {
             Some(lit) => lit,
             None => return Ok(Some(formula.get_model())),
@@ -292,48 +301,67 @@ fn enqueue_asserting_literal(
 mod tests {
     use super::*;
     use crate::formula::Formula;
+    use pyo3::Python;
 
     #[test]
     fn test_cdcl_simple_sat_uip() {
-        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
-        assert!(res.is_some());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
+            assert!(res.is_some());
+        });
     }
 
     #[test]
     fn test_cdcl_simple_unsat_uip() {
-        let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
-        assert!(res.is_none());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
+            assert!(res.is_none());
+        });
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_uip() {
-        let mut formula =
-            Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::UIP).unwrap();
-        assert!(res.is_none());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula =
+                Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
+            assert!(res.is_none());
+        });
     }
 
     #[test]
     fn test_cdcl_simple_sat_dip() {
-        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
-        assert!(res.is_some());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
+            assert!(res.is_some());
+        });
     }
 
     #[test]
     fn test_cdcl_simple_unsat_dip() {
-        let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
-        assert!(res.is_none());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
+            assert!(res.is_none());
+        });
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_dip() {
-        let mut formula =
-            Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-        let res = solve_cdcl(&mut formula, ImplicationPoint::DIP).unwrap();
-        assert!(res.is_none());
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula =
+                Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
+            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
+            assert!(res.is_none());
+        });
     }
 }

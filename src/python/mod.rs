@@ -1,11 +1,11 @@
 pub mod sat;
 pub mod stats;
 
+use crate::preprocess::Preprocess;
 use crate::python::stats::Stats;
 use crate::solver::Algorithm;
 use crate::history::ImplicationPoint;
 use pyo3::prelude::*;
-use ctrlc;
 
 /// Python bindings for the Sat struct, allocate an instance to then add clauses.
 #[pyclass]
@@ -64,10 +64,9 @@ impl Sat {
     }
     
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm,implication_point) ,text_signature = "algorithm, implication_point")]
-    pub fn solve(&mut self, algorithm: Algorithm, implication_point: ImplicationPoint)->PyResult<()> {
-        ctrlc::set_handler(|| std::process::exit(2)).unwrap();
-        let (result,stats) = self.solve_rs(algorithm,implication_point)?;
+    #[pyo3(signature = (algorithm,implication_point, preprocess) ,text_signature = "algorithm, implication_point, preprocess")]
+    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>)->PyResult<()> {
+        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess)?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())
