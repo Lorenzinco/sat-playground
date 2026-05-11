@@ -1,6 +1,7 @@
 use crate::formula::Formula;
-use crate::formula::Literal;
+use crate::formula::literal::Literal;
 
+#[derive(Clone)]
 pub struct Vsids {
     scores: Vec<f64>,
     decay: f64,
@@ -30,6 +31,10 @@ impl Vsids {
         for score in &mut self.scores {
             *score *= self.decay;
         }
+    }
+
+    pub fn empty() -> Self {
+        Vsids::new(0)
     }
 
     pub fn get_best_unassigned(&mut self, formula: &Formula) -> Option<Literal> {

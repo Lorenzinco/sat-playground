@@ -6,3 +6,5 @@
 clsat/__pycache__
 clsat/*.so
 clsat/libclsat.dylib.dSYM
+*.drat
+*.dimacs

@@ -2,6 +2,7 @@ use crate::preprocess::Preprocess;
 use crate::solver::Algorithm;
 use crate::history::ImplicationPoint;
 use crate::formula::Formula;
+use crate::heuristics::Heuristics;
 use crate::python::Sat;
 use crate::python::Stats;
 use pyo3::prelude::*;
@@ -19,14 +20,14 @@ impl Sat {
 			.collect()
 	}
 	
-	pub fn solve_rs<'py>(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>) -> PyResult<(Option<Vec<bool>>,Stats)> {
+	pub fn solve_rs<'py>(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics) -> PyResult<(Option<Vec<bool>>,Stats)> {
 
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
 
         formula.preprocess(preprocess);
         
-        let result = formula.solve(py,algorithm,implication_point);
+        let result = formula.solve(py,algorithm,implication_point, heuristics);
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());

@@ -1,16 +1,15 @@
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
-use crate::formula::literal::Literal;
-use crate::formula::clause::Clause;
-use crate::history::uip::find_1uip;
 use crate::formula::Formula;
+use crate::formula::literal::Literal;
 use crate::history::History;
+use crate::history::uip::find_1uip;
 
 use ultragraph::GraphMut;
-use ultragraph::UltraGraph;
 use ultragraph::GraphView;
+use ultragraph::UltraGraph;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeType {
@@ -21,7 +20,7 @@ pub enum NodeType {
 fn get_or_add(
     graph: &mut UltraGraph<NodeType>,
     node_ids: &mut HashMap<NodeType, usize>,
-    node: NodeType
+    node: NodeType,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     if let Some(&idx) = node_ids.get(&node) {
         return Ok(idx);
@@ -40,89 +39,70 @@ pub fn graph_from_conflict(
     history: &History,
     formula: &Formula,
     conflict_clause_idx: usize,
-) -> Result<UltraGraph<NodeType>, Box<dyn std::error::Error>> {
+) -> Result<(UltraGraph<NodeType>, Literal), Box<dyn std::error::Error>> {
     let current_level = history.get_decision_level();
     let mut graph = UltraGraph::new();
 
     if current_level == 0 {
         graph.add_root_node(NodeType::Conflict)?;
-        return Ok(graph);
+        return Ok((graph, Literal::new(0, false)));
     }
 
-    let level_data = &history.decision_levels[current_level];
+    // Identify the 1UIP to serve as our hard stop (source of the subgraph)
+    let (uip_clause, _) = find_1uip(history, formula, conflict_clause_idx);
+    let first_uip = uip_clause
+        .iter()
+        .find(|l| history.get_literal_level(l) == Some(current_level))
+        .map(|l| l.negated())
+        .unwrap();
+
     let mut node_ids: HashMap<NodeType, usize> = HashMap::new();
+    let _conflict_id = get_or_add(&mut graph, &mut node_ids, NodeType::Conflict)?;
 
-    if let Some(decision_lit) = level_data.get_decision_literal() {
-        get_or_add(
-            &mut graph,
-            &mut node_ids,
-            NodeType::Literal(decision_lit.clone()),
-        )?;
-    }
+    let mut q = VecDeque::new();
+    let mut seen = HashSet::new();
 
-    for lit in level_data.get_implied_literals_rev() {
-        get_or_add(
-            &mut graph,
-            &mut node_ids,
-            NodeType::Literal(lit.clone()),
-        )?;
-    }
+    q.push_back(NodeType::Conflict);
+    seen.insert(NodeType::Conflict);
 
-    let conflict_id = get_or_add(&mut graph, &mut node_ids, NodeType::Conflict)?;
-    let mut implied_lits: Vec<Literal> = level_data.get_implied_literals_rev().cloned().collect();
-    implied_lits.reverse();
+    // BFS backwards from the conflict, stopping at 1UIP
+    while let Some(node) = q.pop_front() {
+        let node_id = *node_ids.get(&node).unwrap();
 
-    for implied in implied_lits.iter() {
-        let Some(reason_idx) = level_data.get_reason(implied) else {
-            continue;
+        let get_preds = || -> Vec<Literal> {
+            match &node {
+                NodeType::Conflict => {
+                    let clause = &formula.get_clauses()[conflict_clause_idx];
+                    clause.get_literals().iter().map(|l| l.negated()).collect()
+                }
+                NodeType::Literal(lit) => {
+                    if lit == &first_uip {
+                        return vec![]; // Stop backward exploration at 1UIP
+                    }
+                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit) {
+                        let reason = &formula.get_clauses()[reason_idx];
+                        reason.get_literals().iter().filter(|&l| l != lit).map(|l| l.negated()).collect()
+                    } else {
+                        vec![]
+                    }
+                }
+            }
         };
 
-        let implied_id = get_or_add(
-            &mut graph,
-            &mut node_ids,
-            NodeType::Literal(implied.clone()),
-        )?;
+        for pred in get_preds() {
+            if history.get_literal_level(&pred) == Some(current_level) {
+                let pred_node = NodeType::Literal(pred.clone());
+                let pred_id = get_or_add(&mut graph, &mut node_ids, pred_node.clone())?;
+                graph.add_edge(pred_id, node_id, ())?;
 
-        let reason = &formula.get_clauses()[reason_idx];
-
-        for lit in reason.iter() {
-            if lit == implied {
-                continue;
+                if seen.insert(pred_node.clone()) {
+                    q.push_back(pred_node);
+                }
             }
-
-            let pred = lit.negated();
-            if history.get_literal_level(&pred) != Some(current_level) {
-                continue;
-            }
-
-            let pred_id = get_or_add(
-                &mut graph,
-                &mut node_ids,
-                NodeType::Literal(pred.clone()),
-            )?;
-
-            graph.add_edge(pred_id, implied_id, ())?;
         }
     }
 
-    let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
-    for lit in conflict_clause.iter() {
-        let pred = lit.negated();
-
-        if history.get_literal_level(&pred) != Some(current_level) {
-            continue;
-        }
-
-        let pred_id = get_or_add(
-            &mut graph,
-            &mut node_ids,
-            NodeType::Literal(pred.clone()),
-        )?;
-
-        graph.add_edge(pred_id, conflict_id, ())?;
-    }
-
-    Ok(graph)
+    Ok((graph, first_uip))
 }
 
 /// Return all exact two-vertex bottlenecks as pairs of literals.
@@ -308,46 +288,31 @@ pub fn find_clauses_from_dip_pair<W>(
     conflict_clause_idx: usize,
     dip_a: &Literal,
     dip_b: &Literal,
-) -> Option<(Clause, Vec<Literal>, Vec<Literal>)> {
+    first_uip: &Literal,
+) -> Option<(Vec<Literal>, Vec<Literal>)> {
     let current_level = history.get_decision_level();
     if current_level == 0 {
         return None;
     }
 
     let last = graph.get_last_index()?;
-    
-    // Find literal nodes
+
     let mut dip_a_node = None;
     let mut dip_b_node = None;
-    
-    // We need 1uip for the start of the pre-region
-    let (uip_clause, _) = find_1uip(history, formula, conflict_clause_idx);
-    let mut first_uip = None;
-    for lit in uip_clause.iter() {
-        if history.get_literal_level(lit) == Some(current_level) {
-            first_uip = Some(lit.negated());
-            break;
-        }
-    }
-    let first_uip = first_uip?;
     let mut first_uip_node = None;
 
     let mut adj = vec![Vec::new(); last + 1];
-    let mut rev = vec![Vec::new(); last + 1];
 
     for u in 0..=last {
         if let Some(node) = graph.get_node(u) {
             if let NodeType::Literal(lit) = node {
                 if lit == dip_a { dip_a_node = Some(u); }
                 if lit == dip_b { dip_b_node = Some(u); }
-                if lit == &first_uip { first_uip_node = Some(u); }
+                if lit == first_uip { first_uip_node = Some(u); }
             }
             if let Some(edges) = graph.get_edges(u) {
                 for (v, _) in edges {
-                    if v <= last {
-                        adj[u].push(v);
-                        rev[v].push(u);
-                    }
+                    if v <= last { adj[u].push(v); }
                 }
             }
         }
@@ -357,7 +322,8 @@ pub fn find_clauses_from_dip_pair<W>(
     let dip_b_node = dip_b_node?;
     let first_uip_node = first_uip_node?;
 
-    // Pre-region BFS (stops AT dips, but includes them)
+    // The graph is guaranteed to have NO dead ends and NO nodes prior to first_uip.
+    // Pre-region BFS: simply walk forward from 1UIP, stopping at DIPs.
     let mut pre_region = HashSet::new();
     let mut q = VecDeque::new();
     pre_region.insert(first_uip_node);
@@ -373,46 +339,21 @@ pub fn find_clauses_from_dip_pair<W>(
     }
     pre_region.insert(dip_a_node);
     pre_region.insert(dip_b_node);
-    
-    // println!("c --- DIP DEBUG ---");
-    // println!("c DIP A: {}, DIP B: {}", dip_a, dip_b);
-    // println!("c Pre-region nodes:");
-    // for &node in &pre_region {
-    //     if let Some(crate::history::conflict_graph::NodeType::Literal(lit)) = graph.get_node(node) {
-    //         println!("c   - Lit: {} (Level: {:?})", lit, history.get_literal_level(lit));
-    //         if let Some(reason_idx) = history.decision_levels[history.get_literal_level(lit).unwrap_or(0)].get_reason(lit) {
-    //             println!("c       Reason clause idx: {}", reason_idx);
-    //         }
-    //     }
-    // }
 
-    // Post-region BFS (starts strictly after dips)
+    // Post-region BFS: walk forward from DIPs.
     let mut post_region = HashSet::new();
-    for &v in &adj[dip_a_node] {
-        if post_region.insert(v) { q.push_back(v); }
-    }
-    for &v in &adj[dip_b_node] {
-        if post_region.insert(v) { q.push_back(v); }
+    let mut q = VecDeque::new();
+    for &start in &[dip_a_node, dip_b_node] {
+        for &v in &adj[start] {
+            if post_region.insert(v) { q.push_back(v); }
+        }
     }
 
     while let Some(u) = q.pop_front() {
         for &v in &adj[u] {
-            if post_region.insert(v) {
-                q.push_back(v);
-            }
+            if post_region.insert(v) { q.push_back(v); }
         }
     }
-    
-    // // After Post-region BFS finishes:
-    // println!("c Post-region nodes:");
-    // for &node in &post_region {
-    //     if let Some(crate::history::conflict_graph::NodeType::Literal(lit)) = graph.get_node(node) {
-    //         println!("c   - Lit: {} (Level: {:?})", lit, history.get_literal_level(lit));
-    //         if let Some(reason_idx) = history.decision_levels[history.get_literal_level(lit).unwrap_or(0)].get_reason(lit) {
-    //             println!("c       Reason clause idx: {}", reason_idx);
-    //         }
-    //     }
-    // }
 
     let get_lower_level_preds = |region: &HashSet<usize>| -> Vec<Literal> {
         let mut res = Vec::new();
@@ -428,9 +369,7 @@ pub fn find_clauses_from_dip_pair<W>(
                             let pred = reason_lit.negated();
                             let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                             if pred_level > 0 && pred_level < current_level {
-                                if seen.insert(pred.get_index()) {
-                                    res.push(pred.clone());
-                                }
+                                if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
                             }
                         }
                     }
@@ -441,29 +380,21 @@ pub fn find_clauses_from_dip_pair<W>(
                     let pred = conflict_lit.negated();
                     let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                     if pred_level > 0 && pred_level < current_level {
-                        if seen.insert(pred.get_index()) {
-                            res.push(pred.clone());
-                        }
+                        if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
                     }
                 }
             }
         }
         res
     };
-
-    // ¬f ∨ ¬C
+    
     let mut pre_lits = vec![first_uip.negated()];
-    for lit in get_lower_level_preds(&pre_region) {
-        pre_lits.push(lit.negated());
-    }
+    for lit in get_lower_level_preds(&pre_region) { pre_lits.push(lit.negated()); }
 
-    // ¬D
     let mut post_lits = Vec::new();
-    for lit in get_lower_level_preds(&post_region) {
-        post_lits.push(lit.negated());
-    }
+    for lit in get_lower_level_preds(&post_region) { post_lits.push(lit.negated()); }
 
-    Some((uip_clause, pre_lits, post_lits))
+    Some((pre_lits, post_lits))
 }
 
 #[cfg(test)]
@@ -535,12 +466,12 @@ mod tests {
     fn two_parallel_chains_all_cross_pairs_are_tvbs() {
         let mut g = UltraGraph::<NodeType>::new();
 
-        let s  = g.add_node(NodeType::Literal(lit(1))).unwrap();
+        let s = g.add_node(NodeType::Literal(lit(1))).unwrap();
         let a1 = g.add_node(NodeType::Literal(lit(2))).unwrap();
         let a2 = g.add_node(NodeType::Literal(lit(3))).unwrap();
         let b1 = g.add_node(NodeType::Literal(lit(4))).unwrap();
         let b2 = g.add_node(NodeType::Literal(lit(5))).unwrap();
-        let t  = g.add_root_node(NodeType::Conflict).unwrap();
+        let t = g.add_root_node(NodeType::Conflict).unwrap();
 
         g.add_edge(s, a1, ()).unwrap();
         g.add_edge(a1, a2, ()).unwrap();
@@ -551,10 +482,7 @@ mod tests {
         g.add_edge(b2, t, ()).unwrap();
 
         let got = find_all_two_vertex_bottlenecks(&g).unwrap();
-        assert_eq!(
-            pairset(got),
-            expected(&[(2, 4), (2, 5), (3, 4), (3, 5)])
-        );
+        assert_eq!(pairset(got), expected(&[(2, 4), (2, 5), (3, 4), (3, 5)]));
     }
 
     /// Build three internally vertex-disjoint paths:

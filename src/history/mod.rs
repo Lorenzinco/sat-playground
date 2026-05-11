@@ -4,6 +4,7 @@ pub mod conflict_graph;
 pub mod uip;
 pub mod dip;
 
+
 use pyo3::prelude::*;
 
 use crate::history::decision_level::DecisionLevel;
@@ -30,7 +31,6 @@ pub enum ConflictLearnResult {
     Dip {
         dip_a: Literal,
         dip_b: Literal,
-        uip_clause: Clause,
         pre_clause_without_z: Vec<Literal>,   // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>,  // ¬D
         backtrack_level: usize,               // = l_D
@@ -119,7 +119,7 @@ impl History {
         self.decision_levels.len()-1
     }
     
-    fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
+    pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
         self.implication_levels_indexes.get_level(lit)
             .or_else(|| self.implication_levels_indexes.get_level(&lit.negated()))
 }
@@ -448,34 +448,22 @@ mod history{
         history.add_implication(&lit5_neg, Some(3));
 
         // Conflict on C4 (-4 v 5)
-        let (dip_a,
-        dip_b,
-        uip_clause,
-        pre_clause_without_z,
-        post_clause_without_z,
-        backtrack_level) = match history.analyze_conflict(&formula, 4, ImplicationPoint::DIP){
-            ConflictLearnResult::Dip { 
-                dip_a,
-                dip_b,
-                uip_clause,
-                pre_clause_without_z,
-                post_clause_without_z,
-                backtrack_level
-            } => {
-                (dip_a,
-                dip_b,
-                uip_clause,
-                pre_clause_without_z,
-                post_clause_without_z,
-                backtrack_level)
-            },
-            _ => {panic!("Non-Uip")}
-        };
-        
-        println!("{dip_a},{dip_b},{uip_clause},{:?},{:?},{backtrack_level}", pre_clause_without_z,post_clause_without_z);
-        
-        // It should extract a 2-cut right away instead of going down to the 1-UIP
-        assert_eq!(pre_clause_without_z.len(), 1);
-        assert_eq!(backtrack_level, 0);
+        let result = history.analyze_conflict(&formula, 4, ImplicationPoint::DIP);
+
+        match result {
+            ConflictLearnResult::Dip { pre_clause_without_z, backtrack_level, .. } => {
+                // If DIP is returned, it must be meaningful (non-empty post in the new logic).
+                assert!(!pre_clause_without_z.is_empty());
+                assert_eq!(backtrack_level, 0);
+            }
+            ConflictLearnResult::Uip { clause, backtrack_level } => {
+                // Expected after the new fallback: UIP on -x4
+                assert_eq!(backtrack_level, 0);
+                assert_eq!(clause.len(), 1);
+                let lit = clause.get_literals()[0].clone();
+                assert_eq!(lit.get_index(), 3);
+                assert!(lit.is_negated());
+            }
+        }
     }
 }

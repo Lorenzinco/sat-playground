@@ -39,3 +39,26 @@ impl <W: Write> DratLogger<W> {
         writeln!(self.writer, "0")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formula::literal::Literal;
+
+    #[test]
+    fn log_add_delete_empty_formats_dimacs() {
+        let mut buf = Vec::new();
+        let mut logger = DratLogger::new(&mut buf);
+
+        let clause = vec![Literal::new(0, false), Literal::new(2, true)];
+        logger.log_add(&clause).unwrap();
+
+        let del = vec![Literal::new(1, false)];
+        logger.log_delete(&del).unwrap();
+
+        logger.log_empty_clause().unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "1 -3 0\nd 2 0\n0\n");
+    }
+}

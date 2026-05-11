@@ -2,9 +2,10 @@ pub mod assignment;
 pub mod clause;
 pub mod extension;
 pub mod literal;
-pub mod vsids;
 
 use crate::formula::extension::ExtensionMap;
+use crate::heuristics;
+use crate::heuristics::Heuristics;
 use crate::history::History;
 use crate::history::ImplicationPoint;
 use crate::preprocess;
@@ -26,6 +27,10 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+
+use rand::RngExt;
+use rand::prelude::IndexedRandom;
+use rand::rng;
 
 use pyo3::prelude::*;
 use std::fmt;
@@ -280,10 +285,19 @@ impl Formula {
         py: Python<'_>,
         algorithm: Algorithm,
         implication_point: ImplicationPoint,
+        heuristics: Heuristics,
     ) -> PyResult<Option<Vec<bool>>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let stats_ptr = &self.stats as *const _ as usize;
+
+        //override default empty
+        let mut heuristics = match heuristics {
+            Heuristics::VSIDS(_) => {
+                Heuristics::VSIDS(heuristics::vsids::Vsids::new(self.assignment.len()))
+            }
+            _ => Heuristics::None,
+        };
 
         let timer = thread::spawn(move || {
             let start = Instant::now();
@@ -319,7 +333,7 @@ impl Formula {
             io::stdout().flush().ok();
         });
 
-        let result = solve(self, py, algorithm, implication_point);
+        let result = solve(self, py, algorithm, implication_point, &mut heuristics);
 
         stop.store(true, Ordering::Relaxed);
         let _ = timer.join();
@@ -370,6 +384,14 @@ impl Formula {
         }
 
         pure_literals
+    }
+
+    pub fn get_decision_literal(&mut self, heuristics: &mut Heuristics) -> Option<Literal> {
+        match heuristics {
+            Heuristics::VSIDS(vsids) => vsids.get_best_unassigned(self),
+            Heuristics::Random => self.get_random_unassigned_literal(),
+            _ => self.get_unassigned_literal(),
+        }
     }
 
     pub fn is_satisfied(&self) -> bool {
@@ -483,8 +505,7 @@ impl Formula {
         while let Some(lit) = queue.pop_front() {
             let false_lit = lit.negated();
 
-            // We TAKE the list of clauses watching this literal so we can mutate the
-            // formula's clause list and watchlist while iterating, ZERO allocations!
+            // take to avoid cloning
             let watching_clauses = self.watch.take(&false_lit);
             let mut keep_watchlist = Vec::new();
             let mut conflict = None;
@@ -581,6 +602,24 @@ impl Formula {
             .enumerate()
             .filter(|(_idx, clause)| clause.is_empty(assignment))
             .next()
+    }
+
+    pub fn get_random_unassigned_literal(&self) -> Option<Literal> {
+        let unassigned: Vec<u64> = (0..self.assignment.len())
+            .map(|i| i as u64)
+            .filter(|&i| self.assignment.get_value(i).is_none())
+            .collect();
+
+        if unassigned.is_empty() {
+            return None;
+        }
+
+        let mut rng = rng();
+
+        let var = *unassigned.choose(&mut rng).unwrap();
+        let negated = rng.random_bool(0.5);
+
+        Some(Literal::new(var, negated))
     }
 
     pub fn get_unassigned_literal(&self) -> Option<Literal> {

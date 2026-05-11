@@ -5,6 +5,7 @@ pub mod history;
 pub mod two_watched;
 pub mod drat;
 pub mod preprocess;
+pub mod heuristics;
 
 #[pyo3::pymodule]
 mod clsat {

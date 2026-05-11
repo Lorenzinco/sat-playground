@@ -1,6 +1,7 @@
 pub mod sat;
 pub mod stats;
 
+use crate::heuristics::Heuristics;
 use crate::preprocess::Preprocess;
 use crate::python::stats::Stats;
 use crate::solver::Algorithm;
@@ -64,9 +65,9 @@ impl Sat {
     }
     
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm,implication_point, preprocess) ,text_signature = "algorithm, implication_point, preprocess")]
-    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>)->PyResult<()> {
-        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess)?;
+    #[pyo3(signature = (algorithm,implication_point, preprocess, heuristics) ,text_signature = "algorithm, implication_point, preprocess, heuristics")]
+    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics)->PyResult<()> {
+        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess, heuristics)?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())

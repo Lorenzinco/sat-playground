@@ -12,6 +12,7 @@ ctrlc = "3.5.2"
 fastbit = "0.11.1"
 indexmap = "2.13.0"
 pyo3 = {version =  "0.28.3", features = ["macros", "experimental-inspect"]}
+rand = "0.10.1"
 ultragraph = "0.8.15"
 
 [build-dependencies]

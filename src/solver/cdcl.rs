@@ -1,7 +1,7 @@
 use crate::drat::DratLogger;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
-use crate::formula::vsids::Vsids;
+use crate::heuristics::Heuristics;
 use crate::formula::Formula;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
@@ -17,10 +17,10 @@ pub fn solve_cdcl<'py>(
     py: Python<'_>,
     formula: &mut Formula,
     implication_point: ImplicationPoint,
+    heuristics: &mut Heuristics
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
     let mut queue: VecDeque<Literal> = VecDeque::new();
-    let mut vsids = Vsids::new(formula.assignment.len());
     let mut logger = DratLogger::new(File::create("proof.drat").unwrap());
     let mut steps = 0;
     
@@ -59,11 +59,16 @@ pub fn solve_cdcl<'py>(
         if steps % 100 == 0{
             py.check_signals()?;
         }
-        
-        let decision_lit = match vsids.get_best_unassigned(formula) {
+
+        let decision_lit = match formula.get_decision_literal(heuristics){
             Some(lit) => lit,
-            None => return Ok(Some(formula.get_model())),
+            None => return Ok(Some(formula.get_model()))
         };
+        
+        // let decision_lit = match vsids.get_best_unassigned(formula) {
+        //     Some(lit) => lit,
+        //     None => return Ok(Some(formula.get_model())),
+        // };
 
         history.add_decision(&decision_lit);
         formula
@@ -79,14 +84,16 @@ pub fn solve_cdcl<'py>(
 
             formula.stats.add_conflict();
 
+            let mut learned = Clause::new();
+
             match history.analyze_conflict(formula, conflict_idx, implication_point) {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
                 } => {
-                    let learned = clause.clone();
+                    learned = clause;
 
-                    // Proof logging: standard UIP clause only.
+                    // Drat proof logging
                     let _ = logger.log_add(learned.get_literals());
 
                     let mut actual_backtrack = backtrack_level;
@@ -107,10 +114,10 @@ pub fn solve_cdcl<'py>(
                     formula.add_clause(learned.clone());
                     let clause_idx = formula.get_clauses().len() - 1;
 
-                    for lit in learned.get_literals() {
-                        vsids.bump(lit);
-                    }
-                    vsids.decay_all();
+                    // for lit in learned.get_literals() {
+                    //     vsids.bump(lit);
+                    // }
+                    // vsids.decay_all();
 
                     if let Some(asserting_lit) =
                         find_asserting_literal(&learned, &formula.assignment)
@@ -128,18 +135,14 @@ pub fn solve_cdcl<'py>(
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    uip_clause,
                     pre_clause_without_z,
                     post_clause_without_z,
                     backtrack_level,
                 } => {
-                    // PROOF SIDE: Log the standard 1UIP clause first!
-                    // This acts as the logical anchor for drat-trim to verify the pre_clause!
-                    let _ = logger.log_add(uip_clause.get_literals());
 
-                    // Get or create z for z <-> (dip_a ∧ dip_b)
+                    // z <-> (dip_a ∧ dip_b)
                     let z = match formula.extensions.substitute(&dip_a, &dip_b) {
-                        Some(ext_lit) => ext_lit,
+                        Some(ext_lit) => ext_lit, // substitution already exists
                         None => {
                             let new_z = formula.add_literal();
                             formula.stats.add_literal();
@@ -173,7 +176,7 @@ pub fn solve_cdcl<'py>(
                         }
                     };
 
-                    // Internal DIP learned clauses:
+                    // post_dip 
                     let mut post_lits = Vec::with_capacity(post_clause_without_z.len() + 1);
                     post_lits.push(z.negated());
                     post_lits.extend(post_clause_without_z.into_iter());
@@ -200,27 +203,30 @@ pub fn solve_cdcl<'py>(
 
                     queue.clear();
 
+                    
                     for lit in post_clause.get_literals() {
-                        vsids.bump(lit);
+                        let _ = learned.add_literal(lit); 
+                        //vsids.bump(lit);
                     }
                     for lit in pre_clause.get_literals() {
-                        vsids.bump(lit);
+                        let _ = learned.add_literal(lit);
+                        //vsids.bump(lit);
                     }
-                    vsids.decay_all();
+                    //vsids.decay_all();
 
-                    // PROOF & SOLVER SIDE: Add post_clause FIRST
+                    // Log post learned clause
                     formula.stats.add_learnt_clause(&post_clause);
                     let _ = logger.log_add(&post_clause.get_literals());
                     formula.add_clause(post_clause);
                     
                     let post_idx = formula.get_clauses().len() - 1;
 
-                    // PROOF & SOLVER SIDE: Add pre_clause SECOND
+                    // Log pre clause
                     formula.stats.add_learnt_clause(&pre_clause);
                     let _ = logger.log_add(&pre_clause.get_literals());
                     formula.add_clause(pre_clause);
 
-                    // After backtracking, post should assert ¬z.
+                    // ¬z is asserting.
                     let asserting_lit = z.negated();
 
                     match asserting_lit.eval(&formula.assignment) {
@@ -248,6 +254,9 @@ pub fn solve_cdcl<'py>(
                     }
                 }
             }
+
+            heuristics.bump(learned.get_literals());
+            heuristics.decay();
         }
     }
 }
@@ -302,66 +311,191 @@ mod tests {
     use super::*;
     use crate::formula::Formula;
     use pyo3::Python;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn proof_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_proof_lock<F: FnOnce()>(f: F) {
+        let _guard = proof_lock().lock().unwrap();
+        f();
+    }
+
+    fn parse_proof(path: &str) -> Vec<(bool, Vec<i64>)> {
+        let content = fs::read_to_string(path).expect("proof.drat missing");
+        let mut out = Vec::new();
+
+        for (line_no, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let mut parts = trimmed.split_whitespace();
+            let first = parts.next().unwrap();
+
+            let mut is_delete = false;
+            let mut nums: Vec<i64> = Vec::new();
+
+            if first == "d" {
+                is_delete = true;
+            } else {
+                nums.push(first.parse::<i64>().unwrap_or_else(|_| {
+                    panic!("invalid DRAT token at line {}: {}", line_no + 1, first)
+                }));
+            }
+
+            for tok in parts {
+                nums.push(tok.parse::<i64>().unwrap_or_else(|_| {
+                    panic!("invalid DRAT token at line {}: {}", line_no + 1, tok)
+                }));
+            }
+
+            assert!(
+                !nums.is_empty(),
+                "empty proof line at {}: {:?}",
+                line_no + 1,
+                line
+            );
+
+            let last = *nums.last().unwrap();
+            assert_eq!(
+                last, 0,
+                "proof line not terminated by 0 at line {}: {}",
+                line_no + 1,
+                line
+            );
+            nums.pop();
+
+            out.push((is_delete, nums));
+        }
+
+        out
+    }
+
+    fn assert_no_duplicates_or_tautologies(proof: &[(bool, Vec<i64>)]) {
+        for (idx, (_is_delete, lits)) in proof.iter().enumerate() {
+            let mut seen = HashSet::new();
+            for &lit in lits {
+                assert_ne!(lit, 0, "literal 0 in proof at line {}", idx + 1);
+                assert!(
+                    seen.insert(lit),
+                    "duplicate literal {} in proof at line {}",
+                    lit,
+                    idx + 1
+                );
+                assert!(
+                    !seen.contains(&-lit),
+                    "tautological clause contains {} and {} at line {}",
+                    lit,
+                    -lit,
+                    idx + 1
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_cdcl_simple_sat_uip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
-            assert!(res.is_some());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP, &mut Heuristics::Random).unwrap();
+                assert!(res.is_some());
+            });
         });
     }
 
     #[test]
     fn test_cdcl_simple_unsat_uip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
-            assert!(res.is_none());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP, &mut Heuristics::Random).unwrap();
+                assert!(res.is_none());
+            });
         });
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_uip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula =
-                Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP).unwrap();
-            assert!(res.is_none());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula =
+                    Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::UIP,&mut Heuristics::Random).unwrap();
+                assert!(res.is_none());
+            });
         });
     }
 
     #[test]
     fn test_cdcl_simple_sat_dip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
-            assert!(res.is_some());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP,&mut Heuristics::Random).unwrap();
+                assert!(res.is_some());
+            });
         });
     }
 
     #[test]
     fn test_cdcl_simple_unsat_dip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
-            assert!(res.is_none());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP,&mut Heuristics::Random).unwrap();
+                assert!(res.is_none());
+            });
         });
     }
 
     #[test]
     fn test_cdcl_inner_conflict_loop_dip() {
-        Python::initialize();
-        Python::attach(|py| {
-            let mut formula =
-                Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
-            let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP).unwrap();
-            assert!(res.is_none());
+        with_proof_lock(|| {
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula =
+                    Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP,&mut Heuristics::Random).unwrap();
+                assert!(res.is_none());
+            });
+        });
+    }
+
+    #[test]
+    fn test_drat_proof_lines_well_formed_dip_unsat() {
+        with_proof_lock(|| {
+            let _ = fs::remove_file("proof.drat");
+
+            Python::initialize();
+            Python::attach(|py| {
+                let mut formula =
+                    Formula::from_vec(vec![vec![1, 2], vec![1, -2], vec![-1, 3], vec![-1, -3]]);
+                let res = solve_cdcl(py, &mut formula, ImplicationPoint::DIP,&mut Heuristics::Random).unwrap();
+                assert!(res.is_none());
+            });
+
+            let proof = parse_proof("proof.drat");
+            assert!(!proof.is_empty(), "proof.drat is empty");
+
+            let last = proof.last().unwrap();
+            assert!(
+                !last.0 && last.1.is_empty(),
+                "last line should be an empty clause"
+            );
+
+            assert_no_duplicates_or_tautologies(&proof);
         });
     }
 }

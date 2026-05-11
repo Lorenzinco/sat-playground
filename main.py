@@ -24,8 +24,9 @@ def main():
     print("c Solving SAT problem...", flush=True)
     s.solve(
         algorithm="cdcl",
-        implication_point="dip",
+        implication_point="uip",
         preprocess=["bva"],
+        heuristics="vsids"
     )
 
     if s.model is not None:

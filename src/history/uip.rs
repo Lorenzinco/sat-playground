@@ -140,6 +140,6 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
         }
     }
     
-    //(Clause::from_literals(&minimized_lits), backtrack_level)
-    (Clause::from_literals(&learned_lits), backtrack_level)
+    (Clause::from_literals(&minimized_lits), backtrack_level)
+    //(Clause::from_literals(&learned_lits), backtrack_level)
 }
