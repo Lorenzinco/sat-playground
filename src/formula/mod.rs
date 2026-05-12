@@ -3,6 +3,7 @@ pub mod clause;
 pub mod extension;
 pub mod literal;
 
+use crate::drat::DratLogger;
 use crate::formula::extension::ExtensionMap;
 use crate::heuristics;
 use crate::heuristics::Heuristics;
@@ -224,7 +225,7 @@ impl Formula {
         self.stats
     }
 
-    pub fn add_clause(&mut self, clause: Clause) {
+    pub fn add_clause<W:Write>(&mut self, clause: Clause, logger: &mut Option<DratLogger<W>>) {
         let clause_idx = self.clauses.len();
         match clause.watched {
             Watched::None => {}
@@ -239,6 +240,11 @@ impl Formula {
                     .add_to_watchlist(clause_idx, &clause.get_literals()[idx2 as usize]);
             }
         }
+
+        if let Some(log) = logger.as_mut(){
+            let _ = log.log_add(clause.get_literals());
+        }
+        
         self.clauses.push(clause);
     }
 
@@ -252,11 +258,14 @@ impl Formula {
         }
     }
 
-    pub fn delete_clause(&mut self, clause_index: usize) {
+    pub fn delete_clause<W: Write>(&mut self, clause_index: usize, logger: &mut Option<DratLogger<W>>) {
         assert!(clause_index > 0 && clause_index < self.clauses.len() - 1);
 
         // Remap the watchlists of literals pointing to that clause
         let clause = &self.clauses[clause_index];
+        if let Some(log) = logger {
+            let _ = log.log_delete(clause.get_literals());
+        }
         for literal in clause {
             self.watch.remove_from_watchlist(clause_index, literal);
         }
@@ -280,12 +289,13 @@ impl Formula {
         self.assignment.unset(index);
     }
 
-    pub fn solve<'py>(
+    pub fn solve<'py,W: Write>(
         &mut self,
         py: Python<'_>,
         algorithm: Algorithm,
         implication_point: ImplicationPoint,
         heuristics: Heuristics,
+        logger: &mut Option<DratLogger<W>>
     ) -> PyResult<Option<Vec<bool>>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
@@ -333,7 +343,7 @@ impl Formula {
             io::stdout().flush().ok();
         });
 
-        let result = solve(self, py, algorithm, implication_point, &mut heuristics);
+        let result = solve(self, py, algorithm, implication_point, &mut heuristics, logger);
 
         stop.store(true, Ordering::Relaxed);
         let _ = timer.join();
@@ -641,6 +651,7 @@ impl Formula {
 mod tests {
     use super::*;
     use crate::two_watched::Watched;
+    use std::io::Empty;
 
     fn assert_watchlists_consistent(formula: &Formula) {
         let total_lists = formula.assignment.len() * 2;
@@ -685,7 +696,7 @@ mod tests {
 
         assert_watchlists_consistent(&formula);
         // Remove clause 1
-        formula.delete_clause(1);
+        formula.delete_clause::<Empty>(1,&mut None);
 
         assert_eq!(formula.get_clauses().len(), 3);
         assert_eq!(

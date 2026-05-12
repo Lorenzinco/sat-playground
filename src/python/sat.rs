@@ -5,6 +5,9 @@ use crate::formula::Formula;
 use crate::heuristics::Heuristics;
 use crate::python::Sat;
 use crate::python::Stats;
+use crate::drat::DratLogger;
+
+use std::fs::File;
 use pyo3::prelude::*;
 use std::fmt;
 
@@ -20,14 +23,18 @@ impl Sat {
 			.collect()
 	}
 	
-	pub fn solve_rs<'py>(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics) -> PyResult<(Option<Vec<bool>>,Stats)> {
+	pub fn solve_rs<'py>(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics, drat_path: Option<String>) -> PyResult<(Option<Vec<bool>>,Stats)> {
 
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
+        let mut logger = match drat_path {
+            Some(path) => { Some(DratLogger::new(File::create(path).unwrap()))},
+            None => { None }
+        };
 
         formula.preprocess(preprocess);
         
-        let result = formula.solve(py,algorithm,implication_point, heuristics);
+        let result = formula.solve(py,algorithm,implication_point, heuristics,&mut logger);
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());

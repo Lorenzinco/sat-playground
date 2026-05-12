@@ -1,6 +1,9 @@
 pub mod dpll;
 pub mod cdcl;
 
+use std::io::Write;
+
+use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::heuristics::Heuristics;
 use crate::history::ImplicationPoint;
@@ -26,11 +29,11 @@ impl FromPyObject<'_,'_> for Algorithm {
     
 }
 
-pub fn solve<'py>(formula: &mut Formula, py: Python<'_>, algorithm: Algorithm,implication_point: ImplicationPoint, heuristics: &mut Heuristics) -> PyResult<Option<Vec<bool>>> {
+pub fn solve<'py,W: Write>(formula: &mut Formula, py: Python<'_>, algorithm: Algorithm,implication_point: ImplicationPoint, heuristics: &mut Heuristics, logger: &mut Option<DratLogger<W>>) -> PyResult<Option<Vec<bool>>> {
     formula.stats.start();
     let result = match algorithm {
         Algorithm::DPLL => dpll::solve_dpll(py,formula),
-        Algorithm::CDCL => cdcl::solve_cdcl(py,formula,implication_point, heuristics)
+        Algorithm::CDCL => cdcl::solve_cdcl(py,formula,implication_point, heuristics, logger)
     };
     formula.stats.stop();
     

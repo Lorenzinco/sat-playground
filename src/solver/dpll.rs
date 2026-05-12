@@ -1,20 +1,16 @@
 use crate::formula::literal::Literal;
 use crate::formula::Formula;
 use crate::history::History;
+use crate::python::signal_checker;
 use pyo3::prelude::PyResult;
 use pyo3::Python;
 
-fn propagate(py: Python<'_>, steps: &mut u64, formula: &mut Formula, history: &mut History) -> PyResult<()> {
+fn propagate(formula: &mut Formula, history: &mut History) {
     loop {
-        *steps+=1;
-        if *steps % 5 == 0 {
-            py.check_signals()?;
-        }
         if !formula.unit_propagate_history(history) && !formula.pure_literals_propagate_history(history) { 
             break
         }
     }
-    Ok(())
 }
 
 fn backtrack(formula: &mut Formula, history: &mut History) -> bool {
@@ -44,13 +40,9 @@ pub fn solve_dpll(py: Python<'_>, formula: &mut Formula) -> PyResult<Option<Vec<
     let mut steps = 0;
     loop {
 
-        steps += 1;
+        signal_checker(py, &mut steps)?;
         
-        if steps % 5 == 0 {
-            py.check_signals()?;
-        }
-        
-        propagate(py, &mut steps, formula, &mut history)?;
+        propagate(formula, &mut history);
 
         if formula.is_satisfied() {
             return Ok(Some(formula.get_model()));

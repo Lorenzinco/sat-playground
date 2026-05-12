@@ -368,7 +368,7 @@ pub fn find_clauses_from_dip_pair<W>(
                             if reason_lit == lit { continue; }
                             let pred = reason_lit.negated();
                             let pred_level = history.get_literal_level(&pred).unwrap_or(0);
-                            if pred_level > 0 && pred_level < current_level {
+                            if pred_level < current_level {
                                 if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
                             }
                         }
@@ -379,7 +379,7 @@ pub fn find_clauses_from_dip_pair<W>(
                 for conflict_lit in conflict_clause.get_literals() {
                     let pred = conflict_lit.negated();
                     let pred_level = history.get_literal_level(&pred).unwrap_or(0);
-                    if pred_level > 0 && pred_level < current_level {
+                    if pred_level < current_level {
                         if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
                     }
                 }

@@ -65,11 +65,20 @@ impl Sat {
     }
     
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm,implication_point, preprocess, heuristics) ,text_signature = "algorithm, implication_point, preprocess, heuristics")]
-    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics)->PyResult<()> {
-        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess, heuristics)?;
+    #[pyo3(signature = (algorithm,implication_point, preprocess, heuristics, drat_path=None) ,text_signature = "algorithm, implication_point, preprocess, heuristics, drat_path=None")]
+    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics, drat_path: Option<String>)->PyResult<()> {
+        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess, heuristics,drat_path)?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())
     }
+}
+
+pub fn signal_checker(py: Python<'_>, steps: &mut u64)-> PyResult<()> {
+    *steps += 1;
+    if steps.is_multiple_of(100){
+        py.check_signals()?;
+    }
+
+    Ok(())
 }
