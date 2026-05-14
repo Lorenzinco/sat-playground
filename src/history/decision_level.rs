@@ -46,5 +46,16 @@ impl DecisionLevel{
     pub fn get_reason(&self, lit: &Literal) -> Option<usize> {
         self.implied_literals.get(lit).copied().flatten()
     }
+
+    pub fn implied_literals_iter(&self) -> impl Iterator<Item = &Literal> + '_ {
+        self.implied_literals.keys()
+    }
+    
+    pub fn implied_literals_with_clauses_iter(&self) -> impl Iterator<Item = (&Literal, usize)> + '_ {
+        self.implied_literals
+            .iter()
+            .filter_map(|(lit, clause)| clause.map(|idx| (lit, idx)))
+    }
+
 }
 

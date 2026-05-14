@@ -105,6 +105,68 @@ pub fn graph_from_conflict(
     Ok((graph, first_uip))
 }
 
+pub fn dump_conflict_graph_dot(
+    history: &History,
+    formula: &Formula,
+    conflict_clause_idx: usize,
+    path: &str,
+) -> Result<Literal, Box<dyn std::error::Error>> {
+    let (graph, first_uip) = graph_from_conflict(history, formula, conflict_clause_idx)?;
+
+    let mut out = std::fs::File::create(path)?;
+    use std::io::Write;
+
+    writeln!(out, "digraph ConflictGraph {{")?;
+    writeln!(out, "  rankdir=LR;")?;
+    writeln!(out, "  node [shape=box, style=rounded];")?;
+
+    let last = graph.get_last_index().unwrap_or(0);
+
+    for idx in 0..=last {
+        if let Some(node) = graph.get_node(idx) {
+            match node {
+                NodeType::Conflict => {
+                    writeln!(
+                        out,
+                        "  n{} [label=\"Conflict\", shape=doublecircle, color=red];",
+                        idx
+                    )?;
+                }
+                NodeType::Literal(lit) => {
+                    let label = format!("{}", lit);
+                    let level = history.get_literal_level(lit).unwrap_or(0);
+                    writeln!(
+                        out,
+                        "  n{} [label={}\nlevel={}] ;",
+                        idx,
+                        label,
+                        level
+                    )?;
+                }
+            }
+        }
+    }
+
+    for u in 0..=last {
+        if graph.get_node(u).is_none() {
+            continue;
+        }
+
+        if let Some(edges) = graph.get_edges(u) {
+            for (v, _) in edges {
+                if graph.get_node(v).is_some() {
+                    writeln!(out, "  n{} -> n{};", u, v)?;
+                }
+            }
+        }
+    }
+
+    writeln!(out, "}}")?;
+
+    Ok(first_uip)
+}
+
+
 /// Return all exact two-vertex bottlenecks as pairs of literals.
 ///
 /// Semantics:

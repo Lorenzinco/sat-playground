@@ -5,15 +5,10 @@ pub mod literal;
 
 use crate::drat::DratLogger;
 use crate::formula::extension::ExtensionMap;
-use crate::heuristics;
-use crate::heuristics::Heuristics;
 use crate::history::History;
-use crate::history::ImplicationPoint;
 use crate::preprocess;
 use crate::preprocess::Preprocess;
 use crate::python::stats::Stats;
-use crate::solver::Algorithm;
-use crate::solver::solve;
 use crate::two_watched::Watch;
 use crate::two_watched::Watched;
 use assignment::Assignment;
@@ -21,19 +16,7 @@ use clause::Clause;
 use literal::Literal;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
-
-use rand::RngExt;
-use rand::prelude::IndexedRandom;
-use rand::rng;
-
-use pyo3::prelude::*;
+use std::io::Write;
 use std::fmt;
 
 pub struct Formula {
@@ -289,68 +272,6 @@ impl Formula {
         self.assignment.unset(index);
     }
 
-    pub fn solve<'py,W: Write>(
-        &mut self,
-        py: Python<'_>,
-        algorithm: Algorithm,
-        implication_point: ImplicationPoint,
-        heuristics: Heuristics,
-        logger: &mut Option<DratLogger<W>>
-    ) -> PyResult<Option<Vec<bool>>> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let stats_ptr = &self.stats as *const _ as usize;
-
-        //override default empty
-        let mut heuristics = match heuristics {
-            Heuristics::VSIDS(_) => {
-                Heuristics::VSIDS(heuristics::vsids::Vsids::new(self.assignment.len()))
-            }
-            _ => Heuristics::None,
-        };
-
-        let timer = thread::spawn(move || {
-            let start = Instant::now();
-
-            while !stop_for_thread.load(Ordering::Relaxed) {
-                let elapsed = start.elapsed().as_secs();
-                let time_str = if elapsed >= 60 {
-                    let minutes = elapsed / 60;
-                    let seconds = elapsed % 60;
-                    format!(" {}m {}s", minutes, seconds)
-                } else {
-                    format!(" {}s", elapsed)
-                };
-
-                // We cast the pointer back to read the struct properties.
-                // Technically a data race for printing purposes, but entirely benign.
-                let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
-
-                print!(
-                    "\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | \x1b[34mLearnt: {}\x1b[0m | Lits: {} | AvgLen: {:.2}",
-                    time_str,
-                    stats.conflicts,
-                    stats.clauses_learnt,
-                    stats.literals_learnt,
-                    stats.avg_clause_length
-                );
-                io::stdout().flush().ok();
-
-                thread::sleep(Duration::from_millis(100));
-            }
-
-            print!("\r\x1b[2K");
-            io::stdout().flush().ok();
-        });
-
-        let result = solve(self, py, algorithm, implication_point, &mut heuristics, logger);
-
-        stop.store(true, Ordering::Relaxed);
-        let _ = timer.join();
-
-        result
-    }
-
     pub fn get_empty_clauses(&self) -> Option<Vec<&Clause>> {
         let empty_clauses: Vec<&Clause> = self
             .clauses
@@ -394,14 +315,6 @@ impl Formula {
         }
 
         pure_literals
-    }
-
-    pub fn get_decision_literal(&mut self, heuristics: &mut Heuristics) -> Option<Literal> {
-        match heuristics {
-            Heuristics::VSIDS(vsids) => vsids.get_best_unassigned(self),
-            Heuristics::Random => self.get_random_unassigned_literal(),
-            _ => self.get_unassigned_literal(),
-        }
     }
 
     pub fn is_satisfied(&self) -> bool {
@@ -612,24 +525,6 @@ impl Formula {
             .enumerate()
             .filter(|(_idx, clause)| clause.is_empty(assignment))
             .next()
-    }
-
-    pub fn get_random_unassigned_literal(&self) -> Option<Literal> {
-        let unassigned: Vec<u64> = (0..self.assignment.len())
-            .map(|i| i as u64)
-            .filter(|&i| self.assignment.get_value(i).is_none())
-            .collect();
-
-        if unassigned.is_empty() {
-            return None;
-        }
-
-        let mut rng = rng();
-
-        let var = *unassigned.choose(&mut rng).unwrap();
-        let negated = rng.random_bool(0.5);
-
-        Some(Literal::new(var, negated))
     }
 
     pub fn get_unassigned_literal(&self) -> Option<Literal> {

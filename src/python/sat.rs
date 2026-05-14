@@ -6,6 +6,7 @@ use crate::heuristics::Heuristics;
 use crate::python::Sat;
 use crate::python::Stats;
 use crate::drat::DratLogger;
+use crate::solver::solve;
 
 use std::fs::File;
 use pyo3::prelude::*;
@@ -31,10 +32,9 @@ impl Sat {
             Some(path) => { Some(DratLogger::new(File::create(path).unwrap()))},
             None => { None }
         };
-
-        formula.preprocess(preprocess);
         
-        let result = formula.solve(py,algorithm,implication_point, heuristics,&mut logger);
+        let result = solve(&mut formula, py,algorithm,implication_point, preprocess, heuristics,&mut logger);
+        
         match result {
             Ok(Some(model)) => {
                 self.model = Some(model.clone());

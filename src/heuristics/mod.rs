@@ -1,7 +1,8 @@
 pub mod vsids;
-
+pub mod random;
 
 use crate::formula::literal::Literal;
+use crate::formula::Formula;
 use pyo3::prelude::*;
 
 #[derive(Clone)]
@@ -40,6 +41,15 @@ impl Heuristics {
                 vsids.decay_all();
             },
             _ => {}
+        }
+    }
+
+    
+    pub fn get_decision_literal(&mut self, formula: &mut Formula) -> Option<Literal> {
+        match self {
+            Heuristics::VSIDS(vsids) => vsids.get_best_unassigned(formula),
+            Heuristics::Random => random::get_random_unassigned_literal(formula),
+            _ => formula.get_unassigned_literal(),
         }
     }
 }

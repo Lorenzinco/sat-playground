@@ -6,6 +6,8 @@ use crate::formula::Formula;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
+//use crate::history::conflict_graph;
+use crate::history::conflict_graph::dump_conflict_graph_dot;
 use crate::python::signal_checker;
 
 use pyo3::prelude::PyResult;
@@ -62,7 +64,7 @@ pub fn solve_cdcl<'py, W:Write>(
 
         signal_checker(py, &mut steps)?;
 
-        let decision_lit = match formula.get_decision_literal(heuristics){
+        let decision_lit = match heuristics.get_decision_literal(formula){
             Some(lit) => lit,
             None => return Ok(Some(formula.get_model()))
         };
@@ -201,14 +203,17 @@ pub fn solve_cdcl<'py, W:Write>(
                     
                     let pre_is_rup = is_rup_candidate(formula, &pre_clause);
                     
-                    /*
-                     * if !pre_is_rup {
-                        println!("Skipping non-RUP DIP pre clause");
-                        println!("dip_a = {:?}, dip_b = {:?}, z = {:?}", dip_a, dip_b, z);
-                        println!("post_clause = {:?}", post_clause);
-                        println!("pre_clause = {:?}", pre_clause);
+                    
+                    if !pre_is_rup {
+                        // Dump the implication graph here inside a file to then plot it
+                        // 
+                        // let _ = dump_conflict_graph_dot(&history, formula, conflict_idx, "graph.dot");
+                        // println!("\nSkipping non-RUP DIP pre clause");
+                        // println!("dip_a = {:?}, dip_b = {:?}, z = {:?}", dip_a, dip_b, z);
+                        // println!("post_clause = {:?}", post_clause);
+                        // println!("pre_clause = {:?}", pre_clause);
                     }
-                    */
+                    
                     // println!("Preclause: {:?}, post clause: {:?}",pre_clause,post_clause);
 
                     let mut actual_backtrack = backtrack_level;
@@ -305,7 +310,7 @@ fn assign_literal_true(
 fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
     let mut assignment = std::collections::HashMap::new();
 
-    // RUP check: assume negation of the candidate clause.
+    // RUP check
     for lit in clause.get_literals() {
         let assumption = lit.negated();
 
@@ -322,12 +327,14 @@ fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
             let mut satisfied = false;
 
             for lit in existing_clause.get_literals() {
-                match formula.assignment.get_value(lit.get_signed_index()){
-                    Some(true) => {
-                        satisfied = true;
-                        break;
+                match assignment.get(&lit.get_index()) {
+                    Some(&value) => {
+                        let lit_value = if lit.is_negated() { !value } else { value };
+                        if lit_value {
+                            satisfied = true;
+                            break;
+                        }
                     }
-                    Some(false) => {}
                     None => {
                         unassigned = Some(lit.clone());
                         unassigned_count += 1;
@@ -345,11 +352,9 @@ fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
 
             if unassigned_count == 1 {
                 let unit = unassigned.unwrap();
-
                 if !assign_literal_true(&unit, &mut assignment) {
                     return true;
                 }
-
                 changed = true;
             }
         }

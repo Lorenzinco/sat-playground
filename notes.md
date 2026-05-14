@@ -17,3 +17,6 @@ hall's theorem per il grafo ripartito
 tarsi theorem 
 
 shannon theorem
+
+
+Luby sequence restart 

@@ -51,7 +51,7 @@ impl FromPyObject<'_,'_> for ImplicationPoint {
 }
 
 pub struct History {
-    decision_levels: Vec<DecisionLevel>,
+    pub decision_levels: Vec<DecisionLevel>,
     pub implication_levels_indexes: implication_level::ImplicationLevels
 }
 
