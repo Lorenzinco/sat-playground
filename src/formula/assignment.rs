@@ -39,27 +39,27 @@ impl Assignment {
         self.assigned.len()
     }
     
-    pub fn assign(&mut self, index: u64, value: bool){
-        self.assigned.set(index as usize);
+    pub fn assign(&mut self, index: usize, value: bool){
+        self.assigned.set(index);
         if value {
-            self.value.set(index as usize);
+            self.value.set(index);
         }
         else {
-            self.value.reset(index as usize);
+            self.value.reset(index);
         }
     }
     
     pub fn assign_history(&mut self, literal: &Literal, history: &mut History) {
-        self.assign(literal.get_index(), !literal.is_negated());
+        self.assign(literal.get_index().abs() as usize, !literal.is_negated());
         history.add_decision(literal);
     }
     
-    pub fn unset(&mut self, index: u64){
-        self.assigned.reset(index as usize);
+    pub fn unset(&mut self, index: usize){
+        self.assigned.reset(index);
     }
     
-    fn is_already_assigned(&self, index: u64)->bool{
-        self.assigned.test(index as usize)
+    fn is_already_assigned(&self, index: usize)->bool{
+        self.assigned.test(index)
     }
     
     pub fn to_model(&self)->Vec<bool> {
@@ -71,9 +71,9 @@ impl Assignment {
         result
     }
     
-    pub fn get_value(&self, index: u64)->Option<bool>{
+    pub fn get_value(&self, index: usize)->Option<bool>{
         if self.is_already_assigned(index){
-            return Some(self.value.test(index as usize))
+            return Some(self.value.test(index))
         }
         
         None

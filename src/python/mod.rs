@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 #[pyclass]
 pub struct Sat {
     #[pyo3(get)]
-    pub clauses: Vec<Vec<i64>>,
+    pub clauses: Vec<Vec<i32>>,
     #[pyo3(get)]
     model : Option<Vec<bool>>,
     #[pyo3(get)]
@@ -24,7 +24,7 @@ impl Sat {
     /// Creates a sat instance with <clauses> as clauses, if None is passed instead creates an empty sat instance.
     #[new]
     #[pyo3(signature = (clauses = None),text_signature = "clauses: list[list[int]] | None = None")]
-    pub fn new(clauses: Option<Vec<Vec<i64>>>) -> Self {
+    pub fn new(clauses: Option<Vec<Vec<i32>>>) -> Self {
         if let Some(clauses) = clauses {
             for lit in clauses.iter().flatten() {
                 if *lit == 0 {
@@ -47,7 +47,7 @@ impl Sat {
     }
     /// Adds a clause to the sat instance, the clause is a list of integers where positive integers represent positive literals and negative integers represent negated literals.
    #[pyo3(signature = (clause: "list[int]") ,text_signature = "clause: list[int]")]
-    pub fn add_clause(&mut self, clause: Vec<i64>) {
+    pub fn add_clause(&mut self, clause: Vec<i32>) {
         for lit in clause.iter() {
             if *lit == 0 {
                 panic!("Literal cannot be 0");

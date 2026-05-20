@@ -132,7 +132,7 @@ impl Clause {
     
     /// Returns a vector of the unassigned literals of this clause, if there are no unassigned literals returns an empty vector.
     pub fn get_unassigned_literals(&self, assignment: &Assignment)->Vec<&Literal>{
-        self.literals.iter().filter(|lit| assignment.get_value(lit.get_index()).is_none()).collect()
+        self.literals.iter().filter(|lit| assignment.get_value(lit.get_index().abs() as usize).is_none()).collect()
     }
 
 	// ///  Removes from this clause all of the literals which value has already been assigned, this method in-place modifies this clause.
@@ -142,8 +142,8 @@ impl Clause {
 	// 
 	
 	/// Returns true if this clause contains a literal with index <index>, false otherwise.
-	pub fn contains_literal(&self, index: u64)->bool{
-        self.literals.contains(&Literal::new(index, false)) || self.literals.contains(&Literal::new(index,false))
+	pub fn contains_literal(&self, index: i32)->bool{
+        self.literals.contains(&Literal::new(index)) || self.literals.contains(&Literal::new(-index))
     }
     
     /// Returns true if this clause is satisfied, false otherwise. A clause is satisfied if at least one of its literals resolves to true.
@@ -176,7 +176,7 @@ impl Clause {
     /// Unit propagates this clause, this method in-place modifies this clause and returns the literal that was propagated, if this clause is not a unit clause this method panics.
     pub fn unit_propagate(&mut self, assignment: &mut Assignment)->Option<&Literal>{
         if let Some(lit) = self.get_unit_literal(assignment){
-            assignment.assign(lit.get_index(), !lit.is_negated());
+            assignment.assign(lit.get_index().abs() as usize, !lit.is_negated());
             return Some(lit)
         }
         

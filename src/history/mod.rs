@@ -100,12 +100,12 @@ impl History {
         
         for decision in to_revert {
             if let Some(lit) = decision.get_decision_literal() {
-                assignment.unset(lit.get_index());
+                assignment.unset(lit.get_index().abs() as usize);
                 self.implication_levels_indexes.unset_level(lit); 
             }
             
             for implication in decision.get_implied_literals() {
-                assignment.unset(implication.get_index());
+                assignment.unset(implication.get_index().abs() as usize);
                 self.implication_levels_indexes.unset_level(implication);
             }
         }

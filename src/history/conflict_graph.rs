@@ -45,7 +45,7 @@ pub fn graph_from_conflict(
 
     if current_level == 0 {
         graph.add_root_node(NodeType::Conflict)?;
-        return Ok((graph, Literal::new(0, false)));
+        return Ok((graph, Literal::new(1)));
     }
 
     // Identify the 1UIP to serve as our hard stop (source of the subgraph)
@@ -431,7 +431,7 @@ pub fn find_clauses_from_dip_pair<W>(
                             let pred = reason_lit.negated();
                             let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                             if pred_level < current_level {
-                                if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
+                                if seen.insert(pred.get_index()) { res.push(pred.clone()); }
                             }
                         }
                     }
@@ -442,7 +442,7 @@ pub fn find_clauses_from_dip_pair<W>(
                     let pred = conflict_lit.negated();
                     let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                     if pred_level < current_level {
-                        if seen.insert(pred.get_signed_index()) { res.push(pred.clone()); }
+                        if seen.insert(pred.get_index()) { res.push(pred.clone()); }
                     }
                 }
             }

@@ -102,7 +102,7 @@ impl Formula {
         Formula {
             clauses: vec![],
             assignment: Assignment::new(size),
-            watch: Watch::new(size as u64),
+            watch: Watch::new(size),
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
         }
@@ -119,7 +119,7 @@ impl Formula {
         let mut formula = Formula {
             clauses: clauses.to_owned(),
             assignment: Assignment::new(max_index as usize + 1),
-            watch: Watch::new(max_index + 1),
+            watch: Watch::new(max_index as usize + 1),
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
         };
@@ -146,15 +146,15 @@ impl Formula {
         formula
     }
 
-    pub fn from_vec(raw_clauses: Vec<Vec<i64>>) -> Self {
+    pub fn from_vec(raw_clauses: Vec<Vec<i32>>) -> Self {
         let mut clauses = Vec::new();
         for raw_clause in raw_clauses.iter() {
             let mut clause = Clause::new();
             for raw_lit in raw_clause.iter() {
-                if *raw_lit == 0 as i64 {
+                if *raw_lit == 0 {
                     panic!("0 indexing is not allowed on dimacs")
                 }
-                let lit = Literal::new((raw_lit.abs() - 1) as u64, raw_lit.is_negative());
+                let lit = Literal::new(*raw_lit);
                 clause
                     .add_literal(&lit)
                     .expect("Literal cannot be in the same clause twice");
@@ -261,14 +261,14 @@ impl Formula {
         let index = self.assignment.add_variable();
         self.watch.add_literal();
 
-        Literal::new(index as u64, false)
+        Literal::new(index as i32)
     }
 
-    pub fn set_variable(&mut self, index: u64, value: bool) {
+    pub fn set_variable(&mut self, index: usize, value: bool) {
         self.assignment.assign(index, value)
     }
 
-    pub fn unset_variable(&mut self, index: u64) {
+    pub fn unset_variable(&mut self, index: usize) {
         self.assignment.unset(index);
     }
 
@@ -292,13 +292,13 @@ impl Formula {
         // variable_index -> bitmask
         // 0b01 = positive seen
         // 0b10 = negative seen
-        let mut polarity: HashMap<u64, u8> = HashMap::new();
+        let mut polarity: HashMap<usize, u8> = HashMap::new();
 
         for (_, clause) in clauses {
             for lit in clause.get_unassigned_literals(assignment) {
                 let bit = if lit.is_negated() { 0b10 } else { 0b01 };
                 polarity
-                    .entry(lit.get_index())
+                    .entry(lit.get_index().abs() as usize)
                     .and_modify(|mask| *mask |= bit)
                     .or_insert(bit);
             }
@@ -308,8 +308,8 @@ impl Formula {
 
         for (var, mask) in polarity {
             match mask {
-                0b01 => pure_literals.push(Literal::new(var, false)),
-                0b10 => pure_literals.push(Literal::new(var, true)),
+                0b01 => pure_literals.push(Literal::new(var as i32)),
+                0b10 => pure_literals.push(Literal::new(-(var as i32))),
                 _ => {}
             }
         }
@@ -350,7 +350,7 @@ impl Formula {
             }
             if let Some(literal) = found {
                 self.assignment
-                    .assign(literal.get_index(), !literal.is_negated());
+                    .assign(literal.get_index().abs() as usize, !literal.is_negated());
                 progress = true;
             } else {
                 break;
@@ -374,7 +374,7 @@ impl Formula {
             }
             if let Some((i, literal)) = found {
                 self.assignment
-                    .assign(literal.get_index(), !literal.is_negated());
+                    .assign(literal.get_index().abs() as usize, !literal.is_negated());
                 history.add_implication(&literal, Some(i));
                 progress = true;
             } else {
@@ -390,7 +390,7 @@ impl Formula {
             let mut assignment = self.assignment.clone();
             let pure_literals = self.get_pure_literals();
             if let Some(pure) = pure_literals.into_iter().next() {
-                assignment.assign(pure.get_index(), !pure.is_negated());
+                assignment.assign(pure.get_index().abs() as usize, !pure.is_negated());
                 progress = true;
             } else {
                 break;
@@ -408,7 +408,7 @@ impl Formula {
             let mut assignment = self.assignment.clone();
             let pure_literals = self.get_pure_literals();
             if let Some(pure) = pure_literals.into_iter().next() {
-                assignment.assign(pure.get_index(), !pure.is_negated());
+                assignment.assign(pure.get_index().abs() as usize, !pure.is_negated());
                 history.add_implication(&pure, None);
                 progress = true;
             } else {
@@ -495,7 +495,7 @@ impl Formula {
                         conflict = Some(clause_idx);
                     } else {
                         self.assignment
-                            .assign(other_lit.get_index(), !other_lit.is_negated());
+                            .assign(other_lit.get_index().abs() as usize, !other_lit.is_negated());
                         history.add_implication(&other_lit, Some(clause_idx as usize));
                         queue.push_back(other_lit);
                     }
@@ -529,8 +529,8 @@ impl Formula {
 
     pub fn get_unassigned_literal(&self) -> Option<Literal> {
         for i in 0..self.assignment.len() {
-            if self.assignment.get_value(i as u64).is_none() {
-                return Some(Literal::new(i as u64, true));
+            if self.assignment.get_value(i).is_none() {
+                return Some(Literal::new(i as i32));
             }
         }
 

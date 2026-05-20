@@ -29,7 +29,7 @@ fn backtrack(formula: &mut Formula, history: &mut History) -> bool {
         if !last_decision.is_negated() {
             let flipped = last_decision.negated();
             history.add_decision(&flipped);
-            formula.assignment.assign(flipped.get_index(), !flipped.is_negated());
+            formula.assignment.assign(flipped.get_index().abs() as usize, !flipped.is_negated());
             return true;
         }
     }
@@ -60,9 +60,9 @@ pub fn solve_dpll(py: Python<'_>, formula: &mut Formula) -> PyResult<Option<Vec<
             None => return Ok(Some(formula.get_model())),
         };
 
-        let decision = Literal::new(lit.get_index(), false);
+        let decision = Literal::new(lit.get_index().abs());
 
         history.add_decision(&decision);
-        formula.assignment.assign(decision.get_index(), true);
+        formula.assignment.assign(decision.get_index().abs() as usize, true);
     }
 }

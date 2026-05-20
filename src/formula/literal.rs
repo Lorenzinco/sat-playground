@@ -4,14 +4,13 @@ use crate::formula::assignment::Assignment;
 
 #[derive(Clone,Hash, PartialEq, Eq)]
 pub struct Literal{
-	variable_index: u64,
-	negative: bool,
+	literal: i32,
 }
 
 
 impl fmt::Display for Literal{
 	fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
-		let sign = if self.negative {"¬"} else {""};
+		let sign = if self.literal.is_negative() {"¬"} else {""};
 		
 		write!(f,"{}x{}",sign,self.to_subscript())
 	}
@@ -19,7 +18,7 @@ impl fmt::Display for Literal{
 
 impl fmt::Debug for Literal{
 	fn fmt(&self, f: &mut fmt::Formatter<'_>)->fmt::Result{
-		let sign = if self.negative {"¬"} else {""};
+		let sign = if self.literal.is_negative() {"¬"} else {""};
 		
 		write!(f,"{}x{}",sign,self.to_subscript())
 	}
@@ -37,46 +36,53 @@ impl Literal{
 	}
     
 	pub fn eval(&self, assignment: &Assignment)->Option<bool>{
-	    if let Some(value) = assignment.get_value(self.get_index()){
+	    if let Some(value) = assignment.get_value(self.get_index().abs() as usize){
 			return Some(self.is_negated() ^ value)
 		}
 	    
 		None
 	}
 	
-	pub fn new(variable_index: u64, negative: bool)->Self{
+	pub fn new(literal: i32)->Self{
+	    if literal == 0 {panic!("literal index is 0 but literal index is sign sensitive now!")}
 		Self {
-			variable_index: variable_index,
-			negative: negative
+		literal: literal
 		}
 	}
 	
 	pub fn negated(&self)->Self{
-        Self {
-            variable_index: self.get_index(),
-            negative: !self.negative
+	    Self { literal: -self.get_index() }
+    }
+    
+    pub fn from_unsigned_index(unsigned_index: u32) -> Literal {
+        if unsigned_index == 0 {
+            panic!("unsigned index 0 would map to literal 0");
+        }
+    
+        let idx = ((unsigned_index + 1) / 2) as i32;
+    
+        if unsigned_index.is_multiple_of(2) {
+            Literal::new(-idx)
+        } else {
+            Literal::new(idx)
         }
     }
     
-    pub fn from_real_index(real_index: u64)->Literal{
-        let negated = if real_index.is_multiple_of(2) { false } else { true };
-        let idx = real_index / 2;
-        
-        Literal::new(idx,negated)
-    }
-
-    pub fn get_signed_index(&self)->u64{
-        match self.is_negated() {
-            true => {self.get_index()*2+1}
-            false => {self.get_index()*2}
+    pub fn get_unsigned_index(&self) -> u32 {
+        let idx = self.literal.abs() as u32;
+    
+        if self.is_negated() {
+            idx * 2
+        } else {
+            idx * 2 - 1
         }
     }
 	
-	pub fn get_index(&self)->u64{
-	    self.variable_index
+	pub fn get_index(&self)->i32{
+	    self.literal
 	}
 	
 	pub fn is_negated(&self)->bool{
-        self.negative
+        self.literal.is_negative()
     }
 }

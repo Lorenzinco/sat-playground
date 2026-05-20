@@ -7,7 +7,7 @@ use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
 //use crate::history::conflict_graph;
-use crate::history::conflict_graph::dump_conflict_graph_dot;
+//use crate::history::conflict_graph::dump_conflict_graph_dot;
 use crate::python::signal_checker;
 
 use pyo3::prelude::PyResult;
@@ -45,7 +45,7 @@ pub fn solve_cdcl<'py, W:Write>(
             }
             Some(true) => {}
             None => {
-                formula.assignment.assign(lit.get_index(), !lit.is_negated());
+                formula.assignment.assign(lit.get_index().abs() as usize, !lit.is_negated());
                 history.add_implication(&lit, Some(i));
                 queue.push_back(lit);
             }
@@ -77,7 +77,7 @@ pub fn solve_cdcl<'py, W:Write>(
         history.add_decision(&decision_lit);
         formula
             .assignment
-            .assign(decision_lit.get_index(), !decision_lit.is_negated());
+            .assign(decision_lit.get_index().abs() as usize, !decision_lit.is_negated());
         queue.push_back(decision_lit);
 
         while let Some(conflict_idx) = formula.propagate_twl(&mut history, &mut queue) {
@@ -294,14 +294,14 @@ pub fn solve_cdcl<'py, W:Write>(
 
 fn assign_literal_true(
     lit: &Literal,
-    assignment: &mut std::collections::HashMap<u64, bool>,
+    assignment: &mut std::collections::HashMap<usize, bool>,
 ) -> bool {
     let value = !lit.is_negated();
 
-    match assignment.get(&lit.get_index()) {
+    match assignment.get(&(lit.get_index().abs() as usize)) {
         Some(&old) => old == value,
         None => {
-            assignment.insert(lit.get_index(), value);
+            assignment.insert(lit.get_index().abs() as usize, value);
             true
         }
     }
@@ -327,7 +327,7 @@ fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
             let mut satisfied = false;
 
             for lit in existing_clause.get_literals() {
-                match assignment.get(&lit.get_index()) {
+                match assignment.get(&(lit.get_index().abs() as usize)) {
                     Some(&value) => {
                         let lit_value = if lit.is_negated() { !value } else { value };
                         if lit_value {
@@ -402,7 +402,7 @@ fn enqueue_asserting_literal(
         None => {
             formula
                 .assignment
-                .assign(lit.get_index(), !lit.is_negated());
+                .assign(lit.get_index().abs() as usize, !lit.is_negated());
             history.add_implication(&lit, Some(reason_clause_idx));
             queue.push_back(lit);
             Ok(())

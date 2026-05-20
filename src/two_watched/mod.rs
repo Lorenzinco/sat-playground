@@ -14,7 +14,7 @@ pub struct Watch {
 }
 
 impl Watch {
-    pub fn new(n_lits: u64) -> Self {
+    pub fn new(n_lits: usize) -> Self {
         let mut watchlist: Vec<Vec<u64>> = Vec::new();
         for _i in 0..n_lits {
             watchlist.push(Vec::new());
@@ -28,7 +28,7 @@ impl Watch {
 
     /// Returns the clauses watched by the literal with index
     pub fn get_watched(&self, lit: &Literal) -> &Vec<u64> {
-        let idx = lit.get_signed_index() as usize;
+        let idx = lit.get_unsigned_index() as usize;
 
         self.watchlist
             .get(idx)
@@ -37,7 +37,7 @@ impl Watch {
 
     /// Pushes the clause index inside the watchlist of the given lit
     pub fn add_to_watchlist(&mut self, clause_idx: usize, lit: &Literal) {
-        let idx = lit.get_signed_index() as usize;
+        let idx = lit.get_unsigned_index() as usize;
 
         self.watchlist
             .get_mut(idx)
@@ -53,7 +53,7 @@ impl Watch {
 
     /// Removes the clause index from the watchlist of the given lit if present
     pub fn remove_from_watchlist(&mut self, clause_idx: usize, lit: &Literal) {
-        let idx = lit.get_signed_index() as usize;
+        let idx = lit.get_unsigned_index() as usize;
 
         self.watchlist
             .get_mut(idx)
@@ -62,7 +62,7 @@ impl Watch {
     }
 
     pub fn take(&mut self, lit: &Literal) -> Vec<u64> {
-        let idx = lit.get_signed_index() as usize;
+        let idx = lit.get_unsigned_index() as usize;
         take(
             self.watchlist
                 .get_mut(idx as usize)
@@ -71,7 +71,7 @@ impl Watch {
     }
 
     pub fn set(&mut self, lit: &Literal, new_list: Vec<u64>) {
-        let idx = lit.get_signed_index() as usize;
+        let idx = lit.get_unsigned_index() as usize;
         *self
             .watchlist
             .get_mut(idx)

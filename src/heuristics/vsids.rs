@@ -18,7 +18,7 @@ impl Vsids {
     }
 
     pub fn bump(&mut self, lit: &Literal) {
-        let var = lit.get_index() as usize;
+        let var = lit.get_index().abs() as usize;
         if var >= self.scores.len() {
             self.scores.resize(var + 1, 0.0);
             self.saved_phases.resize(var + 1, false);
@@ -47,15 +47,15 @@ impl Vsids {
         let mut best_score = -1.0;
 
         for i in 0..formula.assignment.len() {
-            if formula.assignment.get_value(i as u64).is_none() {
+            if formula.assignment.get_value(i).is_none() {
                 let score = self.scores[i];
                 if score > best_score {
                     best_score = score;
-                    best_var = Some(i as u64);
+                    best_var = Some(i);
                 }
             }
         }
 
-        best_var.map(|var| Literal::new(var, !self.saved_phases[var as usize]))
+        best_var.map(|var| if self.saved_phases[var] {Literal::new(var as i32)} else {Literal::new(-(var as i32))})
     }
 }
