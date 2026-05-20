@@ -4,18 +4,18 @@ use std::mem::take;
 #[derive(Clone, Copy)]
 pub enum Watched {
     None,
-    One(u64),
-    Two(u64, u64),
+    One(usize),
+    Two(usize, usize),
 }
 
 #[derive(Clone)]
 pub struct Watch {
-    watchlist: Vec<Vec<u64>>,
+    watchlist: Vec<Vec<usize>>,
 }
 
 impl Watch {
     pub fn new(n_lits: usize) -> Self {
-        let mut watchlist: Vec<Vec<u64>> = Vec::new();
+        let mut watchlist: Vec<Vec<usize>> = Vec::new();
         for _i in 0..n_lits {
             watchlist.push(Vec::new());
             watchlist.push(Vec::new());
@@ -27,12 +27,12 @@ impl Watch {
     }
 
     /// Returns the clauses watched by the literal with index
-    pub fn get_watched(&self, lit: &Literal) -> &Vec<u64> {
+    pub fn get_watched(&self, lit: &Literal) -> &Vec<usize> {
         let idx = lit.get_unsigned_index() as usize;
 
         self.watchlist
             .get(idx)
-            .expect("watchlist for this literal is unitialized")
+            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
     }
 
     /// Pushes the clause index inside the watchlist of the given lit
@@ -41,8 +41,8 @@ impl Watch {
 
         self.watchlist
             .get_mut(idx)
-            .expect("Watchlist for this literal is unitialized")
-            .push(clause_idx as u64)
+            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
+            .push(clause_idx)
     }
 
     /// Creates space for a new literal inside the watchlist
@@ -57,30 +57,30 @@ impl Watch {
 
         self.watchlist
             .get_mut(idx)
-            .expect("Watchlist for this literal is unitialized")
-            .retain(|&idx| idx != clause_idx as u64);
+            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
+            .retain(|&idx| idx != clause_idx);
     }
 
-    pub fn take(&mut self, lit: &Literal) -> Vec<u64> {
+    pub fn take(&mut self, lit: &Literal) -> Vec<usize> {
         let idx = lit.get_unsigned_index() as usize;
         take(
             self.watchlist
-                .get_mut(idx as usize)
-                .expect("Watchlist for this literal is unitialized"),
+                .get_mut(idx)
+                .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str()),
         )
     }
 
-    pub fn set(&mut self, lit: &Literal, new_list: Vec<u64>) {
+    pub fn set(&mut self, lit: &Literal, new_list: Vec<usize>) {
         let idx = lit.get_unsigned_index() as usize;
         *self
             .watchlist
             .get_mut(idx)
-            .expect("Watchlist for this literal is unitialized") = new_list;
+            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str()) = new_list;
     }
 
     /// Shifts all the clause indexes by one (backwards) from a clause index onwards, this is done after clause deletition
     pub fn shift_by_one_from_index(&mut self, clause_index: usize) {
-        let deleted = clause_index as u64;
+        let deleted = clause_index;
 
         for lit_watchlist in self.watchlist.iter_mut() {
             lit_watchlist.retain_mut(|idx| {

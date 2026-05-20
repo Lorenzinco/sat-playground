@@ -11,7 +11,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
     let current_level = history.get_decision_level();
     if current_level == 0 { return (Clause::new(), 0); } // Unsat
 
-    let mut seen = BitVec::<u64>::new(formula.assignment.len());
+    let mut seen = BitVec::<u64>::new(formula.assignment.len()+1);
     let mut learned_lits: Vec<Literal> = Vec::new();
     let mut path_count = 0;
     
@@ -28,7 +28,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
             for lit in clause.iter() {
                 if Some(lit) == resolved_lit.as_ref() { continue; }
                 
-                let var = lit.get_index() as usize;
+                let var = lit.get_index().abs() as usize;
                 if !seen.test(var) {
                     seen.set(var);
                     if history.get_literal_level(lit) == Some(current_level) {
@@ -42,7 +42,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
 
         loop {
             if let Some(lit) = trail_iter.next() {
-                let var = lit.get_index() as usize;
+                let var = lit.get_index().abs() as usize;
                 if seen.test(var) {
                     resolved_lit = Some(lit.clone());
                     path_count -= 1;
@@ -63,18 +63,18 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
     let last_idx = learned_lits.len() - 1;
     learned_lits.swap(0, last_idx);
 
-    let mut min_seen = BitVec::<u64>::new(formula.assignment.len());
+    let mut min_seen = BitVec::<u64>::new(formula.assignment.len()+1);
     for lit in &learned_lits {
-        min_seen.set(lit.get_index() as usize);
+        min_seen.set(lit.get_index().abs() as usize);
     }
     
-    let mut poisoned = BitVec::<u64>::new(formula.assignment.len());
+    let mut poisoned = BitVec::<u64>::new(formula.assignment.len()+1);
     
     let mut minimized_lits = Vec::new();
     minimized_lits.push(learned_lits[0].clone());
     
     for lit in learned_lits.iter().skip(1) {
-        let var = lit.get_index() as usize;
+        let var = lit.get_index().abs() as usize;
         let level = history.get_literal_level(lit).unwrap_or(0);
         
         if level == 0 { continue; }
@@ -84,7 +84,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
         let mut failed = false;
         
         while let Some(current) = stack.pop() {
-            let c_var = current.get_index() as usize;
+            let c_var = current.get_index().abs() as usize;
             
             if c_var != var && min_seen.test(c_var) { continue; }
             
@@ -112,7 +112,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
                     }
                     
                     for child in clause.get_literals() {
-                        let child_var = child.get_index() as usize;
+                        let child_var = child.get_index().abs() as usize;
                         if child_var != c_var {
                             stack.push(child.clone());
                         }

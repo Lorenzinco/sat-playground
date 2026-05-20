@@ -1,9 +1,9 @@
+use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
-use crate::formula::Formula;
-use crate::history::uip::find_1uip;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
+use crate::history::uip::find_1uip;
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -18,7 +18,7 @@ struct DipSlice {
     succ: Vec<Vec<usize>>,
     present: Vec<bool>,
     reason_of: Vec<Option<usize>>,
-    pos_of: Vec<Option<usize>>, // signed-index -> trail position
+    pos_of: Vec<Option<usize>>, // unsigned-index -> trail position
 }
 
 fn current_level_context(
@@ -32,13 +32,13 @@ fn current_level_context(
     let mut reason_of = Vec::new();
 
     if let Some(decision) = level.get_decision_literal() {
-        pos_of[decision.get_signed_index() as usize] = Some(trail.len());
+        pos_of[decision.get_unsigned_index() as usize] = Some(trail.len());
         trail.push(decision.clone());
         reason_of.push(None);
     }
 
     for lit in level.implied_literals_iter() {
-        pos_of[lit.get_signed_index() as usize] = Some(trail.len());
+        pos_of[lit.get_unsigned_index() as usize] = Some(trail.len());
         trail.push(lit.clone());
         reason_of.push(level.get_reason(lit));
     }
@@ -63,7 +63,10 @@ fn current_level_predecessors(
             .iter()
             .filter_map(|lit| {
                 let pred = lit.negated();
-                pos_of.get(pred.get_signed_index() as usize).copied().flatten()
+                pos_of
+                    .get(pred.get_unsigned_index() as usize)
+                    .copied()
+                    .flatten()
             })
             .collect();
     }
@@ -85,7 +88,10 @@ fn current_level_predecessors(
         .filter(|reason_lit| *reason_lit != current_lit)
         .filter_map(|reason_lit| {
             let pred = reason_lit.negated();
-            pos_of.get(pred.get_signed_index() as usize).copied().flatten()
+            pos_of
+                .get(pred.get_unsigned_index() as usize)
+                .copied()
+                .flatten()
         })
         .collect()
 }
@@ -107,7 +113,10 @@ fn build_dip_slice(
         .map(|lit| lit.negated())?;
 
     let (trail, pos_of, reason_of) = current_level_context(history, formula);
-    let source_pos = pos_of.get(first_uip.get_signed_index() as usize).copied().flatten()?;
+    let source_pos = pos_of
+        .get(first_uip.get_unsigned_index() as usize)
+        .copied()
+        .flatten()?;
 
     let conflict_idx = trail.len();
     let mut succ = vec![Vec::new(); conflict_idx + 1];
@@ -317,7 +326,7 @@ fn collect_lower_level_preds(
             for conflict_lit in conflict_clause.get_literals() {
                 let pred = conflict_lit.negated();
                 if history.get_literal_level(&pred).unwrap_or(0) < current_level
-                    && seen.insert(pred.get_signed_index())
+                    && seen.insert(pred.get_unsigned_index())
                 {
                     out.push(pred);
                 }
@@ -342,7 +351,7 @@ fn collect_lower_level_preds(
 
             let pred = reason_lit.negated();
             if history.get_literal_level(&pred).unwrap_or(0) < current_level
-                && seen.insert(pred.get_signed_index())
+                && seen.insert(pred.get_unsigned_index())
             {
                 out.push(pred);
             }
@@ -366,12 +375,12 @@ fn find_clauses_from_dip_pair(
 
     let dip_a_pos = slice
         .pos_of
-        .get(dip_a.get_signed_index() as usize)
+        .get(dip_a.get_unsigned_index() as usize)
         .copied()
         .flatten()?;
     let dip_b_pos = slice
         .pos_of
-        .get(dip_b.get_signed_index() as usize)
+        .get(dip_b.get_unsigned_index() as usize)
         .copied()
         .flatten()?;
     let first_uip_pos = slice.source_pos;
@@ -428,12 +437,14 @@ fn find_clauses_from_dip_pair(
     }
 
     let mut pre_lits = vec![slice.trail[first_uip_pos].negated()];
-    for lit in collect_lower_level_preds(&pre_region, slice, history, formula, conflict_clause_idx) {
+    for lit in collect_lower_level_preds(&pre_region, slice, history, formula, conflict_clause_idx)
+    {
         pre_lits.push(lit.negated());
     }
 
     let mut post_lits = Vec::new();
-    for lit in collect_lower_level_preds(&post_region, slice, history, formula, conflict_clause_idx) {
+    for lit in collect_lower_level_preds(&post_region, slice, history, formula, conflict_clause_idx)
+    {
         post_lits.push(lit.negated());
     }
 
@@ -455,36 +466,46 @@ pub fn find_dip(
 
     let Some(slice) = build_dip_slice(history, formula, conflict_clause_index) else {
         let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip { clause, backtrack_level };
+        return ConflictLearnResult::Uip {
+            clause,
+            backtrack_level,
+        };
     };
 
     let Some(mut dips) = find_all_two_vertex_bottlenecks(&slice) else {
         let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip { clause, backtrack_level };
+        return ConflictLearnResult::Uip {
+            clause,
+            backtrack_level,
+        };
     };
 
     if dips.is_empty() {
         let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip { clause, backtrack_level };
+        return ConflictLearnResult::Uip {
+            clause,
+            backtrack_level,
+        };
     }
 
     let (a, b) = choose_best_dip_pair(&mut dips, &slice, history);
 
-    let Some((pre_lits, post_lits)) = find_clauses_from_dip_pair(
-        &slice,
-        history,
-        formula,
-        conflict_clause_index,
-        &a,
-        &b,
-    ) else {
+    let Some((pre_lits, post_lits)) =
+        find_clauses_from_dip_pair(&slice, history, formula, conflict_clause_index, &a, &b)
+    else {
         let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip { clause, backtrack_level };
+        return ConflictLearnResult::Uip {
+            clause,
+            backtrack_level,
+        };
     };
 
     if post_lits.is_empty() || a.get_index() == b.get_index() {
         let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip { clause, backtrack_level };
+        return ConflictLearnResult::Uip {
+            clause,
+            backtrack_level,
+        };
     }
 
     let backtrack_level = post_lits
@@ -516,7 +537,7 @@ fn choose_best_dip_pair(
         let pos_a = if la == current_level {
             slice
                 .pos_of
-                .get(a.get_signed_index() as usize)
+                .get(a.get_unsigned_index() as usize)
                 .copied()
                 .flatten()
                 .unwrap_or(0)
@@ -527,7 +548,7 @@ fn choose_best_dip_pair(
         let pos_b = if lb == current_level {
             slice
                 .pos_of
-                .get(b.get_signed_index() as usize)
+                .get(b.get_unsigned_index() as usize)
                 .copied()
                 .flatten()
                 .unwrap_or(0)
@@ -535,27 +556,30 @@ fn choose_best_dip_pair(
             0
         };
 
-        (la, lb, std::cmp::max(pos_a, pos_b), std::cmp::min(pos_a, pos_b))
+        (
+            la,
+            lb,
+            std::cmp::max(pos_a, pos_b),
+            std::cmp::min(pos_a, pos_b),
+        )
     });
 
     dips.pop().unwrap()
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use crate::history::{ConflictLearnResult, History, ImplicationPoint};
     use crate::formula::Formula;
     use crate::formula::clause::Clause;
     use crate::formula::literal::Literal;
+    use crate::history::{ConflictLearnResult, History, ImplicationPoint};
     use std::collections::HashSet;
 
-    fn lit_key(lit: &Literal) -> (u64, bool) {
+    fn lit_key(lit: &Literal) -> (i32, bool) {
         (lit.get_index(), lit.is_negated())
     }
 
-    fn lit_set(lits: &[Literal]) -> HashSet<(u64, bool)> {
+    fn lit_set(lits: &[Literal]) -> HashSet<(i32, bool)> {
         lits.iter().map(lit_key).collect()
     }
 
@@ -570,53 +594,55 @@ mod tests {
         }
     }
 
-    fn unordered_pair(a: &Literal, b: &Literal) -> ((u64, bool), (u64, bool)) {
+    fn unordered_pair(a: &Literal, b: &Literal) -> ((i32, bool), (i32, bool)) {
         let ka = lit_key(a);
         let kb = lit_key(b);
         if ka <= kb { (ka, kb) } else { (kb, ka) }
     }
 
-    fn lit_value(lit: &Literal, assignment: &std::collections::HashMap<u64, bool>) -> Option<bool> {
+    fn lit_value(lit: &Literal, assignment: &std::collections::HashMap<i32, bool>) -> Option<bool> {
+        let var = lit.get_index().abs();
         assignment
-            .get(&lit.get_index())
+            .get(&var)
             .map(|&var_value| var_value != lit.is_negated())
     }
-    
+
     fn assign_literal_true(
         lit: &Literal,
-        assignment: &mut std::collections::HashMap<u64, bool>,
+        assignment: &mut std::collections::HashMap<i32, bool>,
     ) -> bool {
+        let var = lit.get_index().abs();
         let value = !lit.is_negated();
-    
-        match assignment.get(&lit.get_index()) {
+
+        match assignment.get(&var) {
             Some(&old) => old == value,
             None => {
-                assignment.insert(lit.get_index(), value);
+                assignment.insert(var, value);
                 true
             }
         }
     }
-    
+
     fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
         let mut assignment = std::collections::HashMap::new();
-    
+
         // RUP check: assume negation of the candidate clause.
         for lit in clause.get_literals() {
             let assumption = lit.negated();
-    
+
             if !assign_literal_true(&assumption, &mut assignment) {
                 return true;
             }
         }
-    
+
         loop {
             let mut changed = false;
-    
+
             for existing_clause in formula.get_clauses() {
                 let mut unassigned = None;
                 let mut unassigned_count = 0;
                 let mut satisfied = false;
-    
+
                 for lit in existing_clause.get_literals() {
                     match lit_value(lit, &assignment) {
                         Some(true) => {
@@ -630,26 +656,26 @@ mod tests {
                         }
                     }
                 }
-    
+
                 if satisfied {
                     continue;
                 }
-    
+
                 if unassigned_count == 0 {
                     return true;
                 }
-    
+
                 if unassigned_count == 1 {
                     let unit = unassigned.unwrap();
-    
+
                     if !assign_literal_true(&unit, &mut assignment) {
                         return true;
                     }
-    
+
                     changed = true;
                 }
             }
-    
+
             if !changed {
                 return false;
             }
@@ -658,13 +684,13 @@ mod tests {
 
     #[test]
     fn paper_fig1_expected_pre_and_post_are_rup_after_extension_axioms() {
-        let x = |n: u64| Literal::new(n - 1, false);
-        let y = |n: u64| Literal::new(13 + n - 1, false);
-    
+        let x = |n: u64| Literal::new(n as i32);
+        let y = |n: u64| Literal::new((13 + n) as i32);
+
         // Original Figure 1 clauses plus extension axioms.
         //
         // Fresh extension variable:
-        // z = DIMACS var 20, internal index 19.
+        // z = DIMACS var 20.
         //
         // DIP: z <-> (x8 ∧ ¬x9)
         //
@@ -686,15 +712,14 @@ mod tests {
             vec![-11, 12],
             vec![10, -11, 13],
             vec![-12, -13],
-    
             // Extension axioms for z <-> (x8 ∧ ¬x9)
             vec![20, -8, 9],
             vec![-20, 8],
             vec![-20, -9],
         ]);
-    
-        let z = Literal::new(19, false);
-    
+
+        let z = Literal::new(20);
+
         // Figure 2 last row:
         // pre-DIP:  ¬x5 ∨ y1 ∨ ¬y3 ∨ ¬y4 ∨ z
         // post-DIP: ¬z ∨ ¬y4 ∨ ¬y5 ∨ y6
@@ -705,91 +730,105 @@ mod tests {
             y(3).negated(),
             y(4).negated(),
         ]);
-    
-        let post_clause = Clause::from_literals(&vec![
-            z.negated(),
-            y(4).negated(),
-            y(5).negated(),
-            y(6),
-        ]);
-    
+
+        let post_clause =
+            Clause::from_literals(&vec![z.negated(), y(4).negated(), y(5).negated(), y(6)]);
+
         assert!(
             is_rup_candidate(&formula, &pre_clause),
             "expected paper pre-DIP clause is not RUP: {:?}",
             pre_clause
         );
-    
+
         assert!(
             is_rup_candidate(&formula, &post_clause),
             "expected paper post-DIP clause is not RUP: {:?}",
             post_clause
         );
     }
-    
+
     #[test]
     fn dip_parallel_paths_ignores_dead_end_and_extracts_clauses() {
         // Variables (1-based in DIMACS):
         // 1 x1 (level1 decision), 2 p, 3 q, 4 x2 (level2 decision),
         // 5 a, 6 b, 7 c, 8 d, 9 r, 10 s (dead-end lower-level), 11 j (dead-end current level)
-        let clauses: Vec<Vec<i64>> = vec![
-            vec![-1, 2],         // 0: ¬x1 v p
-            vec![-1, 3],         // 1: ¬x1 v q
-            vec![-1, 10],        // 2: ¬x1 v s
-            vec![-4, -2, 5],     // 3: ¬x2 v ¬p v a
-            vec![-4, -3, 6],     // 4: ¬x2 v ¬q v b
-            vec![-5, -2, 7],     // 5: ¬a v ¬p v c
-            vec![-6, -3, 8],     // 6: ¬b v ¬q v d
-            vec![-7, -8, 9],     // 7: ¬c v ¬d v r   (conflict when r=false)
-            vec![-4, -10, 11],   // 8: ¬x2 v ¬s v j  (dead-end branch)
+        let clauses: Vec<Vec<i32>> = vec![
+            vec![-1, 2],       // 0: ¬x1 v p
+            vec![-1, 3],       // 1: ¬x1 v q
+            vec![-1, 10],      // 2: ¬x1 v s
+            vec![-4, -2, 5],   // 3: ¬x2 v ¬p v a
+            vec![-4, -3, 6],   // 4: ¬x2 v ¬q v b
+            vec![-5, -2, 7],   // 5: ¬a v ¬p v c
+            vec![-6, -3, 8],   // 6: ¬b v ¬q v d
+            vec![-7, -8, 9],   // 7: ¬c v ¬d v r   (conflict when r=false)
+            vec![-4, -10, 11], // 8: ¬x2 v ¬s v j  (dead-end branch)
         ];
 
         let mut formula = Formula::from_vec(clauses);
         let mut history = History::new();
 
         // Level 1 decision
-        let x1 = Literal::new(0, false);
+        let x1 = Literal::new(1);
         formula.assignment.assign_history(&x1, &mut history);
 
-        let p = Literal::new(1, false);
-        formula.assignment.assign(p.get_index(), true);
+        let p = Literal::new(2);
+        formula
+            .assignment
+            .assign(p.get_index().abs() as usize, true);
         history.add_implication(&p, Some(0));
 
-        let q = Literal::new(2, false);
-        formula.assignment.assign(q.get_index(), true);
+        let q = Literal::new(3);
+        formula
+            .assignment
+            .assign(q.get_index().abs() as usize, true);
         history.add_implication(&q, Some(1));
 
-        let s = Literal::new(9, false);
-        formula.assignment.assign(s.get_index(), true);
+        let s = Literal::new(10);
+        formula
+            .assignment
+            .assign(s.get_index().abs() as usize, true);
         history.add_implication(&s, Some(2));
 
         // r = false at level 1
-        let r_neg = Literal::new(8, true);
-        formula.assignment.assign(r_neg.get_index(), false);
+        let r_neg = Literal::new(-9);
+        formula
+            .assignment
+            .assign(r_neg.get_index().abs() as usize, false);
         history.add_implication(&r_neg, None);
 
         // Level 2 decision
-        let x2 = Literal::new(3, false);
+        let x2 = Literal::new(4);
         formula.assignment.assign_history(&x2, &mut history);
 
-        let a = Literal::new(4, false);
-        formula.assignment.assign(a.get_index(), true);
+        let a = Literal::new(5);
+        formula
+            .assignment
+            .assign(a.get_index().abs() as usize, true);
         history.add_implication(&a, Some(3));
 
-        let b = Literal::new(5, false);
-        formula.assignment.assign(b.get_index(), true);
+        let b = Literal::new(6);
+        formula
+            .assignment
+            .assign(b.get_index().abs() as usize, true);
         history.add_implication(&b, Some(4));
 
-        let c = Literal::new(6, false);
-        formula.assignment.assign(c.get_index(), true);
+        let c = Literal::new(7);
+        formula
+            .assignment
+            .assign(c.get_index().abs() as usize, true);
         history.add_implication(&c, Some(5));
 
-        let d = Literal::new(7, false);
-        formula.assignment.assign(d.get_index(), true);
+        let d = Literal::new(8);
+        formula
+            .assignment
+            .assign(d.get_index().abs() as usize, true);
         history.add_implication(&d, Some(6));
 
         // Dead-end implication (should NOT influence pre_clause)
-        let j = Literal::new(10, false);
-        formula.assignment.assign(j.get_index(), true);
+        let j = Literal::new(11);
+        formula
+            .assignment
+            .assign(j.get_index().abs() as usize, true);
         history.add_implication(&j, Some(8));
 
         let conflict_idx = 7;
@@ -803,7 +842,13 @@ mod tests {
                     post_clause_without_z,
                     backtrack_level,
                     ..
-                } => (dip_a, dip_b, pre_clause_without_z, post_clause_without_z, backtrack_level),
+                } => (
+                    dip_a,
+                    dip_b,
+                    pre_clause_without_z,
+                    post_clause_without_z,
+                    backtrack_level,
+                ),
                 _ => panic!("Expected DIP result"),
             };
 
@@ -825,7 +870,7 @@ mod tests {
         assert_eq!(pre_set, expected_pre);
 
         // Post-clause should contain r (since ¬r is in conflict clause and r is level 1).
-        let r = Literal::new(8, false);
+        let r = Literal::new(9);
         let post_set = lit_set(&post_clause_without_z);
         let expected_post: HashSet<_> = [lit_key(&r)].into_iter().collect();
         assert_eq!(post_set, expected_post);
@@ -838,27 +883,24 @@ mod tests {
         use crate::formula::Formula;
         use crate::formula::literal::Literal;
         use crate::history::History;
-        use crate::history::conflict_graph::{
-            graph_from_conflict,
-            find_clauses_from_dip_pair,
-        };
+        use crate::history::conflict_graph::{find_clauses_from_dip_pair, graph_from_conflict};
         use std::collections::HashSet;
-    
-        fn lit_key(lit: &Literal) -> (u64, bool) {
+
+        fn lit_key(lit: &Literal) -> (i32, bool) {
             (lit.get_index(), lit.is_negated())
         }
-    
-        fn lit_set(lits: &[Literal]) -> HashSet<(u64, bool)> {
+
+        fn lit_set(lits: &[Literal]) -> HashSet<(i32, bool)> {
             lits.iter().map(lit_key).collect()
         }
-    
+
         // Mapping:
-        // x1..x13 => indices 0..12, DIMACS vars 1..13
-        // y1..y6  => indices 13..18, DIMACS vars 14..19
-        let x = |n: u64| Literal::new(n - 1, false);
-        let y = |n: u64| Literal::new(13 + n - 1, false);
-    
-        let clauses: Vec<Vec<i64>> = vec![
+        // x1..x13 => DIMACS vars 1..13
+        // y1..y6  => DIMACS vars 14..19
+        let x = |n: u64| Literal::new(n as i32);
+        let y = |n: u64| Literal::new((13 + n) as i32);
+
+        let clauses: Vec<Vec<i32>> = vec![
             vec![14, -1, 2],          // (1)  y1 v ¬x1 v x2
             vec![-1, -3],             // (2)  ¬x1 v ¬x3
             vec![15, -1, 4],          // (3)  y2 v ¬x1 v x4
@@ -873,10 +915,10 @@ mod tests {
             vec![10, -11, 13],        // (12) x10 v ¬x11 v x13
             vec![-12, -13],           // (13) ¬x12 v ¬x13, conflicting
         ];
-    
+
         let mut formula = Formula::from_vec(clauses);
         let mut history = History::new();
-    
+
         // Previous-level assignments:
         // {¬y1, ¬y2, y3, y4, y5, ¬y6}
         for lit in [
@@ -889,14 +931,14 @@ mod tests {
         ] {
             formula
                 .assignment
-                .assign(lit.get_index(), !lit.is_negated());
+                .assign(lit.get_index().abs() as usize, !lit.is_negated());
             history.add_implication(&lit, None);
         }
-    
+
         // Current decision level: decide x1.
         let x1 = x(1);
         formula.assignment.assign_history(&x1, &mut history);
-    
+
         // Propagation sequence from Example 3.1 / Figure 1.
         let propagated = [
             (x(2), 0),
@@ -912,26 +954,25 @@ mod tests {
             (x(12), 10),
             (x(13), 11),
         ];
-    
+
         for (lit, reason) in propagated {
             formula
                 .assignment
-                .assign(lit.get_index(), !lit.is_negated());
+                .assign(lit.get_index().abs() as usize, !lit.is_negated());
             history.add_implication(&lit, Some(reason));
         }
-    
+
         let conflict_idx = 12;
-    
-        let (graph, first_uip) =
-            graph_from_conflict(&history, &formula, conflict_idx)
-                .expect("graph_from_conflict should build Figure 1 graph");
-    
+
+        let (graph, first_uip) = graph_from_conflict(&history, &formula, conflict_idx)
+            .expect("graph_from_conflict should build Figure 1 graph");
+
         assert_eq!(lit_key(&first_uip), lit_key(&x(5)));
-    
+
         // Last row of Figure 2: DIP is x8 and ¬x9.
         let dip_a = x(8);
         let dip_b = x(9).negated();
-    
+
         let (pre, post) = find_clauses_from_dip_pair(
             &graph,
             &history,
@@ -946,9 +987,9 @@ mod tests {
         assert_unique_literals(&pre);
         assert_unique_literals(&post);
 
-        println!("prededuping: {:?}, {:?}",pre,post);
-        println!("post: {:?}, {:?}",pre,post);
-    
+        println!("prededuping: {:?}, {:?}", pre, post);
+        println!("post: {:?}, {:?}", pre, post);
+
         // Figure 2 last row:
         // pre-DIP:  ¬x5 ∨ y1 ∨ ¬y3 ∨ ¬y4 ∨ z
         // post-DIP: ¬z ∨ ¬y4 ∨ ¬y5 ∨ y6
@@ -960,7 +1001,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-    
+
         let expected_post: HashSet<_> = [
             lit_key(&y(4).negated()),
             lit_key(&y(5).negated()),
@@ -968,64 +1009,75 @@ mod tests {
         ]
         .into_iter()
         .collect();
-    
+
         assert_eq!(lit_set(&pre), expected_pre);
         assert_eq!(lit_set(&post), expected_post);
     }
 
-    
     #[test]
     fn dip_backtrack_level_uses_highest_lower_level_literal() {
         // Variables:
         // 1 x1 (level1), 2 p, 3 q, 4 y (level2), 5 x2 (level3),
         // 6 a, 7 b, 8 c, 9 d
-        let clauses: Vec<Vec<i64>> = vec![
-            vec![-1, 2],        // 0: ¬x1 v p
-            vec![-1, 3],        // 1: ¬x1 v q
-            vec![-5, -2, 6],    // 2: ¬x2 v ¬p v a
-            vec![-5, -3, 7],    // 3: ¬x2 v ¬q v b
-            vec![-6, -2, 8],    // 4: ¬a v ¬p v c
-            vec![-7, -3, 9],    // 5: ¬b v ¬q v d
-            vec![-8, -9, -4],   // 6: ¬c v ¬d v ¬y (conflict)
+        let clauses: Vec<Vec<i32>> = vec![
+            vec![-1, 2],      // 0: ¬x1 v p
+            vec![-1, 3],      // 1: ¬x1 v q
+            vec![-5, -2, 6],  // 2: ¬x2 v ¬p v a
+            vec![-5, -3, 7],  // 3: ¬x2 v ¬q v b
+            vec![-6, -2, 8],  // 4: ¬a v ¬p v c
+            vec![-7, -3, 9],  // 5: ¬b v ¬q v d
+            vec![-8, -9, -4], // 6: ¬c v ¬d v ¬y (conflict)
         ];
 
         let mut formula = Formula::from_vec(clauses);
         let mut history = History::new();
 
         // Level 1
-        let x1 = Literal::new(0, false);
+        let x1 = Literal::new(1);
         formula.assignment.assign_history(&x1, &mut history);
 
-        let p = Literal::new(1, false);
-        formula.assignment.assign(p.get_index(), true);
+        let p = Literal::new(2);
+        formula
+            .assignment
+            .assign(p.get_index().abs() as usize, true);
         history.add_implication(&p, Some(0));
 
-        let q = Literal::new(2, false);
-        formula.assignment.assign(q.get_index(), true);
+        let q = Literal::new(3);
+        formula
+            .assignment
+            .assign(q.get_index().abs() as usize, true);
         history.add_implication(&q, Some(1));
 
         // Level 2
-        let y = Literal::new(3, false);
+        let y = Literal::new(4);
         formula.assignment.assign_history(&y, &mut history);
 
         // Level 3
-        let x2 = Literal::new(4, false);
+        let x2 = Literal::new(5);
         formula.assignment.assign_history(&x2, &mut history);
 
-        let a = Literal::new(5, false);
-        formula.assignment.assign(a.get_index(), true);
+        let a = Literal::new(6);
+        formula
+            .assignment
+            .assign(a.get_index().abs() as usize, true);
         history.add_implication(&a, Some(2));
 
-        let b = Literal::new(6, false);
-        formula.assignment.assign(b.get_index(), true);
+        let b = Literal::new(7);
+        formula
+            .assignment
+            .assign(b.get_index().abs() as usize, true);
         history.add_implication(&b, Some(3));
 
-        let c = Literal::new(7, false);
-        formula.assignment.assign(c.get_index(), true);
+        let c = Literal::new(8);
+        formula
+            .assignment
+            .assign(c.get_index().abs() as usize, true);
         history.add_implication(&c, Some(4));
 
-        let d = Literal::new(8, false);
-        formula.assignment.assign(d.get_index(), true);
+        let d = Literal::new(9);
+        formula
+            .assignment
+            .assign(d.get_index().abs() as usize, true);
         history.add_implication(&d, Some(5));
 
         let conflict_idx = 6;
@@ -1039,7 +1091,13 @@ mod tests {
                     post_clause_without_z,
                     backtrack_level,
                     ..
-                } => (dip_a, dip_b, pre_clause_without_z, post_clause_without_z, backtrack_level),
+                } => (
+                    dip_a,
+                    dip_b,
+                    pre_clause_without_z,
+                    post_clause_without_z,
+                    backtrack_level,
+                ),
                 _ => panic!("Expected DIP result"),
             };
 
@@ -1070,4 +1128,3 @@ mod tests {
         assert_eq!(backtrack_level, 2);
     }
 }
-

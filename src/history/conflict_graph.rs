@@ -79,9 +79,15 @@ pub fn graph_from_conflict(
                     if lit == &first_uip {
                         return vec![]; // Stop backward exploration at 1UIP
                     }
-                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit) {
+                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
+                    {
                         let reason = &formula.get_clauses()[reason_idx];
-                        reason.get_literals().iter().filter(|&l| l != lit).map(|l| l.negated()).collect()
+                        reason
+                            .get_literals()
+                            .iter()
+                            .filter(|&l| l != lit)
+                            .map(|l| l.negated())
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -135,13 +141,7 @@ pub fn dump_conflict_graph_dot(
                 NodeType::Literal(lit) => {
                     let label = format!("{}", lit);
                     let level = history.get_literal_level(lit).unwrap_or(0);
-                    writeln!(
-                        out,
-                        "  n{} [label={}\nlevel={}] ;",
-                        idx,
-                        label,
-                        level
-                    )?;
+                    writeln!(out, "  n{} [label={}\nlevel={}] ;", idx, label, level)?;
                 }
             }
         }
@@ -165,7 +165,6 @@ pub fn dump_conflict_graph_dot(
 
     Ok(first_uip)
 }
-
 
 /// Return all exact two-vertex bottlenecks as pairs of literals.
 ///
@@ -368,13 +367,21 @@ pub fn find_clauses_from_dip_pair<W>(
     for u in 0..=last {
         if let Some(node) = graph.get_node(u) {
             if let NodeType::Literal(lit) = node {
-                if lit == dip_a { dip_a_node = Some(u); }
-                if lit == dip_b { dip_b_node = Some(u); }
-                if lit == first_uip { first_uip_node = Some(u); }
+                if lit == dip_a {
+                    dip_a_node = Some(u);
+                }
+                if lit == dip_b {
+                    dip_b_node = Some(u);
+                }
+                if lit == first_uip {
+                    first_uip_node = Some(u);
+                }
             }
             if let Some(edges) = graph.get_edges(u) {
                 for (v, _) in edges {
-                    if v <= last { adj[u].push(v); }
+                    if v <= last {
+                        adj[u].push(v);
+                    }
                 }
             }
         }
@@ -392,7 +399,9 @@ pub fn find_clauses_from_dip_pair<W>(
     q.push_back(first_uip_node);
 
     while let Some(u) = q.pop_front() {
-        if u == dip_a_node || u == dip_b_node { continue; }
+        if u == dip_a_node || u == dip_b_node {
+            continue;
+        }
         for &v in &adj[u] {
             if pre_region.insert(v) {
                 q.push_back(v);
@@ -407,13 +416,17 @@ pub fn find_clauses_from_dip_pair<W>(
     let mut q = VecDeque::new();
     for &start in &[dip_a_node, dip_b_node] {
         for &v in &adj[start] {
-            if post_region.insert(v) { q.push_back(v); }
+            if post_region.insert(v) {
+                q.push_back(v);
+            }
         }
     }
 
     while let Some(u) = q.pop_front() {
         for &v in &adj[u] {
-            if post_region.insert(v) { q.push_back(v); }
+            if post_region.insert(v) {
+                q.push_back(v);
+            }
         }
     }
 
@@ -424,14 +437,19 @@ pub fn find_clauses_from_dip_pair<W>(
             if let Some(NodeType::Literal(lit)) = graph.get_node(node) {
                 let lit_level = history.get_literal_level(lit).unwrap_or(0);
                 if lit_level == current_level {
-                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit) {
+                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
+                    {
                         let reason = &formula.get_clauses()[reason_idx];
                         for reason_lit in reason.get_literals() {
-                            if reason_lit == lit { continue; }
+                            if reason_lit == lit {
+                                continue;
+                            }
                             let pred = reason_lit.negated();
                             let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                             if pred_level < current_level {
-                                if seen.insert(pred.get_index()) { res.push(pred.clone()); }
+                                if seen.insert(pred.get_index()) {
+                                    res.push(pred.clone());
+                                }
                             }
                         }
                     }
@@ -442,19 +460,25 @@ pub fn find_clauses_from_dip_pair<W>(
                     let pred = conflict_lit.negated();
                     let pred_level = history.get_literal_level(&pred).unwrap_or(0);
                     if pred_level < current_level {
-                        if seen.insert(pred.get_index()) { res.push(pred.clone()); }
+                        if seen.insert(pred.get_index()) {
+                            res.push(pred.clone());
+                        }
                     }
                 }
             }
         }
         res
     };
-    
+
     let mut pre_lits = vec![first_uip.negated()];
-    for lit in get_lower_level_preds(&pre_region) { pre_lits.push(lit.negated()); }
+    for lit in get_lower_level_preds(&pre_region) {
+        pre_lits.push(lit.negated());
+    }
 
     let mut post_lits = Vec::new();
-    for lit in get_lower_level_preds(&post_region) { post_lits.push(lit.negated()); }
+    for lit in get_lower_level_preds(&post_region) {
+        post_lits.push(lit.negated());
+    }
 
     Some((pre_lits, post_lits))
 }
@@ -466,7 +490,7 @@ mod tests {
     use ultragraph::{GraphMut, UltraGraph};
 
     fn lit(i: u64) -> Literal {
-        Literal::new(i, false)
+        Literal::new(i as i32)
     }
 
     fn pairset(mut pairs: Vec<(Literal, Literal)>) -> HashSet<(Literal, Literal)> {

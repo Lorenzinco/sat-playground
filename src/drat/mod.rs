@@ -1,20 +1,19 @@
-use std::io::Write;
-use std::io;
 use crate::formula::literal::Literal;
+use std::io;
+use std::io::Write;
 
-pub struct DratLogger<W:Write> {
-    writer: W
+pub struct DratLogger<W: Write> {
+    writer: W,
 }
 
-impl <W: Write> DratLogger<W> {
-    pub fn new(writer:W) -> Self {
-        Self{ writer: writer }
+impl<W: Write> DratLogger<W> {
+    pub fn new(writer: W) -> Self {
+        Self { writer: writer }
     }
-    
-    // DIMACS variables are 1-indexed. Adjust the `+ 1` if your variable_index is already 1-based.
+
+    // Literals already carry their DIMACS index/sign (e.g., -3 for ¬x3).
     fn lit_to_dimacs(lit: &Literal) -> i64 {
-        let var = (lit.get_index() + 1) as i64;
-        if lit.is_negated() { -var } else { var }
+        lit.get_index() as i64
     }
 
     /// Logs a learned clause or a preprocessed clause.
@@ -50,10 +49,10 @@ mod tests {
         let mut buf = Vec::new();
         let mut logger = DratLogger::new(&mut buf);
 
-        let clause = vec![Literal::new(0, false), Literal::new(2, true)];
+        let clause = vec![Literal::new(1), Literal::new(-3)];
         logger.log_add(&clause).unwrap();
 
-        let del = vec![Literal::new(1, false)];
+        let del = vec![Literal::new(2)];
         logger.log_delete(&del).unwrap();
 
         logger.log_empty_clause().unwrap();

@@ -5,7 +5,7 @@ use crate::formula::literal::Literal;
 pub struct Vsids {
     scores: Vec<f64>,
     decay: f64,
-    saved_phases: Vec<bool>
+    saved_phases: Vec<bool>,
 }
 
 impl Vsids {
@@ -13,7 +13,7 @@ impl Vsids {
         Self {
             scores: vec![0.0; num_vars],
             decay: 0.95,
-            saved_phases: vec![false; num_vars]
+            saved_phases: vec![false; num_vars],
         }
     }
 
@@ -41,12 +41,13 @@ impl Vsids {
         // Automatically enlarge the scores array if new extension variables were added
         if self.scores.len() < formula.assignment.len() {
             self.scores.resize(formula.assignment.len(), 0.0);
+            self.saved_phases.resize(formula.assignment.len(), false);
         }
 
         let mut best_var = None;
         let mut best_score = -1.0;
 
-        for i in 0..formula.assignment.len() {
+        for i in 1..formula.assignment.len() {
             if formula.assignment.get_value(i).is_none() {
                 let score = self.scores[i];
                 if score > best_score {
@@ -56,6 +57,12 @@ impl Vsids {
             }
         }
 
-        best_var.map(|var| if self.saved_phases[var] {Literal::new(var as i32)} else {Literal::new(-(var as i32))})
+        best_var.map(|var| {
+            if self.saved_phases[var] {
+                Literal::new(var as i32)
+            } else {
+                Literal::new(-(var as i32))
+            }
+        })
     }
 }

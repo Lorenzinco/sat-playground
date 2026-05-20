@@ -16,8 +16,8 @@ use clause::Clause;
 use literal::Literal;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::fmt;
+use std::io::Write;
 
 pub struct Formula {
     clauses: Vec<Clause>,
@@ -99,10 +99,11 @@ impl Formula {
     /// let phi = Formula::new(literals);
     /// ```
     pub fn new(size: usize) -> Self {
+        let storage = size + 1;
         Formula {
             clauses: vec![],
-            assignment: Assignment::new(size),
-            watch: Watch::new(size),
+            assignment: Assignment::new(storage),
+            watch: Watch::new(storage),
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
         }
@@ -112,7 +113,7 @@ impl Formula {
         let max_index = clauses
             .iter()
             .flat_map(|clause| clause.iter())
-            .map(|lit| lit.get_index())
+            .map(|lit| lit.get_index().abs())
             .max()
             .expect("No literal in any formula found!");
 
@@ -129,15 +130,15 @@ impl Formula {
                 Watched::Two(idx1, idx2) => {
                     formula
                         .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx1 as usize]);
+                        .add_to_watchlist(i, &clause.get_literals()[idx1]);
                     formula
                         .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx2 as usize]);
+                        .add_to_watchlist(i, &clause.get_literals()[idx2]);
                 }
                 Watched::One(idx) => {
                     formula
                         .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx as usize]);
+                        .add_to_watchlist(i, &clause.get_literals()[idx]);
                 }
                 Watched::None => {}
             }
@@ -208,7 +209,7 @@ impl Formula {
         self.stats
     }
 
-    pub fn add_clause<W:Write>(&mut self, clause: Clause, logger: &mut Option<DratLogger<W>>) {
+    pub fn add_clause<W: Write>(&mut self, clause: Clause, logger: &mut Option<DratLogger<W>>) {
         let clause_idx = self.clauses.len();
         match clause.watched {
             Watched::None => {}
@@ -224,10 +225,10 @@ impl Formula {
             }
         }
 
-        if let Some(log) = logger.as_mut(){
+        if let Some(log) = logger.as_mut() {
             let _ = log.log_add(clause.get_literals());
         }
-        
+
         self.clauses.push(clause);
     }
 
@@ -241,7 +242,11 @@ impl Formula {
         }
     }
 
-    pub fn delete_clause<W: Write>(&mut self, clause_index: usize, logger: &mut Option<DratLogger<W>>) {
+    pub fn delete_clause<W: Write>(
+        &mut self,
+        clause_index: usize,
+        logger: &mut Option<DratLogger<W>>,
+    ) {
         assert!(clause_index > 0 && clause_index < self.clauses.len() - 1);
 
         // Remap the watchlists of literals pointing to that clause
@@ -480,7 +485,7 @@ impl Formula {
 
                     let candidate = clause.get_literals()[k].clone();
                     if candidate.eval(&self.assignment) != Some(false) {
-                        clause.watched = Watched::Two(k as u64, other_idx);
+                        clause.watched = Watched::Two(k, other_idx);
                         // Add to candidate's watchlist (we don't remove from false_lit because we already took it!)
                         self.watch.add_to_watchlist(clause_idx as usize, &candidate);
                         found_new_watch = true;
@@ -494,8 +499,10 @@ impl Formula {
                     if other_lit.eval(&self.assignment) == Some(false) {
                         conflict = Some(clause_idx);
                     } else {
-                        self.assignment
-                            .assign(other_lit.get_index().abs() as usize, !other_lit.is_negated());
+                        self.assignment.assign(
+                            other_lit.get_index().abs() as usize,
+                            !other_lit.is_negated(),
+                        );
                         history.add_implication(&other_lit, Some(clause_idx as usize));
                         queue.push_back(other_lit);
                     }
@@ -528,7 +535,7 @@ impl Formula {
     }
 
     pub fn get_unassigned_literal(&self) -> Option<Literal> {
-        for i in 0..self.assignment.len() {
+        for i in 1..self.assignment.len() {
             if self.assignment.get_value(i).is_none() {
                 return Some(Literal::new(i as i32));
             }
@@ -550,29 +557,29 @@ mod tests {
 
     fn assert_watchlists_consistent(formula: &Formula) {
         let total_lists = formula.assignment.len() * 2;
-        let mut expected: Vec<Vec<u64>> = vec![Vec::new(); total_lists];
+        let mut expected: Vec<Vec<usize>> = vec![Vec::new(); total_lists];
 
         for (clause_idx, clause) in formula.get_clauses().iter().enumerate() {
             match clause.watched {
                 Watched::None => {}
                 Watched::One(i) => {
                     let lit = &clause.get_literals()[i as usize];
-                    expected[lit.get_signed_index() as usize].push(clause_idx as u64);
+                    expected[lit.get_unsigned_index() as usize].push(clause_idx);
                 }
                 Watched::Two(i, j) => {
                     let lit_i = &clause.get_literals()[i as usize];
                     let lit_j = &clause.get_literals()[j as usize];
-                    expected[lit_i.get_signed_index() as usize].push(clause_idx as u64);
-                    expected[lit_j.get_signed_index() as usize].push(clause_idx as u64);
+                    expected[lit_i.get_unsigned_index() as usize].push(clause_idx);
+                    expected[lit_j.get_unsigned_index() as usize].push(clause_idx);
                 }
             }
         }
 
-        for var_idx in 0..formula.assignment.len() as u64 {
-            for &neg in &[false, true] {
-                let lit = Literal::new(var_idx, neg);
+        for var_idx in 1..formula.assignment.len() {
+            let var = var_idx as i32;
+            for lit in [Literal::new(var), Literal::new(-var)] {
                 let mut actual = formula.watch.get_watched(&lit).clone();
-                let mut expected_list = expected[lit.get_signed_index() as usize].clone();
+                let mut expected_list = expected[lit.get_unsigned_index() as usize].clone();
                 actual.sort_unstable();
                 expected_list.sort_unstable();
                 assert_eq!(actual, expected_list, "watchlist mismatch for {:?}", lit);
@@ -591,29 +598,24 @@ mod tests {
 
         assert_watchlists_consistent(&formula);
         // Remove clause 1
-        formula.delete_clause::<Empty>(1,&mut None);
+        formula.delete_clause::<Empty>(1, &mut None);
 
         assert_eq!(formula.get_clauses().len(), 3);
         assert_eq!(
             formula.get_clause_at_idx(1).get_literals(),
-            &vec![Literal::new(1, false)]
+            &vec![Literal::new(2)]
         );
 
         // Global consistency check (ensures reindexing of watchlists)
         assert_watchlists_consistent(&formula);
 
         // Explicitly verify reindexing for x2 watchlist
-        let mut watched_x2 = formula.watch.get_watched(&Literal::new(1, false)).clone();
+        let mut watched_x2 = formula.watch.get_watched(&Literal::new(2)).clone();
         watched_x2.sort_unstable();
         assert_eq!(watched_x2, vec![0, 1]);
 
         // Deleted clause's watched literals should be gone
-        assert!(formula.watch.get_watched(&Literal::new(0, true)).is_empty());
-        assert!(
-            formula
-                .watch
-                .get_watched(&Literal::new(2, false))
-                .is_empty()
-        );
+        assert!(formula.watch.get_watched(&Literal::new(-1)).is_empty());
+        assert!(formula.watch.get_watched(&Literal::new(3)).is_empty());
     }
 }
