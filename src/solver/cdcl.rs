@@ -125,20 +125,20 @@ fn learn_uip_clause<W: Write>(
         return Ok(None);
     }
 
-    ensure_asserting_clause(&learned, &formula.assignment, "UIP learned clause")?;
+    let asserting_lit = learned
+        .get_unit_literal(&formula.assignment)
+        .cloned()
+        .expect("UIP learned clause must assert after backtrack");
 
     formula.stats.add_learnt_clause(&learned);
-    formula.add_clause(learned.clone(), logger);
-    let clause_idx = formula.get_clauses().len() - 1;
+    let clause_idx = formula.add_clause(learned.clone(), logger);
 
-    if let Some(asserting_lit) = find_asserting_literal(&learned, &formula.assignment) {
-        if let AssignResult::Assigned(lit) =
-            formula
-                .assignment
-                .assign_implication(asserting_lit, history, Some(clause_idx))
-        {
-            propagation.push(lit);
-        }
+    if let AssignResult::Assigned(lit) =
+        formula
+            .assignment
+            .assign_implication(asserting_lit, history, Some(clause_idx))
+    {
+        propagation.push(lit);
     }
 
     Ok(Some(learned))
@@ -184,19 +184,18 @@ fn learn_dip_clauses<W: Write>(
             post_label, post_clause
         )));
     }
-    if !is_satisfied(&post_clause, formula)
-        && find_asserting_literal(&post_clause, &formula.assignment).is_none()
-    {
-        ensure_asserting_clause(&post_clause, &formula.assignment, &post_label)?;
+    if !post_clause.is_satisfied(&formula.assignment) && !post_clause.is_unit(&formula.assignment) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} is neither satisfied nor asserting after backtrack: {:?}",
+            post_label, post_clause
+        )));
     }
 
     formula.stats.add_learnt_clause(&post_clause);
-    formula.add_clause(post_clause, logger);
-    let post_idx = formula.get_clauses().len() - 1;
+    let post_idx = formula.add_clause(post_clause, logger);
 
     formula.stats.add_learnt_clause(&pre_clause);
-    formula.add_clause(pre_clause.clone(), logger);
-    let pre_idx = formula.get_clauses().len() - 1;
+    let pre_idx = formula.add_clause(pre_clause.clone(), logger);
 
     match formula
         .assignment
@@ -219,7 +218,7 @@ fn learn_dip_clauses<W: Write>(
         )));
     }
 
-    if let Some(asserting_lit) = find_asserting_literal(&pre_clause, &formula.assignment) {
+    if let Some(asserting_lit) = pre_clause.get_unit_literal(&formula.assignment).cloned() {
         if let AssignResult::Assigned(lit) =
             formula
                 .assignment
@@ -236,14 +235,7 @@ fn prefixed_clause(first: Literal, rest: Vec<Literal>) -> Clause {
     let mut lits = Vec::with_capacity(rest.len() + 1);
     lits.push(first);
     lits.extend(rest);
-    Clause::from_literals(&lits)
-}
-
-fn is_satisfied(clause: &Clause, formula: &Formula) -> bool {
-    clause
-        .get_literals()
-        .iter()
-        .any(|lit| lit.eval(&formula.assignment) == Some(true))
+    Clause::from_lits(lits)
 }
 
 fn unsat<W: Write>(logger: &mut Option<DratLogger<W>>) -> PyResult<Option<Vec<bool>>> {
@@ -295,68 +287,13 @@ fn extension_literal<W: Write>(
     formula.extensions.add_substitution(dip_a, dip_b, &z);
 
     formula.add_clause(
-        Clause::from_literals(&vec![z.clone(), dip_a.negated(), dip_b.negated()]),
+        Clause::from_lits(vec![z.clone(), dip_a.negated(), dip_b.negated()]),
         logger,
     );
-    formula.add_clause(
-        Clause::from_literals(&vec![z.negated(), dip_a.clone()]),
-        logger,
-    );
-    formula.add_clause(
-        Clause::from_literals(&vec![z.negated(), dip_b.clone()]),
-        logger,
-    );
+    formula.add_clause(Clause::from_lits(vec![z.negated(), dip_a.clone()]), logger);
+    formula.add_clause(Clause::from_lits(vec![z.negated(), dip_b.clone()]), logger);
 
     z
-}
-
-fn find_asserting_literal(
-    clause: &Clause,
-    assignment: &crate::formula::assignment::Assignment,
-) -> Option<Literal> {
-    let mut unassigned = None;
-
-    for lit in clause.get_literals() {
-        match lit.eval(assignment) {
-            Some(true) => return None,
-            Some(false) => {}
-            None => {
-                if unassigned.is_some() {
-                    return None;
-                }
-                unassigned = Some(lit.clone());
-            }
-        }
-    }
-
-    unassigned
-}
-
-fn ensure_asserting_clause(
-    clause: &Clause,
-    assignment: &crate::formula::assignment::Assignment,
-    label: &str,
-) -> PyResult<()> {
-    if find_asserting_literal(clause, assignment).is_some() {
-        return Ok(());
-    }
-
-    let mut true_lits = Vec::new();
-    let mut false_lits = Vec::new();
-    let mut unassigned_lits = Vec::new();
-
-    for lit in clause.get_literals() {
-        match lit.eval(assignment) {
-            Some(true) => true_lits.push(lit.clone()),
-            Some(false) => false_lits.push(lit.clone()),
-            None => unassigned_lits.push(lit.clone()),
-        }
-    }
-
-    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "{} is not asserting: clause={:?}, true={:?}, false={:?}, unassigned={:?}",
-        label, clause, true_lits, false_lits, unassigned_lits
-    )))
 }
 
 #[cfg(test)]

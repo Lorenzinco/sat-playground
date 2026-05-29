@@ -29,23 +29,12 @@ pub struct Formula {
 
 impl Clone for Formula {
     fn clone(&self) -> Self {
-        let new_assignment = self.assignment.clone();
-        let new_watch = self.watch.clone();
-        let stats = self.stats.clone();
-        let new_extensions = self.extensions.clone();
-
-        let mut new_clauses = Vec::new();
-        for clause in &self.clauses {
-            let new_clause = clause.clone();
-            new_clauses.push(new_clause);
-        }
-
         Formula {
-            clauses: new_clauses,
-            assignment: new_assignment,
-            watch: new_watch,
-            stats: stats,
-            extensions: new_extensions,
+            clauses: self.clauses.clone(),
+            assignment: self.assignment.clone(),
+            watch: self.watch.clone(),
+            stats: self.stats.clone(),
+            extensions: self.extensions.clone(),
         }
     }
 }
@@ -209,7 +198,11 @@ impl Formula {
         self.stats
     }
 
-    pub fn add_clause<W: Write>(&mut self, clause: Clause, logger: &mut Option<DratLogger<W>>) {
+    pub fn add_clause<W: Write>(
+        &mut self,
+        clause: Clause,
+        logger: &mut Option<DratLogger<W>>,
+    ) -> usize {
         let clause_idx = self.clauses.len();
         match clause.watched {
             Watched::None => {}
@@ -230,6 +223,7 @@ impl Formula {
         }
 
         self.clauses.push(clause);
+        clause_idx
     }
 
     pub fn preprocess(&mut self, methods: Vec<Preprocess>) {
@@ -348,14 +342,13 @@ impl Formula {
         loop {
             let mut found = None;
             for clause in self.clauses.iter() {
-                if clause.is_unit(&self.assignment) {
-                    found = Some(clause.get_unit_literal(&self.assignment).unwrap().clone());
+                if let Some(unit) = clause.get_unit_literal(&self.assignment) {
+                    found = Some(unit.clone());
                     break;
                 }
             }
             if let Some(literal) = found {
-                self.assignment
-                    .assign(literal.get_index().abs() as usize, !literal.is_negated());
+                self.assignment.assign_literal(literal);
                 progress = true;
             } else {
                 break;
@@ -369,18 +362,14 @@ impl Formula {
         loop {
             let mut found = None;
             for (i, clause) in self.clauses.iter().enumerate() {
-                if clause.is_unit(&self.assignment) {
-                    found = Some((
-                        i,
-                        clause.get_unit_literal(&self.assignment).unwrap().clone(),
-                    ));
+                if let Some(unit) = clause.get_unit_literal(&self.assignment) {
+                    found = Some((i, unit.clone()));
                     break;
                 }
             }
             if let Some((i, literal)) = found {
                 self.assignment
-                    .assign(literal.get_index().abs() as usize, !literal.is_negated());
-                history.add_implication(&literal, Some(i));
+                    .assign_implication(literal, history, Some(i));
                 progress = true;
             } else {
                 break;
@@ -392,15 +381,13 @@ impl Formula {
     pub fn pure_literals_propagate(&mut self) -> bool {
         let mut progress = false;
         loop {
-            let mut assignment = self.assignment.clone();
             let pure_literals = self.get_pure_literals();
             if let Some(pure) = pure_literals.into_iter().next() {
-                assignment.assign(pure.get_index().abs() as usize, !pure.is_negated());
+                self.assignment.assign_literal(pure);
                 progress = true;
             } else {
                 break;
             }
-            self.assignment = assignment;
         }
 
         progress
@@ -410,16 +397,13 @@ impl Formula {
     pub fn pure_literals_propagate_history(&mut self, history: &mut History) -> bool {
         let mut progress = false;
         loop {
-            let mut assignment = self.assignment.clone();
             let pure_literals = self.get_pure_literals();
             if let Some(pure) = pure_literals.into_iter().next() {
-                assignment.assign(pure.get_index().abs() as usize, !pure.is_negated());
-                history.add_implication(&pure, None);
+                self.assignment.assign_implication(pure, history, None);
                 progress = true;
             } else {
                 break;
             }
-            self.assignment = assignment;
         }
 
         progress

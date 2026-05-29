@@ -1030,9 +1030,9 @@ mod tests {
         assert_eq!(l_d, 2);
         assert!(l_c > l_d);
 
-        let pre_dip = Clause::from_literals(&vec![f.negated(), p.negated(), z.clone()]);
+        let pre_dip = Clause::from_lits(vec![f.negated(), p.negated(), z.clone()]);
 
-        let post_dip = Clause::from_literals(&vec![z.negated(), d.negated()]);
+        let post_dip = Clause::from_lits(vec![z.negated(), d.negated()]);
 
         // Paper backjump level: lD.
         // Keep levels <= 2, remove levels > 2.
@@ -1238,11 +1238,11 @@ mod tests {
 
         let mut pre_lits = vec![z.clone()];
         pre_lits.extend(pre_clause_without_z.clone());
-        let pre_dip = Clause::from_literals(&pre_lits);
+        let pre_dip = Clause::from_lits(pre_lits);
 
         let mut post_lits = vec![z.negated()];
         post_lits.extend(post_clause_without_z.clone());
-        let post_dip = Clause::from_literals(&post_lits);
+        let post_dip = Clause::from_lits(post_lits);
 
         // Backjump to max(lC, lD).
         history.revert_decision(backtrack_level + 1, &mut formula.assignment);
