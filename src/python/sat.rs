@@ -9,6 +9,7 @@ use crate::drat::DratLogger;
 use crate::solver::solve;
 
 use std::fs::File;
+use std::io::BufWriter;
 use pyo3::prelude::*;
 use std::fmt;
 
@@ -29,7 +30,11 @@ impl Sat {
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
         let mut logger = match drat_path {
-            Some(path) => { Some(DratLogger::new(File::create(path).unwrap()))},
+            Some(path) => { 
+                let file = File::create(path)?;
+                let writer = BufWriter::with_capacity(1 << 25, file); //32MB buffer
+                Some(DratLogger::new(writer))
+            },
             None => { None }
         };
         
