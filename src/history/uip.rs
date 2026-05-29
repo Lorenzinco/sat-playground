@@ -1,34 +1,43 @@
-use fastbit::BitVec;
 use fastbit::BitRead;
+use fastbit::BitVec;
 use fastbit::BitWrite;
 
-use crate::formula::literal::Literal;
-use crate::formula::clause::Clause;
 use crate::formula::Formula;
+use crate::formula::clause::Clause;
+use crate::formula::literal::Literal;
 use crate::history::History;
 
-pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: usize) -> (Clause, usize) {
+pub fn find_1uip(
+    history: &History,
+    formula: &Formula,
+    conflict_clause_index: usize,
+) -> (Clause, usize) {
     let current_level = history.get_decision_level();
-    if current_level == 0 { return (Clause::new(), 0); } // Unsat
+    if current_level == 0 {
+        return (Clause::new(), 0);
+    }
 
-    let mut seen = BitVec::<u64>::new(formula.assignment.len()+1);
+    let mut seen = BitVec::<u64>::new(formula.assignment.len() + 1);
     let mut learned_lits: Vec<Literal> = Vec::new();
     let mut path_count = 0;
-    
+
     let mut current_clause_idx = Some(conflict_clause_index);
-    let mut resolved_lit: Option<Literal> = None;
+    let mut resolved_lit_idx: Option<i32> = None;
 
     let level_data = &history.decision_levels[current_level];
-    let mut trail_iter = level_data.get_implied_literals_rev()
+    let mut trail_iter = level_data
+        .get_implied_literals_rev()
         .chain(level_data.get_decision_literal().into_iter());
 
     loop {
         if let Some(clause_idx) = current_clause_idx {
             let clause = &formula.get_clauses()[clause_idx];
             for lit in clause.iter() {
-                if Some(lit) == resolved_lit.as_ref() { continue; }
-                
-                let var = lit.get_index().abs() as usize;
+                if resolved_lit_idx == Some(lit.get_index()) {
+                    continue;
+                }
+
+                let var = lit.get_index().unsigned_abs() as usize;
                 if !seen.test(var) {
                     seen.set(var);
                     if history.get_literal_level(lit) == Some(current_level) {
@@ -42,9 +51,9 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
 
         loop {
             if let Some(lit) = trail_iter.next() {
-                let var = lit.get_index().abs() as usize;
+                let var = lit.get_index().unsigned_abs() as usize;
                 if seen.test(var) {
-                    resolved_lit = Some(lit.clone());
+                    resolved_lit_idx = Some(lit.get_index());
                     path_count -= 1;
                     current_clause_idx = level_data.get_reason(lit);
                     break;
@@ -55,49 +64,56 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
         }
 
         if path_count == 0 {
-            learned_lits.push(resolved_lit.unwrap().negated());
+            learned_lits.push(Literal::new(-resolved_lit_idx.unwrap()));
             break;
         }
     }
-    
+
     let last_idx = learned_lits.len() - 1;
     learned_lits.swap(0, last_idx);
 
-    let mut min_seen = BitVec::<u64>::new(formula.assignment.len()+1);
+    let mut min_seen = BitVec::<u64>::new(formula.assignment.len() + 1);
     for lit in &learned_lits {
         min_seen.set(lit.get_index().abs() as usize);
     }
-    
-    let mut poisoned = BitVec::<u64>::new(formula.assignment.len()+1);
-    
+
+    let mut poisoned = BitVec::<u64>::new(formula.assignment.len() + 1);
+
     let mut minimized_lits = Vec::new();
     minimized_lits.push(learned_lits[0].clone());
-    
+
     for lit in learned_lits.iter().skip(1) {
         let var = lit.get_index().abs() as usize;
         let level = history.get_literal_level(lit).unwrap_or(0);
-        
-        if level == 0 { continue; }
-        
-        let mut stack = vec![lit.clone()];
+
+        if level == 0 {
+            continue;
+        }
+
+        let mut stack = vec![lit.get_index()];
         let mut local_seen = Vec::new();
         let mut failed = false;
-        
-        while let Some(current) = stack.pop() {
-            let c_var = current.get_index().abs() as usize;
-            
-            if c_var != var && min_seen.test(c_var) { continue; }
-            
-            if poisoned.test(c_var) { 
-                failed = true; 
-                break; 
+
+        while let Some(current_idx) = stack.pop() {
+            let c_var = current_idx.unsigned_abs() as usize;
+
+            if c_var != var && min_seen.test(c_var) {
+                continue;
             }
-            
+
+            if poisoned.test(c_var) {
+                failed = true;
+                break;
+            }
+
+            let current = Literal::new(current_idx);
             let c_level = history.get_literal_level(&current).unwrap_or(0);
-            if c_level == 0 { continue; }
-            
+            if c_level == 0 {
+                continue;
+            }
+
             let reason_idx = history.decision_levels[c_level].get_reason(&current);
-            
+
             match reason_idx {
                 None => {
                     failed = true;
@@ -105,22 +121,22 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
                 }
                 Some(idx) => {
                     let clause = &formula.get_clauses()[idx];
-                    
+
                     if c_var != var {
                         min_seen.set(c_var);
                         local_seen.push(c_var);
                     }
-                    
+
                     for child in clause.get_literals() {
-                        let child_var = child.get_index().abs() as usize;
+                        let child_var = child.get_index().unsigned_abs() as usize;
                         if child_var != c_var {
-                            stack.push(child.clone());
+                            stack.push(child.get_index());
                         }
                     }
                 }
             }
         }
-        
+
         if failed {
             for &c_var in &local_seen {
                 min_seen.reset(c_var);
@@ -131,7 +147,7 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
         } else {
         }
     }
-    
+
     let mut backtrack_level = 0;
     for lit in minimized_lits.iter().skip(1) {
         let level = history.get_literal_level(lit).unwrap_or(0);
@@ -139,7 +155,6 @@ pub fn find_1uip(history: &History, formula: &Formula, conflict_clause_index: us
             backtrack_level = level;
         }
     }
-    
-    (Clause::from_literals(&minimized_lits), backtrack_level)
-    //(Clause::from_literals(&learned_lits), backtrack_level)
+
+    (Clause::from_lits(minimized_lits), backtrack_level)
 }

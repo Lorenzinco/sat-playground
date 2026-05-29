@@ -82,17 +82,8 @@ impl History {
         literal: &Literal,
         clause_index: Option<usize>,
     ) -> Option<Literal> {
-        let negated = literal.negated();
-        if let Some(_) = self
-            .decision_levels
-            .iter()
-            .filter(|il| il.get_decision_literal().is_some_and(|lit| lit == &negated))
-            .next()
-        {
-            return Some(negated);
-        }
-        if let Some(_) = self.implication_levels_indexes.get_level(&negated) {
-            return Some(negated);
+        if self.implication_levels_indexes.get_level(literal).is_some() {
+            return Some(literal.negated());
         }
 
         let level = self.decision_levels.last_mut().expect("No decisions yet!");
@@ -123,7 +114,7 @@ impl History {
                 self.implication_levels_indexes.unset_level(lit);
             }
 
-            for implication in decision.get_implied_literals() {
+            for implication in decision.implied_literals_iter() {
                 assignment.unset(implication.get_index().abs() as usize);
                 self.implication_levels_indexes.unset_level(implication);
             }
@@ -139,9 +130,7 @@ impl History {
     }
 
     pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
-        self.implication_levels_indexes
-            .get_level(lit)
-            .or_else(|| self.implication_levels_indexes.get_level(&lit.negated()))
+        self.implication_levels_indexes.get_level(lit)
     }
 
     pub fn last_decision_literal(&self) -> Option<&Literal> {
@@ -162,7 +151,7 @@ impl History {
             ImplicationPoint::UIP => {
                 let (clause, level) = find_1uip(self, formula, conflict_clause_index);
                 return ConflictLearnResult::Uip {
-                    clause: clause,
+                    clause,
                     backtrack_level: level,
                 };
             }

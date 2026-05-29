@@ -5,7 +5,6 @@ use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::uip::find_1uip;
 
-use std::collections::HashSet;
 use std::collections::VecDeque;
 
 /// Trail-indexed current-level slice.
@@ -46,7 +45,7 @@ fn current_level_context(
     (trail, pos_of, reason_of)
 }
 
-fn current_level_predecessors(
+fn for_each_current_level_predecessor(
     node_idx: usize,
     trail: &[Literal],
     source_pos: usize,
@@ -54,46 +53,37 @@ fn current_level_predecessors(
     pos_of: &[Option<usize>],
     formula: &Formula,
     conflict_clause_idx: usize,
-) -> Vec<usize> {
+    mut visit: impl FnMut(usize),
+) {
     let conflict_idx = trail.len();
 
-    if node_idx == conflict_idx {
-        return formula.get_clauses()[conflict_clause_idx]
-            .get_literals()
-            .iter()
-            .filter_map(|lit| {
-                let pred = lit.negated();
-                pos_of
-                    .get(pred.get_unsigned_index() as usize)
-                    .copied()
-                    .flatten()
-            })
-            .collect();
-    }
-
-    if node_idx == source_pos {
-        return vec![];
-    }
-
-    let reason_idx = match reason_of.get(node_idx).copied().flatten() {
-        Some(idx) => idx,
-        None => return vec![],
+    let clause_lits = if node_idx == conflict_idx {
+        formula.get_clauses()[conflict_clause_idx].get_literals()
+    } else {
+        if node_idx == source_pos {
+            return;
+        }
+        let Some(reason_idx) = reason_of.get(node_idx).copied().flatten() else {
+            return;
+        };
+        formula.get_clauses()[reason_idx].get_literals()
     };
 
-    let current_lit = &trail[node_idx];
+    let current_lit = (node_idx != conflict_idx).then(|| &trail[node_idx]);
+    for lit in clause_lits {
+        if current_lit.is_some_and(|current| lit == current) {
+            continue;
+        }
 
-    formula.get_clauses()[reason_idx]
-        .get_literals()
-        .iter()
-        .filter(|reason_lit| *reason_lit != current_lit)
-        .filter_map(|reason_lit| {
-            let pred = reason_lit.negated();
-            pos_of
-                .get(pred.get_unsigned_index() as usize)
-                .copied()
-                .flatten()
-        })
-        .collect()
+        let pred = lit.negated();
+        if let Some(pred_idx) = pos_of
+            .get(pred.get_unsigned_index() as usize)
+            .copied()
+            .flatten()
+        {
+            visit(pred_idx);
+        }
+    }
 }
 
 fn build_dip_slice(
@@ -127,7 +117,7 @@ fn build_dip_slice(
     queue.push_back(conflict_idx);
 
     while let Some(node_idx) = queue.pop_front() {
-        for pred_idx in current_level_predecessors(
+        for_each_current_level_predecessor(
             node_idx,
             &trail,
             source_pos,
@@ -135,13 +125,14 @@ fn build_dip_slice(
             &pos_of,
             formula,
             conflict_clause_idx,
-        ) {
-            succ[pred_idx].push(node_idx);
-            if !present[pred_idx] {
-                present[pred_idx] = true;
-                queue.push_back(pred_idx);
-            }
-        }
+            |pred_idx| {
+                succ[pred_idx].push(node_idx);
+                if !present[pred_idx] {
+                    present[pred_idx] = true;
+                    queue.push_back(pred_idx);
+                }
+            },
+        );
     }
 
     if !present[source_pos] {
@@ -191,7 +182,7 @@ fn reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
     seen
 }
 
-fn find_all_two_vertex_bottlenecks(slice: &DipSlice) -> Option<Vec<(Literal, Literal)>> {
+fn find_all_two_vertex_bottlenecks(slice: &DipSlice) -> Option<Vec<(usize, usize)>> {
     let conflict_idx = slice.trail.len();
     let rev = reverse_adj(&slice.succ);
     let can_reach_t = reachable(&rev, conflict_idx, &slice.present);
@@ -236,10 +227,7 @@ fn find_all_two_vertex_bottlenecks(slice: &DipSlice) -> Option<Vec<(Literal, Lit
                 candidates[i],
                 candidates[j],
             ) {
-                out.push((
-                    slice.trail[candidates[i]].clone(),
-                    slice.trail[candidates[j]].clone(),
-                ));
+                out.push((candidates[i], candidates[j]));
             }
         }
     }
@@ -282,7 +270,11 @@ fn exists_path_avoiding_pair(
     false
 }
 
-fn forward_region(slice: &DipSlice, seeds: Vec<usize>, stop_at: &[usize]) -> Vec<bool> {
+fn forward_region(
+    slice: &DipSlice,
+    seeds: impl IntoIterator<Item = usize>,
+    stop_at: &[usize],
+) -> Vec<bool> {
     let mut region = vec![false; slice.trail.len() + 1];
     let mut queue = VecDeque::new();
 
@@ -339,7 +331,7 @@ fn collect_external_preds(
                 || history.get_literal_level(pred).unwrap_or(0) < current_level)
     };
 
-    let mut seen = HashSet::new();
+    let mut seen = vec![false; slice.pos_of.len()];
     let mut out = Vec::new();
 
     for idx in 0..region.len() {
@@ -351,7 +343,9 @@ fn collect_external_preds(
             let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
             for conflict_lit in conflict_clause.get_literals() {
                 let pred = conflict_lit.negated();
-                if should_emit(&pred) && seen.insert(pred.get_unsigned_index()) {
+                let key = pred.get_unsigned_index() as usize;
+                if should_emit(&pred) && key < seen.len() && !seen[key] {
+                    seen[key] = true;
                     out.push(pred);
                 }
             }
@@ -370,7 +364,9 @@ fn collect_external_preds(
             }
 
             let pred = reason_lit.negated();
-            if should_emit(&pred) && seen.insert(pred.get_unsigned_index()) {
+            let key = pred.get_unsigned_index() as usize;
+            if should_emit(&pred) && key < seen.len() && !seen[key] {
+                seen[key] = true;
                 out.push(pred);
             }
         }
@@ -408,16 +404,18 @@ fn find_clauses_from_dip_pair(
         return None;
     }
 
-    let mut pre_region = forward_region(slice, vec![first_uip_pos], &[dip_a_pos, dip_b_pos]);
+    let mut pre_region = forward_region(slice, [first_uip_pos], &[dip_a_pos, dip_b_pos]);
     pre_region[dip_a_pos] = true;
     pre_region[dip_b_pos] = true;
 
-    let post_seeds = slice.succ[dip_a_pos]
-        .iter()
-        .chain(slice.succ[dip_b_pos].iter())
-        .copied()
-        .collect();
-    let post_region = forward_region(slice, post_seeds, &[]);
+    let post_region = forward_region(
+        slice,
+        slice.succ[dip_a_pos]
+            .iter()
+            .chain(slice.succ[dip_b_pos].iter())
+            .copied(),
+        &[],
+    );
 
     if !post_region[conflict_idx] {
         return None;
@@ -474,7 +472,7 @@ pub fn find_dip(
         return fallback_uip(history, formula, conflict_clause_index);
     };
 
-    let Some(mut dips) = find_all_two_vertex_bottlenecks(&slice) else {
+    let Some(dips) = find_all_two_vertex_bottlenecks(&slice) else {
         return fallback_uip(history, formula, conflict_clause_index);
     };
 
@@ -482,7 +480,7 @@ pub fn find_dip(
         return fallback_uip(history, formula, conflict_clause_index);
     }
 
-    let (a, b) = choose_best_dip_pair(&mut dips, &slice, history);
+    let (a, b) = choose_best_dip_pair(&dips, &slice, history);
 
     let Some((pre_lits, post_lits)) =
         find_clauses_from_dip_pair(&slice, history, formula, conflict_clause_index, &a, &b)
@@ -528,47 +526,37 @@ fn fallback_uip(
 }
 
 fn choose_best_dip_pair(
-    dips: &mut Vec<(Literal, Literal)>,
+    dips: &[(usize, usize)],
     slice: &DipSlice,
     history: &History,
 ) -> (Literal, Literal) {
     let current_level = history.get_decision_level();
+    let &(a_pos, b_pos) = dips
+        .iter()
+        .max_by_key(|&&(a_pos, b_pos)| {
+            let a = &slice.trail[a_pos];
+            let b = &slice.trail[b_pos];
+            let la = history.get_literal_level(a).unwrap_or(0);
+            let lb = history.get_literal_level(b).unwrap_or(0);
 
-    dips.sort_by_key(|(a, b)| {
-        let la = history.get_literal_level(a).unwrap_or(0);
-        let lb = history.get_literal_level(b).unwrap_or(0);
+            (
+                la,
+                lb,
+                if la == current_level { a_pos } else { 0 }.max(if lb == current_level {
+                    b_pos
+                } else {
+                    0
+                }),
+                if la == current_level { a_pos } else { 0 }.min(if lb == current_level {
+                    b_pos
+                } else {
+                    0
+                }),
+            )
+        })
+        .unwrap();
 
-        let pos_a = if la == current_level {
-            slice
-                .pos_of
-                .get(a.get_unsigned_index() as usize)
-                .copied()
-                .flatten()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let pos_b = if lb == current_level {
-            slice
-                .pos_of
-                .get(b.get_unsigned_index() as usize)
-                .copied()
-                .flatten()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        (
-            la,
-            lb,
-            std::cmp::max(pos_a, pos_b),
-            std::cmp::min(pos_a, pos_b),
-        )
-    });
-
-    dips.pop().unwrap()
+    (slice.trail[a_pos].clone(), slice.trail[b_pos].clone())
 }
 
 #[cfg(test)]
