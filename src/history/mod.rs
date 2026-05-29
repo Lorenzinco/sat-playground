@@ -30,8 +30,9 @@ pub enum ConflictLearnResult {
     Dip {
         dip_a: Literal,
         dip_b: Literal,
+        pre_clause_without_z: Vec<Literal>,  // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>, // ¬D
-        backtrack_level: usize,              // = l_D
+        backtrack_level: usize,              // = max(l_C, l_D)
     },
 }
 

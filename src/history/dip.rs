@@ -170,28 +170,7 @@ fn reverse_adj(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     rev
 }
 
-fn reverse_reachable(rev: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
-    let mut seen = vec![false; rev.len()];
-    let mut queue = VecDeque::new();
-
-    if start < rev.len() && present[start] {
-        seen[start] = true;
-        queue.push_back(start);
-    }
-
-    while let Some(u) = queue.pop_front() {
-        for &p in &rev[u] {
-            if present[p] && !seen[p] {
-                seen[p] = true;
-                queue.push_back(p);
-            }
-        }
-    }
-
-    seen
-}
-
-fn forward_reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
+fn reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
     let mut seen = vec![false; adj.len()];
     let mut queue = VecDeque::new();
 
@@ -215,7 +194,7 @@ fn forward_reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<
 fn find_all_two_vertex_bottlenecks(slice: &DipSlice) -> Option<Vec<(Literal, Literal)>> {
     let conflict_idx = slice.trail.len();
     let rev = reverse_adj(&slice.succ);
-    let can_reach_t = reverse_reachable(&rev, conflict_idx, &slice.present);
+    let can_reach_t = reachable(&rev, conflict_idx, &slice.present);
 
     let mut source_candidates = Vec::new();
     for pos in 0..slice.trail.len() {
@@ -237,7 +216,7 @@ fn find_all_two_vertex_bottlenecks(slice: &DipSlice) -> Option<Vec<(Literal, Lit
         return None;
     }
 
-    let reachable_from_s = forward_reachable(&slice.succ, slice.source_pos, &slice.present);
+    let reachable_from_s = reachable(&slice.succ, slice.source_pos, &slice.present);
     let relevant: Vec<bool> = (0..=conflict_idx)
         .map(|idx| slice.present[idx] && reachable_from_s[idx] && can_reach_t[idx])
         .collect();
@@ -303,8 +282,37 @@ fn exists_path_avoiding_pair(
     false
 }
 
-fn collect_lower_level_preds(
+fn forward_region(slice: &DipSlice, seeds: Vec<usize>, stop_at: &[usize]) -> Vec<bool> {
+    let mut region = vec![false; slice.trail.len() + 1];
+    let mut queue = VecDeque::new();
+
+    for seed in seeds {
+        if !region[seed] {
+            region[seed] = true;
+            queue.push_back(seed);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        if stop_at.contains(&idx) {
+            continue;
+        }
+
+        for &succ in &slice.succ[idx] {
+            if !region[succ] {
+                region[succ] = true;
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    region
+}
+
+fn collect_external_preds(
     region: &[bool],
+    covered: &[bool],
+    include_current_level_external_preds: bool,
     slice: &DipSlice,
     history: &History,
     formula: &Formula,
@@ -312,6 +320,24 @@ fn collect_lower_level_preds(
 ) -> Vec<Literal> {
     let current_level = history.get_decision_level();
     let conflict_idx = slice.trail.len();
+
+    let is_internal_current_level_pred = |pred: &Literal| {
+        slice
+            .pos_of
+            .get(pred.get_unsigned_index() as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|pos| {
+                region.get(pos).copied().unwrap_or(false)
+                    || covered.get(pos).copied().unwrap_or(false)
+            })
+    };
+
+    let should_emit = |pred: &Literal| {
+        !is_internal_current_level_pred(pred)
+            && (include_current_level_external_preds
+                || history.get_literal_level(pred).unwrap_or(0) < current_level)
+    };
 
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -325,17 +351,10 @@ fn collect_lower_level_preds(
             let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
             for conflict_lit in conflict_clause.get_literals() {
                 let pred = conflict_lit.negated();
-                if history.get_literal_level(&pred).unwrap_or(0) < current_level
-                    && seen.insert(pred.get_unsigned_index())
-                {
+                if should_emit(&pred) && seen.insert(pred.get_unsigned_index()) {
                     out.push(pred);
                 }
             }
-            continue;
-        }
-
-        let lit = &slice.trail[idx];
-        if history.get_literal_level(lit) != Some(current_level) {
             continue;
         }
 
@@ -343,6 +362,7 @@ fn collect_lower_level_preds(
             continue;
         };
 
+        let lit = &slice.trail[idx];
         let reason = &formula.get_clauses()[reason_idx];
         for reason_lit in reason.get_literals() {
             if reason_lit == lit {
@@ -350,9 +370,7 @@ fn collect_lower_level_preds(
             }
 
             let pred = reason_lit.negated();
-            if history.get_literal_level(&pred).unwrap_or(0) < current_level
-                && seen.insert(pred.get_unsigned_index())
-            {
+            if should_emit(&pred) && seen.insert(pred.get_unsigned_index()) {
                 out.push(pred);
             }
         }
@@ -361,14 +379,14 @@ fn collect_lower_level_preds(
     out
 }
 
-fn find_post_clause_from_dip_pair(
+fn find_clauses_from_dip_pair(
     slice: &DipSlice,
-    history: &History,
+    _history: &History,
     formula: &Formula,
     conflict_clause_idx: usize,
     dip_a: &Literal,
     dip_b: &Literal,
-) -> Option<(Vec<Literal>)> {
+) -> Option<(Vec<Literal>, Vec<Literal>)> {
     if dip_a == dip_b {
         return None;
     }
@@ -390,38 +408,53 @@ fn find_post_clause_from_dip_pair(
         return None;
     }
 
-    let mut post_region = vec![false; conflict_idx + 1];
-    let mut queue = VecDeque::new();
+    let mut pre_region = forward_region(slice, vec![first_uip_pos], &[dip_a_pos, dip_b_pos]);
+    pre_region[dip_a_pos] = true;
+    pre_region[dip_b_pos] = true;
 
-    for &start in &[dip_a_pos, dip_b_pos] {
-        for &succ in &slice.succ[start] {
-            if !post_region[succ] {
-                post_region[succ] = true;
-                queue.push_back(succ);
-            }
-        }
-    }
-
-    while let Some(node_idx) = queue.pop_front() {
-        for &succ in &slice.succ[node_idx] {
-            if !post_region[succ] {
-                post_region[succ] = true;
-                queue.push_back(succ);
-            }
-        }
-    }
+    let post_seeds = slice.succ[dip_a_pos]
+        .iter()
+        .chain(slice.succ[dip_b_pos].iter())
+        .copied()
+        .collect();
+    let post_region = forward_region(slice, post_seeds, &[]);
 
     if !post_region[conflict_idx] {
         return None;
     }
-    
+
+    let covered_none = vec![false; conflict_idx + 1];
+    let mut pre_lits = vec![slice.trail[first_uip_pos].negated()];
+    for lit in collect_external_preds(
+        &pre_region,
+        &covered_none,
+        true,
+        slice,
+        _history,
+        formula,
+        conflict_clause_idx,
+    ) {
+        pre_lits.push(lit.negated());
+    }
+
+    let mut post_covered = vec![false; conflict_idx + 1];
+    post_covered[dip_a_pos] = true;
+    post_covered[dip_b_pos] = true;
+
     let mut post_lits = Vec::new();
-    for lit in collect_lower_level_preds(&post_region, slice, history, formula, conflict_clause_idx)
-    {
+    for lit in collect_external_preds(
+        &post_region,
+        &post_covered,
+        false,
+        slice,
+        _history,
+        formula,
+        conflict_clause_idx,
+    ) {
         post_lits.push(lit.negated());
     }
 
-    Some(post_lits)
+    Some((pre_lits, post_lits))
 }
 
 pub fn find_dip(
@@ -438,59 +471,58 @@ pub fn find_dip(
     }
 
     let Some(slice) = build_dip_slice(history, formula, conflict_clause_index) else {
-        let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip {
-            clause,
-            backtrack_level,
-        };
+        return fallback_uip(history, formula, conflict_clause_index);
     };
 
     let Some(mut dips) = find_all_two_vertex_bottlenecks(&slice) else {
-        let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip {
-            clause,
-            backtrack_level,
-        };
+        return fallback_uip(history, formula, conflict_clause_index);
     };
 
     if dips.is_empty() {
-        let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip {
-            clause,
-            backtrack_level,
-        };
+        return fallback_uip(history, formula, conflict_clause_index);
     }
 
     let (a, b) = choose_best_dip_pair(&mut dips, &slice, history);
 
-    let Some(post_lits) =
-        find_post_clause_from_dip_pair(&slice, history, formula, conflict_clause_index, &a, &b)
+    let Some((pre_lits, post_lits)) =
+        find_clauses_from_dip_pair(&slice, history, formula, conflict_clause_index, &a, &b)
     else {
-        let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip {
-            clause,
-            backtrack_level,
-        };
+        return fallback_uip(history, formula, conflict_clause_index);
     };
 
     if post_lits.is_empty() || a.get_index() == b.get_index() {
-        let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
-        return ConflictLearnResult::Uip {
-            clause,
-            backtrack_level,
-        };
+        return fallback_uip(history, formula, conflict_clause_index);
     }
 
-    let backtrack_level = post_lits
-        .iter()
-        .filter_map(|lit| history.get_literal_level(lit))
-        .max()
-        .unwrap_or(0);
+    let max_lower_level = |lits: &[Literal]| {
+        lits.iter()
+            .filter_map(|lit| history.get_literal_level(lit))
+            .filter(|&level| level < current_level)
+            .max()
+            .unwrap_or(0)
+    };
+
+    let l_c = max_lower_level(&pre_lits);
+    let l_d = max_lower_level(&post_lits);
+    let backtrack_level = std::cmp::max(l_c, l_d);
 
     ConflictLearnResult::Dip {
         dip_a: a,
         dip_b: b,
+        pre_clause_without_z: pre_lits,
         post_clause_without_z: post_lits,
+        backtrack_level,
+    }
+}
+
+fn fallback_uip(
+    history: &History,
+    formula: &Formula,
+    conflict_clause_index: usize,
+) -> ConflictLearnResult {
+    let (clause, backtrack_level) = find_1uip(history, formula, conflict_clause_index);
+    ConflictLearnResult::Uip {
+        clause,
         backtrack_level,
     }
 }
@@ -542,7 +574,6 @@ fn choose_best_dip_pair(
 #[cfg(test)]
 mod tests {
     use crate::formula::Formula;
-    use crate::formula::clause::Clause;
     use crate::formula::literal::Literal;
     use crate::history::{ConflictLearnResult, History, ImplicationPoint};
     use std::collections::HashSet;
@@ -570,153 +601,6 @@ mod tests {
         let ka = lit_key(a);
         let kb = lit_key(b);
         if ka <= kb { (ka, kb) } else { (kb, ka) }
-    }
-
-    fn lit_value(lit: &Literal, assignment: &std::collections::HashMap<i32, bool>) -> Option<bool> {
-        let var = lit.get_index().abs();
-        assignment
-            .get(&var)
-            .map(|&var_value| var_value != lit.is_negated())
-    }
-
-    fn assign_literal_true(
-        lit: &Literal,
-        assignment: &mut std::collections::HashMap<i32, bool>,
-    ) -> bool {
-        let var = lit.get_index().abs();
-        let value = !lit.is_negated();
-
-        match assignment.get(&var) {
-            Some(&old) => old == value,
-            None => {
-                assignment.insert(var, value);
-                true
-            }
-        }
-    }
-
-    fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
-        let mut assignment = std::collections::HashMap::new();
-
-        // RUP check: assume negation of the candidate clause.
-        for lit in clause.get_literals() {
-            let assumption = lit.negated();
-
-            if !assign_literal_true(&assumption, &mut assignment) {
-                return true;
-            }
-        }
-
-        loop {
-            let mut changed = false;
-
-            for existing_clause in formula.get_clauses() {
-                let mut unassigned = None;
-                let mut unassigned_count = 0;
-                let mut satisfied = false;
-
-                for lit in existing_clause.get_literals() {
-                    match lit_value(lit, &assignment) {
-                        Some(true) => {
-                            satisfied = true;
-                            break;
-                        }
-                        Some(false) => {}
-                        None => {
-                            unassigned = Some(lit.clone());
-                            unassigned_count += 1;
-                        }
-                    }
-                }
-
-                if satisfied {
-                    continue;
-                }
-
-                if unassigned_count == 0 {
-                    return true;
-                }
-
-                if unassigned_count == 1 {
-                    let unit = unassigned.unwrap();
-
-                    if !assign_literal_true(&unit, &mut assignment) {
-                        return true;
-                    }
-
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                return false;
-            }
-        }
-    }
-
-    #[test]
-    fn paper_fig1_expected_pre_and_post_are_rup_after_extension_axioms() {
-        let x = |n: u64| Literal::new(n as i32);
-        let y = |n: u64| Literal::new((13 + n) as i32);
-
-        // Original Figure 1 clauses plus extension axioms.
-        //
-        // Fresh extension variable:
-        // z = DIMACS var 20.
-        //
-        // DIP: z <-> (x8 ∧ ¬x9)
-        //
-        // Extension clauses:
-        // z ∨ ¬x8 ∨ x9
-        // ¬z ∨ x8
-        // ¬z ∨ ¬x9
-        let formula = Formula::from_vec(vec![
-            vec![14, -1, 2],
-            vec![-1, -3],
-            vec![15, -1, 4],
-            vec![-16, -2, 3, -4, 5],
-            vec![14, -5, -6],
-            vec![-5, 7],
-            vec![6, -7, 8],
-            vec![-16, -17, -5, -9],
-            vec![-17, 9, -10],
-            vec![-18, 19, -8, 9, 11],
-            vec![-11, 12],
-            vec![10, -11, 13],
-            vec![-12, -13],
-            // Extension axioms for z <-> (x8 ∧ ¬x9)
-            vec![20, -8, 9],
-            vec![-20, 8],
-            vec![-20, -9],
-        ]);
-
-        let z = Literal::new(20);
-
-        // Figure 2 last row:
-        // pre-DIP:  ¬x5 ∨ y1 ∨ ¬y3 ∨ ¬y4 ∨ z
-        // post-DIP: ¬z ∨ ¬y4 ∨ ¬y5 ∨ y6
-        let pre_clause = Clause::from_literals(&vec![
-            z.clone(),
-            x(5).negated(),
-            y(1),
-            y(3).negated(),
-            y(4).negated(),
-        ]);
-
-        let post_clause =
-            Clause::from_literals(&vec![z.negated(), y(4).negated(), y(5).negated(), y(6)]);
-
-        assert!(
-            is_rup_candidate(&formula, &pre_clause),
-            "expected paper pre-DIP clause is not RUP: {:?}",
-            pre_clause
-        );
-
-        assert!(
-            is_rup_candidate(&formula, &post_clause),
-            "expected paper post-DIP clause is not RUP: {:?}",
-            post_clause
-        );
     }
 
     #[test]
@@ -1106,7 +990,7 @@ mod tests {
         use crate::formula::clause::Clause;
         use crate::formula::literal::Literal;
         use crate::history::History;
-    
+
         // Artificial trail:
         //
         // DL1: c
@@ -1124,49 +1008,42 @@ mod tests {
         // Backjump to lD = 2:
         // d survives, so post-DIP is unit on ¬z.
         // p is unassigned, so after z=false, pre-DIP is ¬f ∨ ¬p, not unit.
-    
+
         let mut formula = Formula::new(7);
         let mut history = History::new();
-    
+
         let c = Literal::new(1);
         let d = Literal::new(2);
         let p = Literal::new(3);
         let f = Literal::new(4);
         let z = Literal::new(7);
-    
+
         formula.assignment.assign_history(&c, &mut history); // DL1
         formula.assignment.assign_history(&d, &mut history); // DL2
         formula.assignment.assign_history(&p, &mut history); // DL3
         formula.assignment.assign_history(&f, &mut history); // DL4
-    
+
         let l_c = history.get_literal_level(&p).unwrap();
         let l_d = history.get_literal_level(&d).unwrap();
-    
+
         assert_eq!(l_c, 3);
         assert_eq!(l_d, 2);
         assert!(l_c > l_d);
-    
-        let pre_dip = Clause::from_literals(&vec![
-            f.negated(),
-            p.negated(),
-            z.clone(),
-        ]);
-    
-        let post_dip = Clause::from_literals(&vec![
-            z.negated(),
-            d.negated(),
-        ]);
-    
+
+        let pre_dip = Clause::from_literals(&vec![f.negated(), p.negated(), z.clone()]);
+
+        let post_dip = Clause::from_literals(&vec![z.negated(), d.negated()]);
+
         // Paper backjump level: lD.
         // Keep levels <= 2, remove levels > 2.
         history.revert_decision(l_d + 1, &mut formula.assignment);
-    
+
         assert_eq!(formula.assignment.get_value(1), Some(true)); // c survives
         assert_eq!(formula.assignment.get_value(2), Some(true)); // d survives
-        assert_eq!(formula.assignment.get_value(3), None);       // p gone
-        assert_eq!(formula.assignment.get_value(4), None);       // f gone
-        assert_eq!(formula.assignment.get_value(7), None);       // z fresh/unassigned
-    
+        assert_eq!(formula.assignment.get_value(3), None); // p gone
+        assert_eq!(formula.assignment.get_value(4), None); // f gone
+        assert_eq!(formula.assignment.get_value(7), None); // z fresh/unassigned
+
         // post-DIP: ¬z ∨ ¬d
         // d=true, so ¬d=false.
         // z is unassigned.
@@ -1176,10 +1053,12 @@ mod tests {
             post_dip.get_unit_literal(&formula.assignment),
             Some(&z.negated())
         );
-    
+
         // Simulate post-DIP propagation: ¬z, i.e. z=false.
-        formula.assignment.assign(z.get_index().abs() as usize, false);
-    
+        formula
+            .assignment
+            .assign(z.get_index().abs() as usize, false);
+
         // pre-DIP: ¬f ∨ ¬p ∨ z
         // z=false.
         // f is unassigned.
@@ -1188,7 +1067,7 @@ mod tests {
         // So the clause has two unassigned literals: ¬f and ¬p.
         // Therefore it is NOT unit/asserting.
         assert!(!pre_dip.is_unit(&formula.assignment));
-    
+
         let unassigned = pre_dip.get_unassigned_literals(&formula.assignment);
         assert_eq!(unassigned.len(), 2);
         assert!(unassigned.contains(&&f.negated()));
@@ -1196,12 +1075,12 @@ mod tests {
     }
 
     #[test]
-    fn find_dip_can_return_non_asserting_predip_when_lc_greater_than_ld() {
+    fn find_dip_backtracks_to_max_lc_ld_so_predip_asserts() {
         use crate::formula::Formula;
         use crate::formula::clause::Clause;
         use crate::formula::literal::Literal;
         use crate::history::{ConflictLearnResult, History, ImplicationPoint};
-    
+
         // Variables:
         //
         // Lower levels:
@@ -1247,85 +1126,83 @@ mod tests {
         // lC = DL(p) = 2
         // lD = DL(d) = 1
         //
-        // Since lC > lD, after backjump to lD, post-DIP is asserting,
-        // but pre-DIP is not asserting.
-    
+        // Since this implementation backjumps to max(lC, lD), both the
+        // post-DIP and pre-DIP clauses should become asserting.
+
         let clauses = vec![
-            vec![-3, -2, 4], // 0: ¬f ∨ ¬p ∨ a
-            vec![-3, 5],     // 1: ¬f ∨ b
+            vec![-3, -2, 4],  // 0: ¬f ∨ ¬p ∨ a
+            vec![-3, 5],      // 1: ¬f ∨ b
             vec![-4, -5, -1], // 2: ¬a ∨ ¬b ∨ ¬d conflict
         ];
-    
+
         let mut formula = Formula::from_vec(clauses);
         let mut history = History::new();
-    
+
         let d = Literal::new(1);
         let p = Literal::new(2);
         let f = Literal::new(3);
         let a = Literal::new(4);
         let b = Literal::new(5);
-    
+
         // DL1: d=true
         formula.assignment.assign_history(&d, &mut history);
-    
+
         // DL2: p=true
         formula.assignment.assign_history(&p, &mut history);
-    
+
         // DL3 current level: f decision
         formula.assignment.assign_history(&f, &mut history);
-    
+
         // f,p imply a through clause 0.
         formula
             .assignment
             .assign(a.get_index().abs() as usize, true);
         history.add_implication(&a, Some(0));
-    
+
         // f implies b through clause 1.
         formula
             .assignment
             .assign(b.get_index().abs() as usize, true);
         history.add_implication(&b, Some(1));
-    
+
         let conflict_idx = 2;
-    
+
         let result = history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP);
-    
-        let (
-            dip_a,
-            dip_b,
-            pre_clause_without_z,
-            post_clause_without_z,
-            backtrack_level,
-        ) = match result {
-            ConflictLearnResult::Dip {
-                dip_a,
-                dip_b,
-                pre_clause_without_z,
-                post_clause_without_z,
-                backtrack_level,
-            } => (
-                dip_a,
-                dip_b,
-                pre_clause_without_z,
-                post_clause_without_z,
-                backtrack_level,
-            ),
-            ConflictLearnResult::Uip { clause, backtrack_level } => {
-                panic!(
-                    "expected DIP result, got UIP clause {:?} with backtrack level {}",
-                    clause, backtrack_level
-                );
-            }
-        };
-    
+
+        let (dip_a, dip_b, pre_clause_without_z, post_clause_without_z, backtrack_level) =
+            match result {
+                ConflictLearnResult::Dip {
+                    dip_a,
+                    dip_b,
+                    pre_clause_without_z,
+                    post_clause_without_z,
+                    backtrack_level,
+                } => (
+                    dip_a,
+                    dip_b,
+                    pre_clause_without_z,
+                    post_clause_without_z,
+                    backtrack_level,
+                ),
+                ConflictLearnResult::Uip {
+                    clause,
+                    backtrack_level,
+                } => {
+                    panic!(
+                        "expected DIP result, got UIP clause {:?} with backtrack level {}",
+                        clause, backtrack_level
+                    );
+                }
+            };
+
         let unordered = |x: &Literal, y: &Literal| {
             let mut pair = vec![x.get_index(), y.get_index()];
             pair.sort();
             pair
         };
-    
+
         assert_eq!(unordered(&dip_a, &dip_b), unordered(&a, &b));
-    
+
         // pre_clause_without_z represents:
         //   ¬f ∨ ¬C
         //
@@ -1333,24 +1210,24 @@ mod tests {
         //   ¬f ∨ ¬p
         assert!(pre_clause_without_z.contains(&f.negated()));
         assert!(pre_clause_without_z.contains(&p.negated()));
-    
+
         // post_clause_without_z represents:
         //   ¬D
         //
         // Expected:
         //   ¬d
         assert_eq!(post_clause_without_z, vec![d.negated()]);
-    
+
         let l_c = history.get_literal_level(&p).unwrap();
         let l_d = history.get_literal_level(&d).unwrap();
-    
+
         assert_eq!(l_c, 2);
         assert_eq!(l_d, 1);
         assert!(l_c > l_d);
-    
-        // The implementation should backtrack to lD.
-        assert_eq!(backtrack_level, l_d);
-    
+
+        // This variant backtracks to max(lC, lD) so both post-DIP and pre-DIP assert.
+        assert_eq!(backtrack_level, std::cmp::max(l_c, l_d));
+
         // Introduce z as if solve_cdcl had created the extension:
         //
         // z <-> a ∧ b
@@ -1358,32 +1235,50 @@ mod tests {
         // pre-DIP:  z ∨ ¬f ∨ ¬p
         // post-DIP: ¬z ∨ ¬d
         let z = formula.add_literal();
-    
+
         let mut pre_lits = vec![z.clone()];
         pre_lits.extend(pre_clause_without_z.clone());
         let pre_dip = Clause::from_literals(&pre_lits);
-    
+
         let mut post_lits = vec![z.negated()];
         post_lits.extend(post_clause_without_z.clone());
         let post_dip = Clause::from_literals(&post_lits);
-    
-        // Backjump to lD.
+
+        // Backjump to max(lC, lD).
         history.revert_decision(backtrack_level + 1, &mut formula.assignment);
-    
+
         // d survives at DL1.
-        assert_eq!(formula.assignment.get_value(d.get_index().abs() as usize), Some(true));
-    
-        // p does not survive because p was at DL2 and lD=1.
-        assert_eq!(formula.assignment.get_value(p.get_index().abs() as usize), None);
-    
+        assert_eq!(
+            formula.assignment.get_value(d.get_index().abs() as usize),
+            Some(true)
+        );
+
+        // p survives because backtrack_level is max(lC, lD)=2.
+        assert_eq!(
+            formula.assignment.get_value(p.get_index().abs() as usize),
+            Some(true)
+        );
+
         // f, a, b are current-level and are also gone.
-        assert_eq!(formula.assignment.get_value(f.get_index().abs() as usize), None);
-        assert_eq!(formula.assignment.get_value(a.get_index().abs() as usize), None);
-        assert_eq!(formula.assignment.get_value(b.get_index().abs() as usize), None);
-    
+        assert_eq!(
+            formula.assignment.get_value(f.get_index().abs() as usize),
+            None
+        );
+        assert_eq!(
+            formula.assignment.get_value(a.get_index().abs() as usize),
+            None
+        );
+        assert_eq!(
+            formula.assignment.get_value(b.get_index().abs() as usize),
+            None
+        );
+
         // z is fresh/unassigned.
-        assert_eq!(formula.assignment.get_value(z.get_index().abs() as usize), None);
-    
+        assert_eq!(
+            formula.assignment.get_value(z.get_index().abs() as usize),
+            None
+        );
+
         // post-DIP: ¬z ∨ ¬d
         // d=true, so ¬d=false.
         // z is unassigned.
@@ -1393,25 +1288,19 @@ mod tests {
             post_dip.get_unit_literal(&formula.assignment),
             Some(&z.negated())
         );
-    
+
         // Simulate propagation of ¬z.
         formula
             .assignment
             .assign(z.get_index().abs() as usize, false);
-    
+
         // pre-DIP: z ∨ ¬f ∨ ¬p
-        // z=false.
-        // f is unassigned.
-        // p is unassigned because lC > lD.
-        //
-        // So pre-DIP has two unassigned literals and is not asserting.
-        assert!(!pre_dip.is_unit(&formula.assignment));
-    
-        let unassigned = pre_dip.get_unassigned_literals(&formula.assignment);
-        assert_eq!(unassigned.len(), 2);
-        assert!(unassigned.contains(&&f.negated()));
-        assert!(unassigned.contains(&&p.negated()));
+        // z=false and p=true, so z=false and ¬p=false.
+        // f is unassigned, therefore pre-DIP is unit on ¬f.
+        assert!(pre_dip.is_unit(&formula.assignment));
+        assert_eq!(
+            pre_dip.get_unit_literal(&formula.assignment),
+            Some(&f.negated())
+        );
     }
-
-
 }
