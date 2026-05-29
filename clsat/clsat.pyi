@@ -19,19 +19,21 @@ class Sat:
     
     def __init__(self, clauses: list[list[int]]) -> None: ...
     def add_clause(self, clause: list[int]) -> None: 
-        """
-        Adds a new clause to the SAT problem.
-        :param clause: A list of integers representing a clause, where positive integers represent positive literals and negative integers represent negated literals.
+        """Adds a new clause to the SAT problem.
+
+        Args:
+            clause: A list of integers representing a clause, where positive integers represent positive literals and negative integers represent negated literals.
         """
         ...
     def solve(self, algorithm: Literal["dpll", "cdcl"], implication_point: Literal["uip","dip"], preprocess: list[Literal["bva","bve"]], heuristics: Literal["vsids","random"], drat_path: str|None = None) -> None: 
-        """
-        Solves the SAT problem, to see the solution please inspect the model field of the class.
-        :param algorithm: The algorithm to use for solving the SAT problem. Currently, only "dpll" and "cdcl" are supported.
-        :param implication_point: The implication point mode to use when using the CDCL algorithm, dip is used to use the extended resolution proof system.
-        :param preprocess: The preprocessing techniques to apply before the solving algorithm starts
-        :param heuristics: The heuristics to apply whenever choosing a literal
-        :param drat_path: If given the solver generates a drat proof
+        """Solve the SAT problem.
+
+        Args:
+            algorithm: The algorithm to use ("dpll" or "cdcl").
+            implication_point: UIP/DIP mode for CDCL.
+            preprocess: Preprocessing techniques to apply.
+            heuristics: Literal selection heuristic.
+            drat_path: If given, write a DRAT proof to this path.
         """
         ...
         
