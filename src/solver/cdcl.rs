@@ -6,8 +6,6 @@ use crate::formula::Formula;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
-//use crate::history::conflict_graph;
-//use crate::history::conflict_graph::dump_conflict_graph_dot;
 use crate::python::signal_checker;
 
 use pyo3::prelude::PyResult;
@@ -69,10 +67,6 @@ pub fn solve_cdcl<'py, W:Write>(
             None => return Ok(Some(formula.get_model()))
         };
         
-        // let decision_lit = match vsids.get_best_unassigned(formula) {
-        //     Some(lit) => lit,
-        //     None => return Ok(Some(formula.get_model())),
-        // };
 
         history.add_decision(&decision_lit);
         formula
@@ -119,10 +113,6 @@ pub fn solve_cdcl<'py, W:Write>(
                     formula.add_clause(learned.clone(),logger);
                     let clause_idx = formula.get_clauses().len() - 1;
 
-                    // for lit in learned.get_literals() {
-                    //     vsids.bump(lit);
-                    // }
-                    // vsids.decay_all();
 
                     if let Some(asserting_lit) =
                         find_asserting_literal(&learned, &formula.assignment)
@@ -140,7 +130,6 @@ pub fn solve_cdcl<'py, W:Write>(
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    pre_clause_without_z,
                     post_clause_without_z,
                     backtrack_level,
                 } => {
@@ -185,34 +174,6 @@ pub fn solve_cdcl<'py, W:Write>(
                     post_lits.push(z.negated());
                     post_lits.extend(post_clause_without_z.into_iter());
                     let post_clause = Clause::from_literals(&post_lits);
-
-                    let mut pre_lits = Vec::with_capacity(pre_clause_without_z.len() + 1);
-                    pre_lits.push(z.clone());
-                    pre_lits.extend(pre_clause_without_z.into_iter());
-                    let pre_clause = Clause::from_literals(&pre_lits);
-
-                    if !is_rup_candidate(formula, &post_clause) {
-                        eprintln!("DIP post clause is not RUP");
-                        eprintln!("dip_a = {:?}, dip_b = {:?}, z = {:?}", dip_a, dip_b, z);
-                        eprintln!("post_clause = {:?}", post_clause);
-                        eprintln!("pre_clause = {:?}", pre_clause);
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            "DIP post clause is not RUP",
-                        ));
-                    }
-                    
-                    let pre_is_rup = is_rup_candidate(formula, &pre_clause);
-                    
-                    
-                    if !pre_is_rup {
-                        // Dump the implication graph here inside a file to then plot it
-                        // 
-                        // let _ = dump_conflict_graph_dot(&history, formula, conflict_idx, "graph.dot");
-                        // println!("\nSkipping non-RUP DIP pre clause");
-                        // println!("dip_a = {:?}, dip_b = {:?}, z = {:?}", dip_a, dip_b, z);
-                        // println!("post_clause = {:?}", post_clause);
-                        // println!("pre_clause = {:?}", pre_clause);
-                    }
                     
                     // println!("Preclause: {:?}, post clause: {:?}",pre_clause,post_clause);
 
@@ -235,25 +196,13 @@ pub fn solve_cdcl<'py, W:Write>(
                     
                     for lit in post_clause.get_literals() {
                         let _ = learned.add_literal(lit); 
-                        //vsids.bump(lit);
                     }
-                    for lit in pre_clause.get_literals() {
-                        let _ = learned.add_literal(lit);
-                        //vsids.bump(lit);
-                    }
-                    //vsids.decay_all();
 
                     // Log post learned clause
                     formula.stats.add_learnt_clause(&post_clause);
                     formula.add_clause(post_clause, logger);
                     
                     let post_idx = formula.get_clauses().len() - 1;
-
-                    // Log pre clause
-                    if pre_is_rup {
-                        formula.stats.add_learnt_clause(&pre_clause);
-                        formula.add_clause(pre_clause, logger);
-                    }
 
                     // ¬z is asserting.
                     let asserting_lit = z.negated();
@@ -288,79 +237,6 @@ pub fn solve_cdcl<'py, W:Write>(
 
             heuristics.bump(learned.get_literals());
             heuristics.decay();
-        }
-    }
-}
-
-fn assign_literal_true(
-    lit: &Literal,
-    assignment: &mut std::collections::HashMap<usize, bool>,
-) -> bool {
-    let value = !lit.is_negated();
-
-    match assignment.get(&(lit.get_index().abs() as usize)) {
-        Some(&old) => old == value,
-        None => {
-            assignment.insert(lit.get_index().abs() as usize, value);
-            true
-        }
-    }
-}
-
-fn is_rup_candidate(formula: &Formula, clause: &Clause) -> bool {
-    let mut assignment = std::collections::HashMap::new();
-
-    // RUP check
-    for lit in clause.get_literals() {
-        let assumption = lit.negated();
-
-        if !assign_literal_true(&assumption, &mut assignment) {
-            return true;
-        }
-    }
-
-    loop {
-        let mut changed = false;
-        for existing_clause in formula.get_clauses() {
-            let mut unassigned = None;
-            let mut unassigned_count = 0;
-            let mut satisfied = false;
-
-            for lit in existing_clause.get_literals() {
-                match assignment.get(&(lit.get_index().abs() as usize)) {
-                    Some(&value) => {
-                        let lit_value = if lit.is_negated() { !value } else { value };
-                        if lit_value {
-                            satisfied = true;
-                            break;
-                        }
-                    }
-                    None => {
-                        unassigned = Some(lit.clone());
-                        unassigned_count += 1;
-                    }
-                }
-            }
-
-            if satisfied {
-                continue;
-            }
-
-            if unassigned_count == 0 {
-                return true;
-            }
-
-            if unassigned_count == 1 {
-                let unit = unassigned.unwrap();
-                if !assign_literal_true(&unit, &mut assignment) {
-                    return true;
-                }
-                changed = true;
-            }
-        }
-
-        if !changed {
-            return false;
         }
     }
 }
