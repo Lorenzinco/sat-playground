@@ -32,7 +32,7 @@ impl Watch {
 
         self.watchlist
             .get(idx)
-            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
+            .expect(format!("watchlist for this literal is unitialized. {:?}", idx).as_str())
     }
 
     /// Pushes the clause index inside the watchlist of the given lit
@@ -41,7 +41,7 @@ impl Watch {
 
         self.watchlist
             .get_mut(idx)
-            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
+            .expect(format!("watchlist for this literal is unitialized. {:?}", idx).as_str())
             .push(clause_idx)
     }
 
@@ -57,7 +57,7 @@ impl Watch {
 
         self.watchlist
             .get_mut(idx)
-            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str())
+            .expect(format!("watchlist for this literal is unitialized. {:?}", idx).as_str())
             .retain(|&idx| idx != clause_idx);
     }
 
@@ -66,7 +66,7 @@ impl Watch {
         take(
             self.watchlist
                 .get_mut(idx)
-                .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str()),
+                .expect(format!("watchlist for this literal is unitialized. {:?}", idx).as_str()),
         )
     }
 
@@ -75,7 +75,8 @@ impl Watch {
         *self
             .watchlist
             .get_mut(idx)
-            .expect(format!("watchlist for this literal is unitialized. {:?}",idx).as_str()) = new_list;
+            .expect(format!("watchlist for this literal is unitialized. {:?}", idx).as_str()) =
+            new_list;
     }
 
     /// Shifts all the clause indexes by one (backwards) from a clause index onwards, this is done after clause deletition

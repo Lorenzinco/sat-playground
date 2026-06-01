@@ -47,6 +47,28 @@ impl DecisionLevel {
             .flatten()
     }
 
+    pub fn reason_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.implied_literals
+            .iter()
+            .filter_map(|(_, reason_idx)| *reason_idx)
+    }
+
+    pub fn remap_clause_indices(&mut self, old_to_new: &[Option<usize>]) {
+        let remap = |reason_idx: &mut Option<usize>| {
+            if let Some(idx) = *reason_idx {
+                *reason_idx = old_to_new.get(idx).copied().flatten();
+            }
+        };
+
+        for reason_idx in &mut self.reason_by_unsigned {
+            remap(reason_idx);
+        }
+
+        for (_, reason_idx) in &mut self.implied_literals {
+            remap(reason_idx);
+        }
+    }
+
     pub fn implied_literals_iter(&self) -> impl Iterator<Item = &Literal> + '_ {
         self.implied_literals.iter().map(|(lit, _)| lit)
     }

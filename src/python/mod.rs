@@ -2,10 +2,10 @@ pub mod sat;
 pub mod stats;
 
 use crate::heuristics::Heuristics;
-use crate::preprocess::Preprocess;
+use crate::history::ImplicationPoint;
+use crate::process::Process;
 use crate::python::stats::Stats;
 use crate::solver::Algorithm;
-use crate::history::ImplicationPoint;
 use pyo3::prelude::*;
 
 /// Python bindings for the Sat struct, allocate an instance to then add clauses.
@@ -14,9 +14,9 @@ pub struct Sat {
     #[pyo3(get)]
     pub clauses: Vec<Vec<i32>>,
     #[pyo3(get)]
-    model : Option<Vec<bool>>,
+    model: Option<Vec<bool>>,
     #[pyo3(get)]
-    stats: Option<Stats>
+    stats: Option<Stats>,
 }
 
 #[pymethods]
@@ -34,19 +34,18 @@ impl Sat {
             Sat {
                 clauses: clauses,
                 model: None,
-                stats: None
+                stats: None,
             }
-        }
-        else {
+        } else {
             Sat {
-                clauses: vec!(),
+                clauses: vec![],
                 model: None,
-                stats: None
+                stats: None,
             }
         }
     }
     /// Adds a clause to the sat instance, the clause is a list of integers where positive integers represent positive literals and negative integers represent negated literals.
-   #[pyo3(signature = (clause: "list[int]") ,text_signature = "clause: list[int]")]
+    #[pyo3(signature = (clause: "list[int]") ,text_signature = "clause: list[int]")]
     pub fn add_clause(&mut self, clause: Vec<i32>) {
         for lit in clause.iter() {
             if *lit == 0 {
@@ -55,28 +54,45 @@ impl Sat {
         }
         self.clauses.push(clause);
     }
-    
+
     fn __str__(&self) -> String {
         format!("{}", self)
     }
-    
+
     fn __repr__(&self) -> String {
         format!("{}", self)
     }
-    
+
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm,implication_point, preprocess, heuristics, drat_path=None) ,text_signature = "algorithm, implication_point, preprocess, heuristics, drat_path=None")]
-    pub fn solve(&mut self, py: Python<'_>, algorithm: Algorithm, implication_point: ImplicationPoint, preprocess: Vec<Preprocess>, heuristics: Heuristics, drat_path: Option<String>)->PyResult<()> {
-        let (result,stats) = self.solve_rs(py,algorithm,implication_point, preprocess, heuristics,drat_path)?;
+    #[pyo3(signature = (algorithm,implication_point, preprocess, inprocessing , heuristics, drat_path=None) ,text_signature = "algorithm, implication_point, preprocess, inprocessing, heuristics, drat_path=None")]
+    pub fn solve(
+        &mut self,
+        py: Python<'_>,
+        algorithm: Algorithm,
+        implication_point: ImplicationPoint,
+        preprocess: Vec<Process>,
+        inprocessing: Vec<Process>,
+        heuristics: Heuristics,
+        drat_path: Option<String>,
+    ) -> PyResult<()> {
+        let (result, stats) = self.solve_rs(
+            py,
+            algorithm,
+            implication_point,
+            preprocess,
+            inprocessing,
+            heuristics,
+            drat_path,
+        )?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())
     }
 }
 
-pub fn signal_checker(py: Python<'_>, steps: &mut u64)-> PyResult<()> {
+pub fn signal_checker(py: Python<'_>, steps: &mut u64) -> PyResult<()> {
     *steps += 1;
-    if steps.is_multiple_of(100){
+    if steps.is_multiple_of(100) {
         py.check_signals()?;
     }
 

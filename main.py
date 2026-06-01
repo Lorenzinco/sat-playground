@@ -1,3 +1,4 @@
+from ast import parse
 import clsat
 
 def parse_dimacs(filename):
@@ -18,21 +19,29 @@ def parse_dimacs(filename):
 
 
 def main():
+    # clauses = parse_dimacs("tests/unsat/2bitadd_10.cnf")
     clauses = parse_dimacs("input.dimacs")
     s = clsat.Sat(clauses)
 
     print("c Solving SAT problem...", flush=True)
     s.solve(
         algorithm="cdcl",
-        implication_point="dip",
+        implication_point="uip",
         preprocess=["bva"],
         heuristics="vsids",
-        drat_path="proof.drat"
+        drat_path="proof.drat",
+        inprocessing=[],
     )
 
     if s.model is not None:
         print("s SATISFIABLE", flush=True)
-        print(s.model)
+        solution = ""
+        for (index,value) in enumerate(s.model):
+            if value:
+                solution += f"{index+1} "
+            else:
+                solution += f"-{index+1} "
+        print(solution)
     else:
         print("s UNSATISFIABLE", flush=True)
 

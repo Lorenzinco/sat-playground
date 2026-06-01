@@ -1,6 +1,5 @@
-use pyo3_build_config; 
+use pyo3_build_config;
 
-
-pub fn main() { 
-    pyo3_build_config::add_python_framework_link_args(); 
+pub fn main() {
+    pyo3_build_config::add_python_framework_link_args();
 }

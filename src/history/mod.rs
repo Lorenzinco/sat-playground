@@ -1,3 +1,4 @@
+pub mod clause_minimization;
 pub mod conflict_graph;
 pub mod decision_level;
 pub mod dip;
@@ -5,6 +6,8 @@ pub mod implication_level;
 pub mod uip;
 
 use pyo3::prelude::*;
+use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::history::decision_level::DecisionLevel;
 use crate::history::dip::find_dip;
@@ -26,13 +29,17 @@ pub enum ConflictLearnResult {
     Uip {
         clause: Clause,
         backtrack_level: usize,
+        minimized_literals: usize,
+        minimization_time: Duration,
     },
     Dip {
         dip_a: Literal,
         dip_b: Literal,
         pre_clause_without_z: Vec<Literal>,  // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>, // ¬D
-        backtrack_level: usize,              // = max(l_C, l_D)
+        pre_lbd: i64,
+        post_lbd: i64,
+        backtrack_level: usize, // = max(l_C, l_D)
     },
 }
 
@@ -102,11 +109,20 @@ impl History {
 
     /// Unsets inside the assignments all of the implications starting from level <level> onwards, also modifies the decision levels and implication levels undoing what's beyond <level>.
     pub fn revert_decision(&mut self, level: usize, assignment: &mut Assignment) {
+        self.revert_decision_collect_reasons(level, assignment);
+    }
+
+    pub fn revert_decision_collect_reasons(
+        &mut self,
+        level: usize,
+        assignment: &mut Assignment,
+    ) -> Vec<usize> {
         if level == 0 {
-            return;
+            return Vec::new();
         }
 
         let to_revert = self.decision_levels.split_off(level);
+        let mut removed_reasons = Vec::new();
 
         for decision in to_revert {
             if let Some(lit) = decision.get_decision_literal() {
@@ -114,11 +130,17 @@ impl History {
                 self.implication_levels_indexes.unset_level(lit);
             }
 
+            for reason_idx in decision.reason_indices() {
+                removed_reasons.push(reason_idx);
+            }
+
             for implication in decision.implied_literals_iter() {
                 assignment.unset(implication.get_index().abs() as usize);
                 self.implication_levels_indexes.unset_level(implication);
             }
         }
+
+        removed_reasons
     }
 
     pub fn revert_last_decision(&mut self, assignment: &mut Assignment) {
@@ -130,7 +152,13 @@ impl History {
     }
 
     pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
-        self.implication_levels_indexes.get_level(lit)
+        self.get_literal_and_level(lit).map(|(_, level)| level)
+    }
+
+    pub fn get_literal_and_level(&self, lit: &Literal) -> Option<(Literal, usize)> {
+        self.implication_levels_indexes
+            .get_level(lit)
+            .map(|level| (lit.clone(), level))
     }
 
     pub fn last_decision_literal(&self) -> Option<&Literal> {
@@ -138,6 +166,19 @@ impl History {
             .last()
             .expect("at least one")
             .get_decision_literal()
+    }
+
+    pub fn active_reason_indices(&self) -> HashSet<usize> {
+        self.decision_levels
+            .iter()
+            .flat_map(|level| level.reason_indices())
+            .collect()
+    }
+
+    pub fn remap_clause_indices(&mut self, old_to_new: &[Option<usize>]) {
+        for level in &mut self.decision_levels {
+            level.remap_clause_indices(old_to_new);
+        }
     }
 
     /// Returns the learned minimized clause at 1UIP and the conflict level the clause was found at.
@@ -148,13 +189,7 @@ impl History {
         implication_point: ImplicationPoint,
     ) -> ConflictLearnResult {
         match implication_point {
-            ImplicationPoint::UIP => {
-                let (clause, level) = find_1uip(self, formula, conflict_clause_index);
-                return ConflictLearnResult::Uip {
-                    clause,
-                    backtrack_level: level,
-                };
-            }
+            ImplicationPoint::UIP => find_1uip(self, formula, conflict_clause_index),
             ImplicationPoint::DIP => find_dip(self, formula, conflict_clause_index),
         }
     }
@@ -197,7 +232,7 @@ mod history {
         let lit1 = Literal::new(1);
 
         formula.assignment.assign_history(&lit1, &mut history);
-        assert!(formula.pure_literals_propagate_history(&mut history));
+        assert!(formula.pure_literals_propagate(Some(&mut history)));
         println!("{:?}", formula);
 
         assert!(formula.assignment.get_value(1).is_some());
@@ -221,7 +256,7 @@ mod history {
         let lit1 = Literal::new(1);
 
         formula.assignment.assign_history(&lit1, &mut history);
-        assert!(formula.pure_literals_propagate_history(&mut history));
+        assert!(formula.pure_literals_propagate(Some(&mut history)));
         println!("{:?}", formula);
 
         assert!(formula.assignment.get_value(1).is_some());
@@ -282,6 +317,7 @@ mod history {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
+                    ..
                 } => (clause, backtrack_level),
                 _ => {
                     panic!("Non-Uip")
@@ -295,6 +331,7 @@ mod history {
         assert_eq!(lit.get_index(), -1);
         assert!(lit.is_negated()); // -x1
 
+        assert_eq!(learned.lbd, 1);
         assert_eq!(backtrack_level, 0);
     }
 
@@ -332,6 +369,7 @@ mod history {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
+                    ..
                 } => (clause, backtrack_level),
                 _ => {
                     panic!("Non-Uip")
@@ -341,6 +379,7 @@ mod history {
         println!("Learned: {}", learned);
 
         assert_eq!(learned.len(), 2);
+        assert_eq!(learned.lbd, 2);
         assert_eq!(backtrack_level, 1);
     }
 
@@ -354,6 +393,7 @@ mod history {
             ConflictLearnResult::Uip {
                 clause,
                 backtrack_level,
+                ..
             } => (clause, backtrack_level),
             _ => {
                 panic!("Non-Uip")
@@ -414,6 +454,7 @@ mod history {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
+                    ..
                 } => (clause, backtrack_level),
                 _ => {
                     panic!("Non-Uip")
@@ -474,6 +515,7 @@ mod history {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
+                    ..
                 } => (clause, backtrack_level),
                 _ => {
                     panic!("Non-Uip")
@@ -547,6 +589,7 @@ mod history {
             ConflictLearnResult::Uip {
                 clause,
                 backtrack_level,
+                ..
             } => {
                 // Expected after the new fallback: UIP on -x4
                 assert_eq!(backtrack_level, 0);

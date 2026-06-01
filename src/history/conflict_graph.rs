@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
+use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::uip::find_1uip;
 
@@ -49,8 +50,11 @@ pub fn graph_from_conflict(
     }
 
     // Identify the 1UIP to serve as our hard stop (source of the subgraph)
-    let (uip_clause, _) = find_1uip(history, formula, conflict_clause_idx);
-    let first_uip = uip_clause
+    let ConflictLearnResult::Uip { clause, .. } = find_1uip(history, formula, conflict_clause_idx)
+    else {
+        unreachable!("1UIP analysis cannot return a DIP result")
+    };
+    let first_uip = clause
         .iter()
         .find(|l| history.get_literal_level(l) == Some(current_level))
         .map(|l| l.negated())

@@ -1,21 +1,23 @@
-use crate::formula::literal::Literal;
 use crate::formula::Formula;
+use crate::formula::literal::Literal;
 use crate::history::History;
 use crate::python::signal_checker;
-use pyo3::prelude::PyResult;
 use pyo3::Python;
+use pyo3::prelude::PyResult;
+use std::time::Instant;
 
 fn propagate(formula: &mut Formula, history: &mut History) {
     loop {
-        if !formula.unit_propagate_history(history) && !formula.pure_literals_propagate_history(history) { 
-            break
+        if !formula.unit_propagate(Some(history)) && !formula.pure_literals_propagate(Some(history))
+        {
+            break;
         }
     }
 }
 
 fn backtrack(formula: &mut Formula, history: &mut History) -> bool {
     loop {
-        if history.get_decision_level() == 0{
+        if history.get_decision_level() == 0 {
             return false;
         }
 
@@ -24,12 +26,11 @@ fn backtrack(formula: &mut Formula, history: &mut History) -> bool {
             .expect("history should contain root")
             .clone();
 
-        history.revert_last_decision(&mut formula.assignment);
+        formula.revert_last_decision(history);
 
         if !last_decision.is_negated() {
             let flipped = last_decision.negated();
-            history.add_decision(&flipped);
-            formula.assignment.assign(flipped.get_index().abs() as usize, !flipped.is_negated());
+            formula.add_decision(&flipped, history);
             return true;
         }
     }
@@ -39,10 +40,13 @@ pub fn solve_dpll(py: Python<'_>, formula: &mut Formula) -> PyResult<Option<Vec<
     let mut history = History::new();
     let mut steps = 0;
     loop {
-
         signal_checker(py, &mut steps)?;
-        
+
+        let propagation_start = Instant::now();
         propagate(formula, &mut history);
+        formula
+            .stats
+            .record_propagation_time(propagation_start.elapsed());
 
         if formula.is_satisfied() {
             return Ok(Some(formula.get_model()));
@@ -62,7 +66,6 @@ pub fn solve_dpll(py: Python<'_>, formula: &mut Formula) -> PyResult<Option<Vec<
 
         let decision = Literal::new(lit.get_index().abs());
 
-        history.add_decision(&decision);
-        formula.assignment.assign(decision.get_index().abs() as usize, true);
+        formula.add_decision(&decision, &mut history);
     }
 }

@@ -1,12 +1,16 @@
 use super::literal::Literal;
 use crate::formula::Assignment;
 use crate::two_watched::Watched;
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Clone)]
 pub struct Clause {
     literals: Vec<Literal>,
     pub watched: Watched,
+    pub lbd: i64,
+    pub lock_count: usize,
+    pub bva_generated: bool,
 }
 
 impl<'a> IntoIterator for &'a Clause {
@@ -47,6 +51,9 @@ impl Clause {
         Self {
             literals: vec![],
             watched: Watched::None,
+            lbd: -1,
+            lock_count: 0,
+            bva_generated: false,
         }
     }
 
@@ -58,13 +65,19 @@ impl Clause {
         }
     }
 
-    pub fn from_literals(literals: &Vec<Literal>) -> Self {
-        Self::from_lits(literals.clone())
+    pub fn from_literals(literals: Vec<Literal>, lbd: i64) -> Self {
+        let watched = Self::watched_for_len(literals.len());
+        Self {
+            literals,
+            watched,
+            lbd,
+            lock_count: 0,
+            bva_generated: false,
+        }
     }
 
-    pub fn from_lits(literals: Vec<Literal>) -> Self {
-        let watched = Self::watched_for_len(literals.len());
-        Self { literals, watched }
+    pub fn calculate_lbd(levels: impl IntoIterator<Item = usize>) -> i64 {
+        levels.into_iter().collect::<HashSet<_>>().len() as i64
     }
 
     pub fn len(&self) -> usize {
@@ -126,6 +139,78 @@ impl Clause {
         &self.literals
     }
 
+    pub fn sorted_literal_indices(&self) -> Vec<i32> {
+        let mut literals = self
+            .literals
+            .iter()
+            .map(|lit| lit.get_index())
+            .collect::<Vec<_>>();
+        literals.sort_unstable();
+        literals
+    }
+
+    pub fn watched_literals(&self) -> Option<(&Literal, Option<&Literal>)> {
+        match self.watched {
+            Watched::None => None,
+            Watched::One(i) => Some((&self.literals[i], None)),
+            Watched::Two(i, j) => Some((&self.literals[i], Some(&self.literals[j]))),
+        }
+    }
+
+    pub fn is_subset_of(&self, other: &Clause) -> bool {
+        let subsumer = self.sorted_literal_indices();
+        let candidate = other.sorted_literal_indices();
+        let mut i = 0;
+        let mut j = 0;
+
+        while i < subsumer.len() && j < candidate.len() {
+            match subsumer[i].cmp(&candidate[j]) {
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Less => return false,
+            }
+        }
+
+        i == subsumer.len()
+    }
+
+    pub fn resolve_on(&self, other: &Clause, var: i32) -> Option<Clause> {
+        let mut literals = Vec::new();
+        let mut seen = HashSet::new();
+
+        for lit in &self.literals {
+            let idx = lit.get_index();
+            if idx == var {
+                continue;
+            }
+            if seen.contains(&-idx) {
+                return None;
+            }
+            if seen.insert(idx) {
+                literals.push(Literal::new(idx));
+            }
+        }
+
+        for lit in &other.literals {
+            let idx = lit.get_index();
+            if idx == -var {
+                continue;
+            }
+            if seen.contains(&-idx) {
+                return None;
+            }
+            if seen.insert(idx) {
+                literals.push(Literal::new(idx));
+            }
+        }
+
+        literals.sort_unstable_by_key(|lit| lit.get_index());
+        Some(Clause::from_literals(literals, -1))
+    }
+
     /// Returns a vector of the unassigned literals of this clause, if there are no unassigned literals returns an empty vector.
     pub fn get_unassigned_literals(&self, assignment: &Assignment) -> Vec<&Literal> {
         self.literals
@@ -160,7 +245,7 @@ impl Clause {
 
     pub fn negate(&self) -> Self {
         let negated_literals = self.literals.iter().map(|lit| lit.negated()).collect();
-        Self::from_lits(negated_literals)
+        Self::from_literals(negated_literals, self.lbd)
     }
 
     pub fn get_unit_literal(&self, assignment: &Assignment) -> Option<&Literal> {
