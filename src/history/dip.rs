@@ -567,6 +567,21 @@ fn choose_best_lbd_dip(
                 return None;
             }
 
+            let lbd_distance = (pre_lbd - post_lbd).abs();
+            // let pair_lbd = Clause::calculate_lbd([
+            //     history.get_literal_and_level(&a)?.1,
+            //     history.get_literal_and_level(&b)?.1,
+            // ]);
+            // println!(
+            //     "dip pair ({}, {}) pair_lbd: {} lbd distance: {} (pre_lbd={}, post_lbd={})",
+            //     a, b, pair_lbd, lbd_distance, pre_lbd, post_lbd
+            // );
+
+            if lbd_distance > 1 || pre_lbd > 3 || post_lbd > 3 {
+                // println!("Skipping");
+                return None;
+            }
+
             let worst_lbd = std::cmp::max(pre_lbd, post_lbd);
             let total_lbd = pre_lbd + post_lbd;
             Some((
