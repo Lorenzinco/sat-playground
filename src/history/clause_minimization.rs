@@ -11,7 +11,7 @@ impl History {
     pub fn clause_levels(&self, literals: &[Literal]) -> (usize, i64) {
         let levels = literals
             .iter()
-            .filter_map(|lit| self.get_literal_and_level(lit).map(|(_, level)| level))
+            .filter_map(|lit| self.get_literal_level(lit))
             .collect::<Vec<_>>();
 
         (
@@ -42,7 +42,7 @@ impl History {
 
         for lit in learned_lits.iter().skip(1) {
             let var = lit.get_index().abs() as usize;
-            let (_, level) = self.get_literal_and_level(lit).unwrap_or((lit.clone(), 0));
+            let level = self.get_literal_level(lit).unwrap_or(0);
 
             if level == 0 {
                 continue;
@@ -65,7 +65,7 @@ impl History {
                 }
 
                 let current = Literal::new(current_idx);
-                let (_, c_level) = self.get_literal_and_level(&current).unwrap_or((current, 0));
+                let c_level = self.get_literal_level(&current).unwrap_or(0);
                 if c_level == 0 {
                     continue;
                 }

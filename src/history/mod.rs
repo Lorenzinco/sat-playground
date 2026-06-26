@@ -152,13 +152,8 @@ impl History {
     }
 
     pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
-        self.get_literal_and_level(lit).map(|(_, level)| level)
-    }
-
-    pub fn get_literal_and_level(&self, lit: &Literal) -> Option<(Literal, usize)> {
         self.implication_levels_indexes
             .get_level(lit)
-            .map(|level| (lit.clone(), level))
     }
 
     pub fn last_decision_literal(&self) -> Option<&Literal> {

@@ -43,9 +43,9 @@ pub fn find_1uip(
                 let var = lit.get_index().unsigned_abs() as usize;
                 if !seen.test(var) {
                     seen.set(var);
-                    let (_, level) = history
-                        .get_literal_and_level(lit)
-                        .unwrap_or((lit.clone(), 0));
+                    let level = history
+                        .get_literal_level(lit)
+                        .unwrap_or(0);
                     if level == current_level {
                         path_count += 1;
                     } else {

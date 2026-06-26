@@ -100,9 +100,9 @@ fn build_dip_slice(
     let first_uip = clause
         .iter()
         .find(|lit| {
-            let (_, level) = history
-                .get_literal_and_level(lit)
-                .unwrap_or(((*lit).clone(), 0));
+            let level = history
+                .get_literal_level(lit)
+                .unwrap_or(0);
             level == current_level
         })
         .map(|lit| lit.negated())?;
@@ -332,8 +332,7 @@ fn collect_external_preds(
 
     let emitted_level = |pred: &Literal| {
         history
-            .get_literal_and_level(pred)
-            .map(|(_, level)| level)
+            .get_literal_level(pred)
             .filter(|&level| {
                 !is_internal_current_level_pred(pred)
                     && (include_current_level_external_preds || level < current_level)
@@ -567,17 +566,7 @@ fn choose_best_lbd_dip(
                 return None;
             }
 
-            let lbd_distance = (pre_lbd - post_lbd).abs();
-            // let pair_lbd = Clause::calculate_lbd([
-            //     history.get_literal_and_level(&a)?.1,
-            //     history.get_literal_and_level(&b)?.1,
-            // ]);
-            // println!(
-            //     "dip pair ({}, {}) pair_lbd: {} lbd distance: {} (pre_lbd={}, post_lbd={})",
-            //     a, b, pair_lbd, lbd_distance, pre_lbd, post_lbd
-            // );
-
-            if lbd_distance > 1 || pre_lbd > 3 || post_lbd > 3 {
+            if pre_lbd > 2 || post_lbd > 2 {
                 // println!("Skipping");
                 return None;
             }
