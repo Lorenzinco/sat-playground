@@ -1,174 +1,348 @@
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
-use crate::history::ConflictLearnResult;
-use crate::history::History;
-use crate::history::uip::find_1uip;
+use crate::history::conflict_analysis::{ConflictAnalysis, analyze_conflict_graph};
+use crate::history::uip;
+use crate::history::{ConflictLearnResult, History};
 
-use std::collections::VecDeque;
-use std::time::Duration;
+use std::collections::HashSet;
 
-struct DipGraph {
-    trail: Vec<Literal>,
-    source_pos: usize,
-    successors: Vec<Vec<usize>>,
-    present: Vec<bool>,
-    reason_of: Vec<Option<usize>>,
-    pos_of: Vec<Option<usize>>,
+const DIP_MAX_CLAUSE_LBD: i64 = 2;
+
+struct DipCandidate {
+    dip_a: Literal,
+    dip_b: Literal,
+    pre_clause_without_z: Vec<Literal>,
+    post_clause_without_z: Vec<Literal>,
+    pre_lbd: i64,
+    post_lbd: i64,
+    l_c: usize,
+    l_d: usize,
 }
 
-fn current_level_context(
+pub fn find_dip(
     history: &History,
     formula: &Formula,
-) -> (Vec<Literal>, Vec<Option<usize>>, Vec<Option<usize>>) {
-    let level = &history.decision_levels[history.get_decision_level()];
-
-    let mut trail = Vec::new();
-    let mut pos_of = vec![None; formula.assignment.len() * 2];
-    let mut reason_of = Vec::new();
-
-    if let Some(decision) = level.get_decision_literal() {
-        pos_of[decision.get_unsigned_index() as usize] = Some(trail.len());
-        trail.push(decision.clone());
-        reason_of.push(None);
-    }
-
-    for lit in level.implied_literals_iter() {
-        pos_of[lit.get_unsigned_index() as usize] = Some(trail.len());
-        trail.push(lit.clone());
-        reason_of.push(level.get_reason(lit));
-    }
-
-    (trail, pos_of, reason_of)
-}
-
-fn for_each_current_level_predecessor(
-    node_idx: usize,
-    trail: &[Literal],
-    source_pos: usize,
-    reason_of: &[Option<usize>],
-    pos_of: &[Option<usize>],
-    formula: &Formula,
-    conflict_clause_idx: usize,
-    mut visit: impl FnMut(usize),
-) {
-    let conflict_idx = trail.len();
-
-    let clause_lits = if node_idx == conflict_idx {
-        formula.get_clauses()[conflict_clause_idx].get_literals()
-    } else {
-        if node_idx == source_pos {
-            return;
-        }
-        let Some(reason_idx) = reason_of.get(node_idx).copied().flatten() else {
-            return;
-        };
-        formula.get_clauses()[reason_idx].get_literals()
+    conflict_clause_index: usize,
+) -> ConflictLearnResult {
+    let Some(analysis) = analyze_conflict_graph(history, formula, conflict_clause_index) else {
+        return uip::empty_result();
     };
 
-    let current_lit = (node_idx != conflict_idx).then(|| &trail[node_idx]);
-    for lit in clause_lits {
-        if current_lit.is_some_and(|current| lit == current) {
+    learn_from_analysis(&analysis, history, formula, conflict_clause_index)
+        .unwrap_or_else(|| uip::learn_from_analysis(&analysis, history, formula))
+}
+
+pub(super) fn learn_from_analysis(
+    analysis: &ConflictAnalysis,
+    history: &History,
+    formula: &Formula,
+    conflict_clause_index: usize,
+) -> Option<ConflictLearnResult> {
+    let candidate = find_first_dip_candidate(analysis, history, formula, conflict_clause_index)?;
+    Some(ConflictLearnResult::Dip {
+        dip_a: candidate.dip_a,
+        dip_b: candidate.dip_b,
+        pre_clause_without_z: candidate.pre_clause_without_z,
+        post_clause_without_z: candidate.post_clause_without_z,
+        pre_lbd: candidate.pre_lbd,
+        post_lbd: candidate.post_lbd,
+        backtrack_level: std::cmp::max(candidate.l_c, candidate.l_d),
+    })
+}
+
+fn find_first_dip_candidate(
+    analysis: &ConflictAnalysis,
+    history: &History,
+    formula: &Formula,
+    conflict_clause_idx: usize,
+) -> Option<DipCandidate> {
+    let conflict_idx = analysis.trail.len();
+    let rev = reverse_adj(&analysis.successors);
+    let can_reach_conflict = reachable(&rev, conflict_idx, &analysis.present);
+
+    let mut sources = Vec::new();
+    for pos in 0..analysis.trail.len() {
+        if !analysis.present[pos] || !can_reach_conflict[pos] {
             continue;
         }
 
-        let pred = lit.negated();
-        if let Some(pred_idx) = pos_of
-            .get(pred.get_unsigned_index() as usize)
-            .copied()
-            .flatten()
-        {
-            visit(pred_idx);
+        let indeg = rev[pos]
+            .iter()
+            .filter(|&&p| analysis.present[p] && can_reach_conflict[p])
+            .count();
+        if indeg == 0 {
+            sources.push(pos);
         }
     }
+
+    if sources.len() != 1 || sources[0] != analysis.first_uip_pos {
+        return None;
+    }
+
+    let reachable_from_uip = reachable(
+        &analysis.successors,
+        analysis.first_uip_pos,
+        &analysis.present,
+    );
+    let relevant: Vec<bool> = (0..=conflict_idx)
+        .map(|idx| analysis.present[idx] && reachable_from_uip[idx] && can_reach_conflict[idx])
+        .collect();
+
+    let nodes: Vec<usize> = (0..analysis.trail.len())
+        .filter(|&pos| pos != analysis.first_uip_pos && relevant[pos])
+        .collect();
+
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            let a_pos = nodes[i];
+            let b_pos = nodes[j];
+
+            if exists_path_avoiding_pair(
+                &analysis.successors,
+                &relevant,
+                analysis.first_uip_pos,
+                conflict_idx,
+                a_pos,
+                b_pos,
+            ) {
+                continue;
+            }
+
+            if let Some(candidate) = find_capped_clauses_from_dip_pair(
+                analysis,
+                history,
+                formula,
+                conflict_clause_idx,
+                a_pos,
+                b_pos,
+            ) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
-fn build_dip_slice(
+fn find_capped_clauses_from_dip_pair(
+    analysis: &ConflictAnalysis,
     history: &History,
     formula: &Formula,
     conflict_clause_idx: usize,
-) -> Option<DipGraph> {
-    let current_level = history.get_decision_level();
-    if current_level == 0 {
+    dip_a_pos: usize,
+    dip_b_pos: usize,
+) -> Option<DipCandidate> {
+    if dip_a_pos == dip_b_pos
+        || dip_a_pos == analysis.first_uip_pos
+        || dip_b_pos == analysis.first_uip_pos
+    {
         return None;
     }
 
-    let ConflictLearnResult::Uip { clause, .. } = find_1uip(history, formula, conflict_clause_idx)
-    else {
-        return None;
-    };
-    let first_uip = clause
-        .iter()
-        .find(|lit| {
-            let level = history
-                .get_literal_level(lit)
-                .unwrap_or(0);
-            level == current_level
-        })
-        .map(|lit| lit.negated())?;
+    let conflict_idx = analysis.trail.len();
+    let mut pre_region =
+        forward_region(analysis, [analysis.first_uip_pos], &[dip_a_pos, dip_b_pos]);
+    pre_region[dip_a_pos] = true;
+    pre_region[dip_b_pos] = true;
 
-    let (trail, pos_of, reason_of) = current_level_context(history, formula);
-    let source_pos = pos_of
-        .get(first_uip.get_unsigned_index() as usize)
-        .copied()
-        .flatten()?;
-
-    let conflict_idx = trail.len();
-    let mut succ = vec![Vec::new(); conflict_idx + 1];
-    let mut present = vec![false; conflict_idx + 1];
-    let mut queue = VecDeque::new();
-
-    present[conflict_idx] = true;
-    queue.push_back(conflict_idx);
-
-    while let Some(node_idx) = queue.pop_front() {
-        for_each_current_level_predecessor(
-            node_idx,
-            &trail,
-            source_pos,
-            &reason_of,
-            &pos_of,
-            formula,
-            conflict_clause_idx,
-            |pred_idx| {
-                succ[pred_idx].push(node_idx);
-                if !present[pred_idx] {
-                    present[pred_idx] = true;
-                    queue.push_back(pred_idx);
-                }
-            },
-        );
-    }
-
-    if !present[source_pos] {
+    let post_region = forward_region(
+        analysis,
+        analysis.successors[dip_a_pos]
+            .iter()
+            .chain(analysis.successors[dip_b_pos].iter())
+            .copied(),
+        &[],
+    );
+    if !post_region[conflict_idx] {
         return None;
     }
 
-    Some(DipGraph {
-        trail,
-        source_pos,
-        successors: succ,
-        present,
-        reason_of,
-        pos_of,
+    let covered_none = vec![false; conflict_idx + 1];
+    let (pre_lits, pre_levels) = collect_external_preds_capped(
+        &pre_region,
+        &covered_none,
+        true,
+        Some(analysis.trail[analysis.first_uip_pos].negated()),
+        Some(analysis.current_level),
+        analysis,
+        history,
+        formula,
+        conflict_clause_idx,
+    )?;
+
+    let mut post_covered = vec![false; conflict_idx + 1];
+    post_covered[dip_a_pos] = true;
+    post_covered[dip_b_pos] = true;
+    let (post_lits, post_levels) = collect_external_preds_capped(
+        &post_region,
+        &post_covered,
+        false,
+        None,
+        Some(analysis.current_level),
+        analysis,
+        history,
+        formula,
+        conflict_clause_idx,
+    )?;
+
+    if post_lits.is_empty() {
+        return None;
+    }
+
+    let pre_lbd = Clause::calculate_lbd(pre_levels.iter().copied());
+    let post_lbd = Clause::calculate_lbd(post_levels.iter().copied());
+    if pre_lbd > DIP_MAX_CLAUSE_LBD || post_lbd > DIP_MAX_CLAUSE_LBD {
+        return None;
+    }
+
+    Some(DipCandidate {
+        dip_a: analysis.trail[dip_a_pos].clone(),
+        dip_b: analysis.trail[dip_b_pos].clone(),
+        pre_clause_without_z: pre_lits,
+        post_clause_without_z: post_lits,
+        pre_lbd,
+        post_lbd,
+        l_c: highest_non_current_level(&pre_levels, analysis.current_level),
+        l_d: highest_non_current_level(&post_levels, analysis.current_level),
     })
+}
+
+fn collect_external_preds_capped(
+    region: &[bool],
+    covered: &[bool],
+    include_current_level_external_preds: bool,
+    initial_literal: Option<Literal>,
+    initial_level: Option<usize>,
+    analysis: &ConflictAnalysis,
+    history: &History,
+    formula: &Formula,
+    conflict_clause_idx: usize,
+) -> Option<(Vec<Literal>, Vec<usize>)> {
+    let conflict_idx = analysis.trail.len();
+    let mut lbd_levels = HashSet::new();
+    let mut levels = Vec::new();
+    let mut literals = Vec::new();
+
+    if let Some(level) = initial_level {
+        lbd_levels.insert(level);
+        levels.push(level);
+    }
+    if let Some(lit) = initial_literal {
+        literals.push(lit);
+    }
+
+    let is_internal_current_level_pred = |pred: &Literal| {
+        analysis
+            .pos_of
+            .get(pred.get_unsigned_index() as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|pos| {
+                region.get(pos).copied().unwrap_or(false)
+                    || covered.get(pos).copied().unwrap_or(false)
+            })
+    };
+
+    let emitted_level = |pred: &Literal| {
+        history.get_literal_level(pred).filter(|&level| {
+            !is_internal_current_level_pred(pred)
+                && (include_current_level_external_preds || level < analysis.current_level)
+        })
+    };
+
+    let mut seen = vec![false; analysis.pos_of.len()];
+    for idx in 0..region.len() {
+        if !region[idx] {
+            continue;
+        }
+
+        let mut visit_pred = |pred: Literal| -> Option<()> {
+            let key = pred.get_unsigned_index() as usize;
+            if key >= seen.len() || seen[key] {
+                return Some(());
+            }
+
+            if let Some(level) = emitted_level(&pred) {
+                seen[key] = true;
+                lbd_levels.insert(level);
+                if lbd_levels.len() as i64 > DIP_MAX_CLAUSE_LBD {
+                    return None;
+                }
+                literals.push(pred.negated());
+                levels.push(level);
+            }
+
+            Some(())
+        };
+
+        if idx == conflict_idx {
+            for conflict_lit in formula.get_clauses()[conflict_clause_idx].get_literals() {
+                visit_pred(conflict_lit.negated())?;
+            }
+            continue;
+        }
+
+        let Some(reason_idx) = analysis.reason_of[idx] else {
+            continue;
+        };
+
+        let lit = &analysis.trail[idx];
+        for reason_lit in formula.get_clauses()[reason_idx].get_literals() {
+            if reason_lit == lit {
+                continue;
+            }
+            visit_pred(reason_lit.negated())?;
+        }
+    }
+
+    Some((literals, levels))
+}
+
+fn forward_region(
+    analysis: &ConflictAnalysis,
+    seeds: impl IntoIterator<Item = usize>,
+    stop_at: &[usize],
+) -> Vec<bool> {
+    let mut region = vec![false; analysis.trail.len() + 1];
+    let mut queue = std::collections::VecDeque::new();
+
+    for seed in seeds {
+        if !region[seed] {
+            region[seed] = true;
+            queue.push_back(seed);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        if stop_at.contains(&idx) {
+            continue;
+        }
+
+        for &succ in &analysis.successors[idx] {
+            if !region[succ] {
+                region[succ] = true;
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    region
 }
 
 fn reverse_adj(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut rev = vec![Vec::new(); adj.len()];
-
     for (u, succs) in adj.iter().enumerate() {
         for &v in succs {
             rev[v].push(u);
         }
     }
-
     rev
 }
 
 fn reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
     let mut seen = vec![false; adj.len()];
-    let mut queue = VecDeque::new();
+    let mut queue = std::collections::VecDeque::new();
 
     if start < adj.len() && present[start] {
         seen[start] = true;
@@ -187,59 +361,6 @@ fn reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
     seen
 }
 
-fn find_all_two_vertex_bottlenecks(slice: &DipGraph) -> Option<Vec<(usize, usize)>> {
-    let conflict_idx = slice.trail.len();
-    let rev = reverse_adj(&slice.successors);
-    let can_reach_t = reachable(&rev, conflict_idx, &slice.present);
-
-    let mut source_candidates = Vec::new();
-    for pos in 0..slice.trail.len() {
-        if !slice.present[pos] || !can_reach_t[pos] {
-            continue;
-        }
-
-        let indeg = rev[pos]
-            .iter()
-            .filter(|&&p| slice.present[p] && can_reach_t[p])
-            .count();
-
-        if indeg == 0 {
-            source_candidates.push(pos);
-        }
-    }
-
-    if source_candidates.len() != 1 || source_candidates[0] != slice.source_pos {
-        return None;
-    }
-
-    let reachable_from_s = reachable(&slice.successors, slice.source_pos, &slice.present);
-    let relevant: Vec<bool> = (0..=conflict_idx)
-        .map(|idx| slice.present[idx] && reachable_from_s[idx] && can_reach_t[idx])
-        .collect();
-
-    let candidates: Vec<usize> = (0..slice.trail.len())
-        .filter(|&pos| pos != slice.source_pos && relevant[pos])
-        .collect();
-
-    let mut out = Vec::new();
-    for i in 0..candidates.len() {
-        for j in (i + 1)..candidates.len() {
-            if !exists_path_avoiding_pair(
-                &slice.successors,
-                &relevant,
-                slice.source_pos,
-                conflict_idx,
-                candidates[i],
-                candidates[j],
-            ) {
-                out.push((candidates[i], candidates[j]));
-            }
-        }
-    }
-
-    Some(out)
-}
-
 fn exists_path_avoiding_pair(
     adj: &[Vec<usize>],
     relevant: &[bool],
@@ -253,8 +374,7 @@ fn exists_path_avoiding_pair(
     }
 
     let mut seen = vec![false; adj.len()];
-    let mut queue = VecDeque::new();
-
+    let mut queue = std::collections::VecDeque::new();
     seen[s] = true;
     queue.push_back(s);
 
@@ -275,253 +395,6 @@ fn exists_path_avoiding_pair(
     false
 }
 
-fn forward_region(
-    slice: &DipGraph,
-    seeds: impl IntoIterator<Item = usize>,
-    stop_at: &[usize],
-) -> Vec<bool> {
-    let mut region = vec![false; slice.trail.len() + 1];
-    let mut queue = VecDeque::new();
-
-    for seed in seeds {
-        if !region[seed] {
-            region[seed] = true;
-            queue.push_back(seed);
-        }
-    }
-
-    while let Some(idx) = queue.pop_front() {
-        if stop_at.contains(&idx) {
-            continue;
-        }
-
-        for &succ in &slice.successors[idx] {
-            if !region[succ] {
-                region[succ] = true;
-                queue.push_back(succ);
-            }
-        }
-    }
-
-    region
-}
-
-fn collect_external_preds(
-    region: &[bool],
-    covered: &[bool],
-    include_current_level_external_preds: bool,
-    slice: &DipGraph,
-    history: &History,
-    formula: &Formula,
-    conflict_clause_idx: usize,
-) -> Vec<(Literal, usize)> {
-    let current_level = history.get_decision_level();
-    let conflict_idx = slice.trail.len();
-
-    let is_internal_current_level_pred = |pred: &Literal| {
-        slice
-            .pos_of
-            .get(pred.get_unsigned_index() as usize)
-            .copied()
-            .flatten()
-            .is_some_and(|pos| {
-                region.get(pos).copied().unwrap_or(false)
-                    || covered.get(pos).copied().unwrap_or(false)
-            })
-    };
-
-    let emitted_level = |pred: &Literal| {
-        history
-            .get_literal_level(pred)
-            .filter(|&level| {
-                !is_internal_current_level_pred(pred)
-                    && (include_current_level_external_preds || level < current_level)
-            })
-    };
-
-    let mut seen = vec![false; slice.pos_of.len()];
-    let mut out = Vec::new();
-
-    for idx in 0..region.len() {
-        if !region[idx] {
-            continue;
-        }
-
-        if idx == conflict_idx {
-            let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
-            for conflict_lit in conflict_clause.get_literals() {
-                let pred = conflict_lit.negated();
-                let key = pred.get_unsigned_index() as usize;
-                if key < seen.len() && !seen[key] {
-                    if let Some(level) = emitted_level(&pred) {
-                        seen[key] = true;
-                        out.push((pred, level));
-                    }
-                }
-            }
-            continue;
-        }
-
-        let Some(reason_idx) = slice.reason_of[idx] else {
-            continue;
-        };
-
-        let lit = &slice.trail[idx];
-        let reason = &formula.get_clauses()[reason_idx];
-        for reason_lit in reason.get_literals() {
-            if reason_lit == lit {
-                continue;
-            }
-
-            let pred = reason_lit.negated();
-            let key = pred.get_unsigned_index() as usize;
-            if key < seen.len() && !seen[key] {
-                if let Some(level) = emitted_level(&pred) {
-                    seen[key] = true;
-                    out.push((pred, level));
-                }
-            }
-        }
-    }
-
-    out
-}
-
-fn find_clauses_from_dip_pair(
-    slice: &DipGraph,
-    history: &History,
-    formula: &Formula,
-    conflict_clause_idx: usize,
-    dip_a: &Literal,
-    dip_b: &Literal,
-) -> Option<(Vec<Literal>, Vec<Literal>, i64, i64, usize, usize)> {
-    if dip_a == dip_b {
-        return None;
-    }
-
-    let dip_a_pos = slice
-        .pos_of
-        .get(dip_a.get_unsigned_index() as usize)
-        .copied()
-        .flatten()?;
-    let dip_b_pos = slice
-        .pos_of
-        .get(dip_b.get_unsigned_index() as usize)
-        .copied()
-        .flatten()?;
-    let first_uip_pos = slice.source_pos;
-    let conflict_idx = slice.trail.len();
-
-    if dip_a_pos == first_uip_pos || dip_b_pos == first_uip_pos {
-        return None;
-    }
-
-    let mut pre_region = forward_region(slice, [first_uip_pos], &[dip_a_pos, dip_b_pos]);
-    pre_region[dip_a_pos] = true;
-    pre_region[dip_b_pos] = true;
-
-    let post_region = forward_region(
-        slice,
-        slice.successors[dip_a_pos]
-            .iter()
-            .chain(slice.successors[dip_b_pos].iter())
-            .copied(),
-        &[],
-    );
-
-    if !post_region[conflict_idx] {
-        return None;
-    }
-
-    let covered_none = vec![false; conflict_idx + 1];
-    let mut pre_lits = vec![slice.trail[first_uip_pos].negated()];
-    let mut pre_levels = vec![history.get_decision_level()];
-    for (lit, level) in collect_external_preds(
-        &pre_region,
-        &covered_none,
-        true,
-        slice,
-        history,
-        formula,
-        conflict_clause_idx,
-    ) {
-        pre_lits.push(lit.negated());
-        pre_levels.push(level);
-    }
-
-    let mut post_covered = vec![false; conflict_idx + 1];
-    post_covered[dip_a_pos] = true;
-    post_covered[dip_b_pos] = true;
-
-    let mut post_lits = Vec::new();
-    let mut post_levels = vec![history.get_decision_level()];
-    for (lit, level) in collect_external_preds(
-        &post_region,
-        &post_covered,
-        false,
-        slice,
-        history,
-        formula,
-        conflict_clause_idx,
-    ) {
-        post_lits.push(lit.negated());
-        post_levels.push(level);
-    }
-
-    let l_c = highest_non_current_level(&pre_levels, history.get_decision_level());
-    let l_d = highest_non_current_level(&post_levels, history.get_decision_level());
-    let pre_lbd = Clause::calculate_lbd(pre_levels);
-    let post_lbd = Clause::calculate_lbd(post_levels);
-
-    Some((pre_lits, post_lits, pre_lbd, post_lbd, l_c, l_d))
-}
-
-pub fn find_dip(
-    history: &History,
-    formula: &Formula,
-    conflict_clause_index: usize,
-) -> ConflictLearnResult {
-    let current_level = history.get_decision_level();
-    if current_level == 0 {
-        return ConflictLearnResult::Uip {
-            clause: Clause::new(),
-            backtrack_level: 0,
-            minimized_literals: 0,
-            minimization_time: Duration::ZERO,
-        };
-    }
-
-    let Some(slice) = build_dip_slice(history, formula, conflict_clause_index) else {
-        return fallback_uip(history, formula, conflict_clause_index);
-    };
-
-    let Some(dips) = find_all_two_vertex_bottlenecks(&slice) else {
-        return fallback_uip(history, formula, conflict_clause_index);
-    };
-
-    if dips.is_empty() {
-        return fallback_uip(history, formula, conflict_clause_index);
-    }
-
-    let Some((a, b, pre_lits, post_lits, pre_lbd, post_lbd, l_c, l_d)) =
-        choose_best_lbd_dip(&dips, &slice, history, formula, conflict_clause_index)
-    else {
-        return fallback_uip(history, formula, conflict_clause_index);
-    };
-
-    let backtrack_level = std::cmp::max(l_c, l_d);
-
-    ConflictLearnResult::Dip {
-        dip_a: a,
-        dip_b: b,
-        pre_clause_without_z: pre_lits,
-        post_clause_without_z: post_lits,
-        pre_lbd,
-        post_lbd,
-        backtrack_level,
-    }
-}
-
 fn highest_non_current_level(levels: &[usize], current_level: usize) -> usize {
     levels
         .iter()
@@ -529,68 +402,6 @@ fn highest_non_current_level(levels: &[usize], current_level: usize) -> usize {
         .filter(|&level| level < current_level)
         .max()
         .unwrap_or(0)
-}
-
-fn fallback_uip(
-    history: &History,
-    formula: &Formula,
-    conflict_clause_index: usize,
-) -> ConflictLearnResult {
-    find_1uip(history, formula, conflict_clause_index)
-}
-
-fn choose_best_lbd_dip(
-    dips: &[(usize, usize)],
-    slice: &DipGraph,
-    history: &History,
-    formula: &Formula,
-    conflict_clause_idx: usize,
-) -> Option<(
-    Literal,
-    Literal,
-    Vec<Literal>,
-    Vec<Literal>,
-    i64,
-    i64,
-    usize,
-    usize,
-)> {
-    dips.iter()
-        .filter_map(|&(a_pos, b_pos)| {
-            let a = slice.trail[a_pos].clone();
-            let b = slice.trail[b_pos].clone();
-            let (pre_lits, post_lits, pre_lbd, post_lbd, l_c, l_d) =
-                find_clauses_from_dip_pair(slice, history, formula, conflict_clause_idx, &a, &b)?;
-
-            if post_lits.is_empty() || a.get_index() == b.get_index() {
-                return None;
-            }
-
-            if pre_lbd > 2 || post_lbd > 2 {
-                // println!("Skipping");
-                return None;
-            }
-
-            let worst_lbd = std::cmp::max(pre_lbd, post_lbd);
-            let total_lbd = pre_lbd + post_lbd;
-            Some((
-                (worst_lbd, total_lbd, pre_lbd, post_lbd),
-                a,
-                b,
-                pre_lits,
-                post_lits,
-                pre_lbd,
-                post_lbd,
-                l_c,
-                l_d,
-            ))
-        })
-        .min_by_key(|(score, ..)| *score)
-        .map(
-            |(_, a, b, pre_lits, post_lits, pre_lbd, post_lbd, l_c, l_d)| {
-                (a, b, pre_lits, post_lits, pre_lbd, post_lbd, l_c, l_d)
-            },
-        )
 }
 
 #[cfg(test)]
@@ -733,7 +544,7 @@ mod tests {
         assert_unique_literals(&pre_clause_without_z);
         assert_unique_literals(&post_clause_without_z);
 
-        // The LBD-based policy chooses the earliest pair with the best pre/post LBD score.
+        // The DIP search stops at the first pair that satisfies the pre/post LBD cap.
         assert_eq!(unordered_pair(&dip_a, &dip_b), unordered_pair(&a, &b));
 
         // Pre-clause should contain ¬x2, ¬p, ¬q only.

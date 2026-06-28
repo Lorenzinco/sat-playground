@@ -19,8 +19,8 @@ def parse_dimacs(filename):
 
 
 def main():
-    clauses = parse_dimacs("tests/unsat/2bitadd_10.cnf")
-    # clauses = parse_dimacs("input.dimacs")
+    # clauses = parse_dimacs("tests/unsat/2bitadd_10.cnf")
+    clauses = parse_dimacs("input.dimacs")
     s = clsat.Sat(clauses)
 
     print("c Solving SAT problem...", flush=True)

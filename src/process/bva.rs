@@ -266,9 +266,9 @@ fn apply_bva_candidate<W: Write>(
     }
 
     BvaStepSummary {
-        new_var: z.get_index(),
-        literals: candidate.literals.len(),
-        partials: candidate.partials.len(),
+        _new_var: z.get_index(),
+        _literals: candidate.literals.len(),
+        _partials: candidate.partials.len(),
         deleted_clauses: candidate.to_delete.len(),
         added_clauses: candidate.added_clauses,
         clause_saving: candidate.clause_saving,
@@ -377,9 +377,9 @@ impl BvaRunSummary {
 }
 
 struct BvaStepSummary {
-    new_var: i32,
-    literals: usize,
-    partials: usize,
+    _new_var: i32,
+    _literals: usize,
+    _partials: usize,
     deleted_clauses: usize,
     added_clauses: usize,
     clause_saving: isize,

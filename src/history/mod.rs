@@ -1,4 +1,5 @@
 pub mod clause_minimization;
+pub mod conflict_analysis;
 pub mod conflict_graph;
 pub mod decision_level;
 pub mod dip;
@@ -9,10 +10,9 @@ use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::history::conflict_analysis::analyze_conflict;
 use crate::history::decision_level::DecisionLevel;
-use crate::history::dip::find_dip;
 use crate::history::implication_level::ImplicationLevels;
-use crate::history::uip::find_1uip;
 
 use crate::formula::Formula;
 use crate::formula::assignment::Assignment;
@@ -152,8 +152,7 @@ impl History {
     }
 
     pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
-        self.implication_levels_indexes
-            .get_level(lit)
+        self.implication_levels_indexes.get_level(lit)
     }
 
     pub fn last_decision_literal(&self) -> Option<&Literal> {
@@ -183,10 +182,7 @@ impl History {
         conflict_clause_index: usize,
         implication_point: ImplicationPoint,
     ) -> ConflictLearnResult {
-        match implication_point {
-            ImplicationPoint::UIP => find_1uip(self, formula, conflict_clause_index),
-            ImplicationPoint::DIP => find_dip(self, formula, conflict_clause_index),
-        }
+        analyze_conflict(self, formula, conflict_clause_index, implication_point)
     }
 }
 
