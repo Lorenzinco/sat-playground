@@ -89,33 +89,23 @@ fn find_first_dip_candidate(
         .map(|idx| analysis.present[idx] && reachable_from_uip[idx] && can_reach_conflict[idx])
         .collect();
 
-    let nodes: Vec<usize> = (0..analysis.trail.len())
-        .filter(|&pos| pos != analysis.first_uip_pos && relevant[pos])
-        .collect();
+    let compressed = compressed_two_vertex_bottlenecks(
+        &analysis.successors,
+        &relevant,
+        analysis.first_uip_pos,
+        conflict_idx,
+    )?;
 
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            let a_pos = nodes[i];
-            let b_pos = nodes[j];
-
-            if exists_path_avoiding_pair(
-                &analysis.successors,
-                &relevant,
-                analysis.first_uip_pos,
-                conflict_idx,
-                a_pos,
-                b_pos,
-            ) {
-                continue;
-            }
-
+    for range in &compressed.ranges {
+        let dip_a_pos = range.left;
+        for &dip_b_pos in &compressed.candidates[range.right_path][range.start..range.end] {
             if let Some(candidate) = find_capped_clauses_from_dip_pair(
                 analysis,
                 history,
                 formula,
                 conflict_clause_idx,
-                a_pos,
-                b_pos,
+                dip_a_pos,
+                dip_b_pos,
             ) {
                 return Some(candidate);
             }
@@ -123,6 +113,336 @@ fn find_first_dip_candidate(
     }
 
     None
+}
+
+struct CompressedDipRanges {
+    candidates: [Vec<usize>; 2],
+    ranges: Vec<DipPairRange>,
+}
+
+struct DipPairRange {
+    left: usize,
+    right_path: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PathItem {
+    node: usize,
+    pos: usize,
+    reach_other_pos: usize,
+}
+
+enum DisjointPaths {
+    LessThanTwo,
+    ThreeConnected,
+    Two([Vec<usize>; 2]),
+}
+
+fn compressed_two_vertex_bottlenecks(
+    adj: &[Vec<usize>],
+    relevant: &[bool],
+    s: usize,
+    t: usize,
+) -> Option<CompressedDipRanges> {
+    let paths = match find_disjoint_paths(adj, relevant, s, t) {
+        DisjointPaths::Two(paths) => paths,
+        DisjointPaths::LessThanTwo | DisjointPaths::ThreeConnected => return None,
+    };
+
+    if paths[0].len() <= 2 || paths[1].len() <= 2 {
+        return None;
+    }
+
+    let mut path_pos = vec![[None; 2]; adj.len()];
+    for path_idx in 0..2 {
+        for (pos, &node) in paths[path_idx].iter().enumerate() {
+            path_pos[node][path_idx] = Some(pos);
+        }
+    }
+
+    let direct = directly_reachable_path_positions(adj, relevant, &path_pos, t);
+    let path_items = [
+        non_bypassed_path_items(0, &paths, &direct),
+        non_bypassed_path_items(1, &paths, &direct),
+    ];
+
+    if path_items[0].is_empty() || path_items[1].is_empty() {
+        return None;
+    }
+
+    let mut ranges = Vec::new();
+    add_ranges_from_path(&path_items, 0, &mut ranges);
+
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let candidates = [
+        path_items[0].iter().map(|item| item.node).collect(),
+        path_items[1].iter().map(|item| item.node).collect(),
+    ];
+
+    Some(CompressedDipRanges { candidates, ranges })
+}
+
+fn directly_reachable_path_positions(
+    adj: &[Vec<usize>],
+    relevant: &[bool],
+    path_pos: &[[Option<usize>; 2]],
+    t: usize,
+) -> Vec<[usize; 2]> {
+    let mut direct = vec![[0, 0]; adj.len()];
+
+    for u in (0..=t).rev() {
+        if !relevant[u] {
+            continue;
+        }
+
+        for &v in &adj[u] {
+            if v >= adj.len() || !relevant[v] {
+                continue;
+            }
+
+            let mut v_on_path = false;
+            for path_idx in 0..2 {
+                if let Some(pos) = path_pos[v][path_idx] {
+                    direct[u][path_idx] = direct[u][path_idx].max(pos);
+                    v_on_path = true;
+                }
+            }
+
+            if !v_on_path {
+                direct[u][0] = direct[u][0].max(direct[v][0]);
+                direct[u][1] = direct[u][1].max(direct[v][1]);
+            }
+        }
+    }
+
+    direct
+}
+
+fn non_bypassed_path_items(
+    path_idx: usize,
+    paths: &[Vec<usize>; 2],
+    direct: &[[usize; 2]],
+) -> Vec<PathItem> {
+    let other_path = 1 - path_idx;
+    let path = &paths[path_idx];
+    let other_internal_start = usize::from(paths[other_path].len() > 2);
+    let mut max_same_from_prior = 0;
+    let mut max_other_from_prior = other_internal_start;
+    let mut items = Vec::new();
+
+    for (pos, &node) in path.iter().enumerate() {
+        let is_internal = pos > 0 && pos + 1 < path.len();
+        if is_internal && max_same_from_prior <= pos {
+            items.push(PathItem {
+                node,
+                pos,
+                reach_other_pos: max_other_from_prior,
+            });
+        }
+
+        max_same_from_prior = max_same_from_prior.max(direct[node][path_idx]);
+        max_other_from_prior = max_other_from_prior.max(direct[node][other_path]);
+    }
+
+    items
+}
+
+fn add_ranges_from_path(
+    path_items: &[Vec<PathItem>; 2],
+    left_path: usize,
+    ranges: &mut Vec<DipPairRange>,
+) {
+    let right_path = 1 - left_path;
+    let left_items = &path_items[left_path];
+    let right_items = &path_items[right_path];
+    let mut right_limit = 0;
+
+    for item in left_items {
+        while right_limit < right_items.len()
+            && right_items[right_limit].reach_other_pos <= item.pos
+        {
+            right_limit += 1;
+        }
+
+        if right_limit == 0 {
+            continue;
+        }
+
+        let start = lower_bound_path_pos(right_items, item.reach_other_pos);
+        if start < right_limit {
+            ranges.push(DipPairRange {
+                left: item.node,
+                right_path,
+                start,
+                end: right_limit,
+            });
+        }
+    }
+}
+
+fn lower_bound_path_pos(items: &[PathItem], pos: usize) -> usize {
+    let mut lo = 0;
+    let mut hi = items.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if items[mid].pos < pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[derive(Clone)]
+struct FlowEdge {
+    to: usize,
+    rev: usize,
+    cap: i32,
+}
+
+fn add_flow_edge(graph: &mut [Vec<FlowEdge>], from: usize, to: usize, cap: i32) -> usize {
+    let forward_idx = graph[from].len();
+    let reverse_idx = graph[to].len();
+    graph[from].push(FlowEdge {
+        to,
+        rev: reverse_idx,
+        cap,
+    });
+    graph[to].push(FlowEdge {
+        to: from,
+        rev: forward_idx,
+        cap: 0,
+    });
+    forward_idx
+}
+
+fn find_disjoint_paths(adj: &[Vec<usize>], relevant: &[bool], s: usize, t: usize) -> DisjointPaths {
+    let split_len = adj.len() * 2;
+    let mut graph = vec![Vec::new(); split_len];
+    let mut original_edges = Vec::new();
+
+    for node in 0..adj.len() {
+        if !relevant[node] {
+            continue;
+        }
+        let cap = if node == s || node == t { 3 } else { 1 };
+        add_flow_edge(&mut graph, node * 2, node * 2 + 1, cap);
+    }
+
+    for u in 0..adj.len() {
+        if !relevant[u] {
+            continue;
+        }
+        for &v in &adj[u] {
+            if v < adj.len() && relevant[v] {
+                let from = u * 2 + 1;
+                let to = v * 2;
+                let edge_idx = add_flow_edge(&mut graph, from, to, 1);
+                original_edges.push((from, edge_idx, u, v));
+            }
+        }
+    }
+
+    let source = s * 2 + 1;
+    let sink = t * 2;
+    let mut flow = 0;
+    while flow < 3 && augment_one_path(&mut graph, source, sink) {
+        flow += 1;
+    }
+
+    if flow < 2 {
+        return DisjointPaths::LessThanTwo;
+    }
+    if flow >= 3 {
+        return DisjointPaths::ThreeConnected;
+    }
+
+    let mut used_adj = vec![Vec::new(); adj.len()];
+    for (from, edge_idx, u, v) in original_edges {
+        if graph[from][edge_idx].cap == 0 {
+            used_adj[u].push(v);
+        }
+    }
+
+    let Some(first) = pop_used_successor(&mut used_adj, s) else {
+        return DisjointPaths::LessThanTwo;
+    };
+    let Some(second) = pop_used_successor(&mut used_adj, s) else {
+        return DisjointPaths::LessThanTwo;
+    };
+
+    let Some(path_a) = extract_flow_path(&mut used_adj, s, first, t) else {
+        return DisjointPaths::LessThanTwo;
+    };
+    let Some(path_b) = extract_flow_path(&mut used_adj, s, second, t) else {
+        return DisjointPaths::LessThanTwo;
+    };
+
+    DisjointPaths::Two([path_a, path_b])
+}
+
+fn augment_one_path(graph: &mut [Vec<FlowEdge>], source: usize, sink: usize) -> bool {
+    let mut parent: Vec<Option<(usize, usize)>> = vec![None; graph.len()];
+    let mut queue = std::collections::VecDeque::new();
+    parent[source] = Some((source, usize::MAX));
+    queue.push_back(source);
+
+    while let Some(u) = queue.pop_front() {
+        for edge_idx in 0..graph[u].len() {
+            let edge = &graph[u][edge_idx];
+            if edge.cap <= 0 || parent[edge.to].is_some() {
+                continue;
+            }
+            parent[edge.to] = Some((u, edge_idx));
+            if edge.to == sink {
+                break;
+            }
+            queue.push_back(edge.to);
+        }
+        if parent[sink].is_some() {
+            break;
+        }
+    }
+
+    if parent[sink].is_none() {
+        return false;
+    }
+
+    let mut v = sink;
+    while v != source {
+        let (u, edge_idx) = parent[v].expect("augmenting path parent missing");
+        let rev = graph[u][edge_idx].rev;
+        graph[u][edge_idx].cap -= 1;
+        graph[v][rev].cap += 1;
+        v = u;
+    }
+
+    true
+}
+
+fn pop_used_successor(used_adj: &mut [Vec<usize>], node: usize) -> Option<usize> {
+    used_adj.get_mut(node)?.pop()
+}
+
+fn extract_flow_path(
+    used_adj: &mut [Vec<usize>],
+    s: usize,
+    first: usize,
+    t: usize,
+) -> Option<Vec<usize>> {
+    let mut path = vec![s, first];
+    let mut current = first;
+    while current != t {
+        current = pop_used_successor(used_adj, current)?;
+        path.push(current);
+    }
+    Some(path)
 }
 
 fn find_capped_clauses_from_dip_pair(
@@ -359,40 +679,6 @@ fn reachable(adj: &[Vec<usize>], start: usize, present: &[bool]) -> Vec<bool> {
     }
 
     seen
-}
-
-fn exists_path_avoiding_pair(
-    adj: &[Vec<usize>],
-    relevant: &[bool],
-    s: usize,
-    t: usize,
-    ban_a: usize,
-    ban_b: usize,
-) -> bool {
-    if s == ban_a || s == ban_b || t == ban_a || t == ban_b {
-        return false;
-    }
-
-    let mut seen = vec![false; adj.len()];
-    let mut queue = std::collections::VecDeque::new();
-    seen[s] = true;
-    queue.push_back(s);
-
-    while let Some(u) = queue.pop_front() {
-        if u == t {
-            return true;
-        }
-
-        for &v in &adj[u] {
-            if !relevant[v] || seen[v] || v == ban_a || v == ban_b {
-                continue;
-            }
-            seen[v] = true;
-            queue.push_back(v);
-        }
-    }
-
-    false
 }
 
 fn highest_non_current_level(levels: &[usize], current_level: usize) -> usize {
