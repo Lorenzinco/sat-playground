@@ -87,30 +87,15 @@ def build(size: int, seed: int) -> ReductionData:
     for vertex in range(1, vertices + 1):
         variables = incident[vertex]
         accumulator = variables[0]
-        for offset, variable in enumerate(variables[1:], start=2):
-            accumulator = plan.xor_gate(
-                accumulator,
-                variable,
-                "vertex_{}_parity".format(vertex),
-                "xor_incident_edge_{}_of_3".format(offset),
-            )
+        for variable in variables[1:]:
+            accumulator = plan.xor_gate(accumulator, variable)
         vertex_parities[vertex] = accumulator
 
     global_parity = vertex_parities[1]
     for vertex in range(2, vertices + 1):
-        global_parity = plan.xor_gate(
-            global_parity,
-            vertex_parities[vertex],
-            "global_parity",
-            "xor_vertex_equations_through_{}".format(vertex),
-        )
+        global_parity = plan.xor_gate(global_parity, vertex_parities[vertex])
 
     guidance = static_dag_guidance(num_variables, plan)
-    guidance["success"] = {
-        "literal": global_parity,
-        "forced_by_charges": 1,
-        "forced_by_edge_cancellation": 0,
-    }
 
     return ReductionData(
         problem="tseitin",

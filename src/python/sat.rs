@@ -1,5 +1,6 @@
 use crate::drat::DratLogger;
 use crate::formula::Formula;
+use crate::guidance::{GuidanceSpec, GuidanceTracker};
 use crate::heuristics::Heuristics;
 use crate::history::ImplicationPoint;
 use crate::process::Process;
@@ -33,9 +34,20 @@ impl Sat {
         inprocessing: Vec<Process>,
         heuristics: Heuristics,
         drat_path: Option<String>,
+        extension_guidance: Option<GuidanceSpec>,
+        extension_guidance_log_path: Option<String>,
     ) -> PyResult<(Option<Vec<bool>>, Stats)> {
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
+        let mut guidance = match extension_guidance {
+            Some(spec) => Some(GuidanceTracker::new(spec, extension_guidance_log_path)?),
+            None if extension_guidance_log_path.is_some() => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "extension_guidance_log_path requires extension_guidance",
+                ));
+            }
+            None => None,
+        };
         let mut logger = match drat_path {
             Some(path) => {
                 let file = File::create(path)?;
@@ -54,7 +66,17 @@ impl Sat {
             inprocessing,
             heuristics,
             &mut logger,
+            &mut guidance,
         );
+
+        if let Some(tracker) = &mut guidance {
+            formula.stats.record_guidance(&tracker.summary());
+            if let Err(error) = tracker.finish() {
+                if result.is_ok() {
+                    return Err(error.into());
+                }
+            }
+        }
 
         match result {
             Ok(Some(model)) => {

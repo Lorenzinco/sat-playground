@@ -32,7 +32,9 @@ class Sat:
         preprocess: list[Literal["bva","bve","subsumption"]], 
         inprocessing: list[Literal["bva","bve","subsumption"]],
         heuristics: Literal["vsids","random"], 
-        drat_path: str|None = None
+        drat_path: str|None = None,
+        extension_guidance: dict[str, object]|None = None,
+        extension_guidance_log_path: str|None = None,
         ) -> None:
         """Solve the SAT problem.
 
@@ -42,6 +44,8 @@ class Sat:
             preprocess: Preprocessing techniques to apply.
             heuristics: Literal selection heuristic.
             drat_path: If given, write a DRAT proof to this path.
+            extension_guidance: Optional compact guidance dictionary from Reduction.
+            extension_guidance_log_path: Optional path for one line per observed DIP.
         """
         ...
 
@@ -109,6 +113,19 @@ class Stats:
     """
     The number of auxiliary extension literals added by DIP learning.
     """
+
+    @property
+    def guidance_checks(self)->int: ...
+    @property
+    def guidance_matches(self)->int: ...
+    @property
+    def guidance_unique_matches(self)->int: ...
+    @property
+    def guidance_stages_completed(self)->int: ...
+    @property
+    def guidance_deepest_level(self)->int: ...
+    @property
+    def guidance_best_progress(self)->int: ...
 
     @property
     def bva_literals(self)->int: ...

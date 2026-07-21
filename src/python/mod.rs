@@ -1,6 +1,7 @@
 pub mod sat;
 pub mod stats;
 
+use crate::guidance::GuidanceSpec;
 use crate::heuristics::Heuristics;
 use crate::history::ImplicationPoint;
 use crate::process::Process;
@@ -64,7 +65,19 @@ impl Sat {
     }
 
     /// Returns a model that satisfies the clauses if the instance is satisfiable, otherwise returns None. The model is a list of booleans where the i-th element represents the value of the variable x_i (True for positive literals and False for negated literals).
-    #[pyo3(signature = (algorithm,implication_point, preprocess, inprocessing , heuristics, drat_path=None) ,text_signature = "algorithm, implication_point, preprocess, inprocessing, heuristics, drat_path=None")]
+    #[pyo3(
+        signature = (
+            algorithm,
+            implication_point,
+            preprocess,
+            inprocessing,
+            heuristics,
+            drat_path=None,
+            extension_guidance=None,
+            extension_guidance_log_path=None
+        ),
+        text_signature = "(algorithm, implication_point, preprocess, inprocessing, heuristics, drat_path=None, extension_guidance=None, extension_guidance_log_path=None)"
+    )]
     pub fn solve(
         &mut self,
         py: Python<'_>,
@@ -74,6 +87,8 @@ impl Sat {
         inprocessing: Vec<Process>,
         heuristics: Heuristics,
         drat_path: Option<String>,
+        extension_guidance: Option<GuidanceSpec>,
+        extension_guidance_log_path: Option<String>,
     ) -> PyResult<()> {
         let (result, stats) = self.solve_rs(
             py,
@@ -83,6 +98,8 @@ impl Sat {
             inprocessing,
             heuristics,
             drat_path,
+            extension_guidance,
+            extension_guidance_log_path,
         )?;
         self.stats = Some(stats);
         self.model = result;

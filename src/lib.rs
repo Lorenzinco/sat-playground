@@ -1,5 +1,6 @@
 pub mod drat;
 pub mod formula;
+pub mod guidance;
 pub mod heuristics;
 pub mod history;
 pub mod process;

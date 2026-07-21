@@ -1,4 +1,5 @@
 use crate::formula::clause::Clause;
+use crate::guidance::GuidanceSummary;
 use pyo3::prelude::*;
 use std::time::Duration;
 use std::time::Instant;
@@ -26,6 +27,18 @@ pub struct Stats {
     pub literals_learnt: u64,
     #[pyo3(get)]
     pub extension_literals: u64,
+    #[pyo3(get)]
+    pub guidance_checks: u64,
+    #[pyo3(get)]
+    pub guidance_matches: u64,
+    #[pyo3(get)]
+    pub guidance_unique_matches: u64,
+    #[pyo3(get)]
+    pub guidance_stages_completed: u64,
+    #[pyo3(get)]
+    pub guidance_deepest_level: u64,
+    #[pyo3(get)]
+    pub guidance_best_progress: u64,
     #[pyo3(get)]
     pub bva_literals: u64,
     #[pyo3(get)]
@@ -62,6 +75,12 @@ impl Stats {
             clauses_kept: 0,
             literals_learnt: 0,
             extension_literals: 0,
+            guidance_checks: 0,
+            guidance_matches: 0,
+            guidance_unique_matches: 0,
+            guidance_stages_completed: 0,
+            guidance_deepest_level: 0,
+            guidance_best_progress: 0,
             bva_literals: 0,
             bve_eliminated_variables: 0,
             bve_resolvents: 0,
@@ -94,6 +113,15 @@ impl Stats {
     pub fn add_bva_literal(&mut self) {
         self.literals_learnt += 1;
         self.bva_literals += 1;
+    }
+
+    pub fn record_guidance(&mut self, summary: &GuidanceSummary) {
+        self.guidance_checks = summary.checks as u64;
+        self.guidance_matches = summary.matches as u64;
+        self.guidance_unique_matches = summary.unique_matches as u64;
+        self.guidance_stages_completed = summary.stages_completed as u64;
+        self.guidance_deepest_level = summary.deepest_level as u64;
+        self.guidance_best_progress = summary.best_progress as u64;
     }
 
     pub fn add_bve_eliminated_variable(&mut self) {
@@ -264,6 +292,21 @@ impl Stats {
         let restarts_s = format!("{:>40}", self.restarts);
         let lits_s = format!("{:>40}", self.literals_learnt);
         let ext_lits_s = format!("{:>40}", self.extension_literals);
+        let guidance_hits_s = format!(
+            "{:>40}",
+            format!(
+                "{}/{} ({} unique)",
+                self.guidance_matches, self.guidance_checks, self.guidance_unique_matches
+            )
+        );
+        let guidance_stages_s = format!(
+            "{:>40}",
+            format!(
+                "{} (depth {})",
+                self.guidance_stages_completed, self.guidance_deepest_level
+            )
+        );
+        let guidance_progress_s = format!("{:>40}", self.guidance_best_progress);
         let bva_lits_s = format!("{:>40}", self.bva_literals);
         let bve_vars_s = format!("{:>40}", self.bve_eliminated_variables);
         let bve_resolvents_s = format!("{:>40}", self.bve_resolvents);
@@ -327,6 +370,9 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
+                 c | {:<27} | {} |\n\
+                 c | {:<27} | {} |\n\
+                 c | {:<27} | {} |\n\
                  c +------------------------------------------------------------------------+\n\
                  c | {:^70} |\n\
                  c +------------------------------------------------------------------------+\n\
@@ -366,6 +412,12 @@ impl Stats {
             format!("{blue}{lits_s}{reset}"),
             "Extension literals",
             format!("{blue}{ext_lits_s}{reset}"),
+            "Guidance matches/checks",
+            guidance_hits_s,
+            "Guidance stages/depth",
+            guidance_stages_s,
+            "Guidance best progress",
+            guidance_progress_s,
             "BVA literals",
             format!("{blue}{bva_lits_s}{reset}"),
             "BVE eliminated vars",

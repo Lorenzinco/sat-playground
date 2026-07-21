@@ -3,6 +3,7 @@ use crate::formula::Formula;
 use crate::formula::assignment::AssignResult;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
+use crate::guidance::GuidanceTracker;
 use crate::heuristics::Heuristics;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
@@ -28,6 +29,26 @@ pub fn solve_cdcl<'py, W: Write>(
     heuristics: &mut Heuristics,
     logger: &mut Option<DratLogger<W>>,
     inprocessing: Vec<Process>,
+) -> PyResult<Option<Vec<bool>>> {
+    solve_cdcl_guided(
+        py,
+        formula,
+        implication_point,
+        heuristics,
+        logger,
+        inprocessing,
+        &mut None,
+    )
+}
+
+pub fn solve_cdcl_guided<'py, W: Write>(
+    py: Python<'_>,
+    formula: &mut Formula,
+    implication_point: ImplicationPoint,
+    heuristics: &mut Heuristics,
+    logger: &mut Option<DratLogger<W>>,
+    inprocessing: Vec<Process>,
+    guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
     let mut steps = 0;
@@ -142,6 +163,7 @@ pub fn solve_cdcl<'py, W: Write>(
                     pre_lbd,
                     post_lbd,
                     backtrack_level,
+                    guidance,
                 )?,
             };
             formula.stats.record_learning_time(learning_start.elapsed());
@@ -230,8 +252,10 @@ fn learn_dip_clauses<W: Write>(
     pre_lbd: i64,
     post_lbd: i64,
     backtrack_level: usize,
+    guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Clause>> {
     let z = extension_literal(formula, logger, &dip_a, &dip_b);
+    observe_dip_extension(guidance, &dip_a, &dip_b, &z)?;
     let post_clause = prefixed_clause(z.negated(), post_clause_without_z, post_lbd);
     let pre_clause = prefixed_clause(z.clone(), pre_clause_without_z, pre_lbd);
 
@@ -311,6 +335,18 @@ fn learn_dip_clauses<W: Write>(
     }
 
     Ok(Some(learned))
+}
+
+fn observe_dip_extension(
+    guidance: &mut Option<GuidanceTracker>,
+    dip_a: &Literal,
+    dip_b: &Literal,
+    result: &Literal,
+) -> PyResult<()> {
+    if let Some(tracker) = guidance {
+        tracker.observe(dip_a.get_index(), dip_b.get_index(), result.get_index())?;
+    }
+    Ok(())
 }
 
 fn prefixed_clause(first: Literal, rest: Vec<Literal>, lbd: i64) -> Clause {
@@ -511,6 +547,40 @@ mod tests {
         assert_eq!(clauses[clauses.len() - 3].lbd, 0);
         assert_eq!(clauses[clauses.len() - 2].lbd, 0);
         assert_eq!(clauses[clauses.len() - 1].lbd, 0);
+    }
+
+    #[test]
+    fn dip_guidance_observes_the_actual_reused_extension_variable() {
+        use crate::guidance::{GuidanceSpec, GuidanceTracker};
+
+        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![5]]);
+        let dip_a = Literal::new(1);
+        let dip_b = Literal::new(2);
+        let mut logger: Option<DratLogger<Empty>> = None;
+        let mut guidance = Some(
+            GuidanceTracker::new(
+                GuidanceSpec::StaticAndDag {
+                    original_variables: 2,
+                    operands: vec![[1, 2]],
+                },
+                None,
+            )
+            .unwrap(),
+        );
+
+        let first = extension_literal(&mut formula, &mut logger, &dip_a, &dip_b);
+        assert_eq!(first.get_index(), 6);
+        observe_dip_extension(&mut guidance, &dip_a, &dip_b, &first).unwrap();
+
+        let reused = extension_literal(&mut formula, &mut logger, &dip_b, &dip_a);
+        assert_eq!(reused.get_index(), 6);
+        observe_dip_extension(&mut guidance, &dip_b, &dip_a, &reused).unwrap();
+
+        let summary = guidance.as_ref().unwrap().summary();
+        assert_eq!(summary.checks, 2);
+        assert_eq!(summary.matches, 2);
+        assert_eq!(summary.unique_matches, 1);
+        assert_eq!(summary.stages_completed, 1);
     }
 
     #[test]

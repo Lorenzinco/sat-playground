@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crate::drat::DratLogger;
 use crate::formula::Formula;
+use crate::guidance::GuidanceTracker;
 use crate::heuristics::Heuristics;
 use crate::heuristics::vsids::Vsids;
 use crate::history::ImplicationPoint;
@@ -50,6 +51,7 @@ pub fn solve<'py, W: Write>(
     inprocessing: Vec<Process>,
     heuristics: Heuristics,
     logger: &mut Option<DratLogger<W>>,
+    guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
@@ -125,13 +127,14 @@ pub fn solve<'py, W: Write>(
     let solve_start = Instant::now();
     let result = match algorithm {
         Algorithm::DPLL => dpll::solve_dpll(py, formula),
-        Algorithm::CDCL => cdcl::solve_cdcl(
+        Algorithm::CDCL => cdcl::solve_cdcl_guided(
             py,
             formula,
             implication_point,
             &mut heuristics,
             logger,
             inprocessing,
+            guidance,
         ),
     };
 
