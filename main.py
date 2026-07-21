@@ -1,5 +1,6 @@
 from ast import parse
 import clsat
+import reductions
 
 def parse_dimacs(filename):
     clauses = []
@@ -20,13 +21,19 @@ def parse_dimacs(filename):
 
 def main():
     # clauses = parse_dimacs("tests/unsat/2bitadd_10.cnf")
+    # 
+
+    reduction = reductions.Reduction("pigeonhole", size=4)
+
+    print(reduction.extension_guidance)
+    exit()
     clauses = parse_dimacs("input.dimacs")
     s = clsat.Sat(clauses)
 
     print("c Solving SAT problem...", flush=True)
     s.solve(
         algorithm="cdcl",
-        implication_point="dip",
+        implication_point="uip",
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
