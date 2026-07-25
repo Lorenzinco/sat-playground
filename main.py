@@ -20,19 +20,19 @@ def parse_dimacs(filename):
 
 
 def main():
-    reduction = reductions.Reduction("pigeonhole", size=9)
-    #clauses = parse_dimacs("input.dimacs")
-    s = clsat.Sat(reduction.clauses)
+    #reduction = reductions.Reduction("pigeonhole", size=8)
+    clauses = parse_dimacs("input.dimacs")
+    s = clsat.Sat(clauses)
     print("c Solving SAT problem...", flush=True)
     s.solve(
         algorithm="cdcl",
         implication_point="dip",
-        preprocess=[],
+        preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
         inprocessing=[],
-        extension_guidance=reduction.extension_guidance,
-        extension_guidance_log_path="guidance.log",
+        #extension_guidance=reduction.extension_guidance,
+        #extension_guidance_log_path="guidance.log",
     )
 
     if s.model is not None:

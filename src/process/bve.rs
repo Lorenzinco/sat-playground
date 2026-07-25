@@ -50,23 +50,24 @@ fn apply_best_bve_step<W: Write>(
     let Some(candidate) = best else {
         return Ok(false);
     };
+    let EliminationCandidate {
+        to_delete,
+        resolvents,
+        ..
+    } = candidate;
 
-    for clause in &candidate.resolvents {
-        if let Some((py, steps)) = signal.as_mut() {
-            signal_checker(*py, *steps)?;
-        }
-        formula.add_clause_unchecked(clause.clone(), logger);
+    // Candidate construction is the interruptible phase. Commit the selected
+    // elimination atomically so cancellation cannot leave statistics or clause
+    // indices partially updated.
+    for clause in resolvents {
+        formula.add_clause_unchecked(clause, logger);
         formula.stats.add_bve_resolvent();
     }
 
-    for &idx in &candidate.to_delete {
-        if let Some((py, steps)) = signal.as_mut() {
-            signal_checker(*py, *steps)?;
-        }
-        let deleted = formula.get_clauses()[idx].clone();
-        formula.stats.remove_clause(&deleted);
+    for &idx in &to_delete {
+        formula.record_clause_removal(idx);
     }
-    let old_to_new = formula.delete_clauses(&candidate.to_delete, logger);
+    let old_to_new = formula.delete_clauses(&to_delete, logger);
     if let Some(history) = history {
         history.remap_clause_indices(&old_to_new);
     }
@@ -86,8 +87,10 @@ fn elimination_candidate(
     var: usize,
     signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<Option<EliminationCandidate>> {
-    let pos = formula.occurrence_indices(&Literal::new(var as i32));
-    let neg = formula.occurrence_indices(&Literal::new(-(var as i32)));
+    let positive_literal = Literal::new(var as i32);
+    let negative_literal = Literal::new(-(var as i32));
+    let pos = formula.occurrence_of(&positive_literal);
+    let neg = formula.occurrence_of(&negative_literal);
 
     if pos.is_empty() || neg.is_empty() {
         return Ok(None);
@@ -112,8 +115,8 @@ fn elimination_candidate(
         deleted_literals += formula.get_clauses()[idx].len();
     }
 
-    for &pos_idx in &pos {
-        for &neg_idx in &neg {
+    for &pos_idx in pos {
+        for &neg_idx in neg {
             if let Some((py, steps)) = signal.as_mut() {
                 signal_checker(*py, *steps)?;
             }

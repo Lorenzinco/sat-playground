@@ -109,7 +109,7 @@ impl Formula {
         }
     }
 
-    pub fn from_clauses(clauses: &Vec<Clause>) -> Self {
+    pub fn from_clauses(clauses: &[Clause]) -> Self {
         let max_index = clauses
             .iter()
             .flat_map(|clause| clause.iter())
@@ -127,32 +127,7 @@ impl Formula {
             self_subsuming: false,
         };
 
-        for i in 0..formula.clauses.len() {
-            let clause = &formula.clauses[i];
-            let occurrence_literals = clause.get_literals().clone();
-            for lit in &occurrence_literals {
-                formula.add_to_occurrence(i, lit);
-            }
-
-            let clause = &formula.clauses[i];
-            match clause.watched {
-                Watched::Two(idx1, idx2) => {
-                    formula
-                        .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx1]);
-                    formula
-                        .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx2]);
-                }
-                Watched::One(idx) => {
-                    formula
-                        .watch
-                        .add_to_watchlist(i, &clause.get_literals()[idx]);
-                }
-                Watched::None => {}
-            }
-        }
-
+        formula.rebuild_clause_indices();
         formula
     }
 
@@ -222,6 +197,7 @@ impl Formula {
         self.self_subsuming
     }
 
+    /// Updates the occurrence list of a literal inside a new clause
     pub fn add_to_occurrence(&mut self, clause_idx: usize, lit: &Literal) {
         let idx = lit.get_unsigned_index() as usize;
         if idx >= self.occurrence.len() {
@@ -230,19 +206,12 @@ impl Formula {
         self.occurrence[idx].push(clause_idx);
     }
 
+    /// Returns the vector slice containing clause indexes in which the literal occurs
     pub fn occurrence_of(&self, lit: &Literal) -> &[usize] {
         self.occurrence
             .get(lit.get_unsigned_index() as usize)
             .map(Vec::as_slice)
             .unwrap_or(&[])
-    }
-
-    pub fn occurrence_indices(&self, lit: &Literal) -> Vec<usize> {
-        self.occurrence_of(lit)
-            .iter()
-            .copied()
-            .filter(|&idx| idx < self.clauses.len())
-            .collect()
     }
 
     pub fn candidate_indices_for_clause(&self, clause: &Clause) -> Vec<usize> {
@@ -392,6 +361,10 @@ impl Formula {
         self.delete_clauses(&[clause_index], logger);
     }
 
+    pub fn record_clause_removal(&mut self, clause_index: usize) {
+        self.stats.remove_clause(&self.clauses[clause_index]);
+    }
+
     pub fn delete_clauses<W: Write>(
         &mut self,
         clause_indices: &[usize],
@@ -405,12 +378,18 @@ impl Formula {
             return old_to_new;
         }
 
-        let mut to_delete = clause_indices.to_vec();
-        to_delete.sort_unstable();
-        to_delete.dedup();
+        let normalized = if clause_indices.windows(2).all(|pair| pair[0] < pair[1]) {
+            None
+        } else {
+            let mut indices = clause_indices.to_vec();
+            indices.sort_unstable();
+            indices.dedup();
+            Some(indices)
+        };
+        let to_delete = normalized.as_deref().unwrap_or(clause_indices);
 
         let mut deleted = vec![false; self.clauses.len()];
-        for &idx in &to_delete {
+        for &idx in to_delete {
             assert!(idx < self.clauses.len());
             assert_eq!(
                 self.clauses[idx].lock_count, 0,
@@ -420,7 +399,7 @@ impl Formula {
         }
 
         if let Some(log) = logger {
-            for &idx in &to_delete {
+            for &idx in to_delete {
                 let _ = log.log_delete(self.clauses[idx].get_literals());
             }
         }
@@ -447,19 +426,22 @@ impl Formula {
         self.watch = Watch::new(self.assignment.len());
         self.occurrence = vec![Vec::new(); self.assignment.len() * 2];
 
-        for clause_idx in 0..self.clauses.len() {
-            let occurrence_literals = self.clauses[clause_idx].get_literals().clone();
-            for lit in &occurrence_literals {
-                self.add_to_occurrence(clause_idx, lit);
+        let clauses = &self.clauses;
+        let occurrence = &mut self.occurrence;
+        let watch = &mut self.watch;
+        for (clause_idx, clause) in clauses.iter().enumerate() {
+            for lit in clause.get_literals() {
+                occurrence[lit.get_unsigned_index() as usize].push(clause_idx);
             }
 
-            let literals = self.clauses[clause_idx].get_literals().clone();
-            match self.clauses[clause_idx].watched {
+            match clause.watched {
                 Watched::None => {}
-                Watched::One(idx) => self.watch.add_to_watchlist(clause_idx, &literals[idx]),
+                Watched::One(idx) => {
+                    watch.add_to_watchlist(clause_idx, &clause.get_literals()[idx]);
+                }
                 Watched::Two(idx1, idx2) => {
-                    self.watch.add_to_watchlist(clause_idx, &literals[idx1]);
-                    self.watch.add_to_watchlist(clause_idx, &literals[idx2]);
+                    watch.add_to_watchlist(clause_idx, &clause.get_literals()[idx1]);
+                    watch.add_to_watchlist(clause_idx, &clause.get_literals()[idx2]);
                 }
             }
         }
@@ -771,7 +753,7 @@ impl Formula {
             }
         }
 
-        if conservative && candidates.len() < 1_000 {
+        if conservative && candidates.len() < 50_000 {
             return Ok(());
         }
 
