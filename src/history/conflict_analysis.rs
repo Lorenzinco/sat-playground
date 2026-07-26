@@ -6,15 +6,21 @@ use crate::history::dip;
 use crate::history::uip;
 use crate::history::{ConflictLearnResult, History, ImplicationPoint};
 
+const NO_VERTEX: u32 = u32::MAX;
+
 pub(super) struct ConflictAnalysis {
     pub current_level: usize,
     pub uip_clause_literals: Vec<Literal>,
-    pub trail: Vec<Literal>,
-    pub first_uip_pos: usize,
-    pub successors: Vec<Vec<usize>>,
-    pub present: Vec<bool>,
-    pub reason_of: Vec<Option<usize>>,
-    pub pos_of: Vec<Option<usize>>,
+    /// Assigned literals for graph vertices. Vertex 0 is the synthetic conflict
+    /// and therefore uses the otherwise-invalid literal value 0.
+    pub graph_literals: Vec<i32>,
+    /// Positions in the current decision-level trail, aligned with
+    /// `graph_literals`. The conflict position is `u32::MAX`.
+    pub trail_positions: Vec<u32>,
+    /// Flat predecessor CSR. The sink is vertex 0 and the first UIP is the
+    /// final (source) vertex; every predecessor has a larger vertex ID.
+    pub predecessors: Vec<u32>,
+    pub pred_index: Vec<u32>,
 }
 
 pub(super) fn analyze_conflict(
@@ -48,111 +54,99 @@ pub(super) fn analyze_conflict_graph(
         return None;
     }
 
-    let (trail, pos_of, reason_of) = current_level_context(history, formula);
-    let conflict_idx = trail.len();
-    let mut successors = vec![Vec::new(); conflict_idx + 1];
-    let mut present = vec![false; conflict_idx + 1];
-    present[conflict_idx] = true;
-
+    let level = &history.decision_levels[current_level];
     let mut seen = BitVec::<u64>::new(formula.assignment.len() + 1);
-    let mut learned_lits = Vec::new();
-    let mut path_count = 0;
-    let mut current_clause_idx = Some(conflict_clause_index);
-    let mut resolved_lit_idx = None;
-    let mut current_node_idx = conflict_idx;
+    let mut learned_literals = Vec::new();
+    let mut predecessor_literals = Vec::<i32>::new();
+    let mut pred_index = Vec::<u32>::new();
+    let mut graph_literals = vec![0];
+    let mut trail_positions = vec![NO_VERTEX];
 
-    let level_data = &history.decision_levels[current_level];
-    let mut trail_iter = level_data
-        .get_implied_literals_rev()
-        .chain(level_data.get_decision_literal().into_iter());
+    let mut path_count = 0usize;
+    let mut current_clause = conflict_clause_index;
+    let mut resolved_var = None;
+    let mut trail_cursor = level.trail_len();
 
-    let first_uip_pos = loop {
-        if let Some(clause_idx) = current_clause_idx {
-            for lit in formula.get_clauses()[clause_idx].iter() {
-                if resolved_lit_idx == Some(lit.get_index()) {
-                    continue;
-                }
+    loop {
+        pred_index.push(u32::try_from(predecessor_literals.len()).ok()?);
 
-                let pred = lit.negated();
-                if let Some(pred_idx) = pos_of
-                    .get(pred.get_unsigned_index() as usize)
-                    .copied()
-                    .flatten()
-                {
-                    successors[pred_idx].push(current_node_idx);
-                    present[pred_idx] = true;
-                }
-
-                let var = lit.get_index().unsigned_abs() as usize;
-                if !seen.test(var) {
-                    seen.set(var);
-                    let level = history.get_literal_level(lit).unwrap_or(0);
-                    if level == current_level {
-                        path_count += 1;
-                    } else {
-                        learned_lits.push(lit.clone());
-                    }
-                }
+        for literal in formula.get_clauses()[current_clause].iter() {
+            let var = literal.get_index().unsigned_abs() as usize;
+            if resolved_var == Some(var) {
+                continue;
             }
-        }
 
-        loop {
-            let lit = trail_iter
-                .next()
-                .expect("Trail is empty but path_count is > 0");
-            let var = lit.get_index().unsigned_abs() as usize;
+            let literal_level = history.get_literal_level(literal)?;
+            if literal_level == 0 {
+                continue;
+            }
+
+            if literal_level == current_level {
+                predecessor_literals.push(literal.negated().get_index());
+            }
+
             if seen.test(var) {
-                resolved_lit_idx = Some(lit.get_index());
-                current_node_idx = pos_of[lit.get_unsigned_index() as usize]?;
-                present[current_node_idx] = true;
-                path_count -= 1;
-                current_clause_idx = level_data.get_reason(lit);
-                break;
+                continue;
+            }
+            seen.set(var);
+            if literal_level == current_level {
+                path_count += 1;
+            } else {
+                learned_literals.push(literal.clone());
             }
         }
+
+        let (position, propagated) = loop {
+            trail_cursor = trail_cursor.checked_sub(1)?;
+            let literal = level.trail_literal(trail_cursor)?;
+            if seen.test(literal.get_index().unsigned_abs() as usize) {
+                break (trail_cursor, literal);
+            }
+        };
+
+        let propagated_var = propagated.get_index().unsigned_abs() as usize;
+        seen.reset(propagated_var);
+        path_count = path_count.checked_sub(1)?;
+        graph_literals.push(propagated.get_index());
+        trail_positions.push(u32::try_from(position).ok()?);
 
         if path_count == 0 {
-            learned_lits.push(Literal::new(-resolved_lit_idx?));
-            break current_node_idx;
+            learned_literals.push(propagated.negated());
+            pred_index.push(u32::try_from(predecessor_literals.len()).ok()?);
+            break;
         }
-    };
 
-    let last_idx = learned_lits.len() - 1;
-    learned_lits.swap(0, last_idx);
+        resolved_var = Some(propagated_var);
+        current_clause = level.trail_reason(position)?;
+    }
+
+    let asserting = learned_literals.len().checked_sub(1)?;
+    learned_literals.swap(0, asserting);
+
+    let mut vertex_by_var = vec![NO_VERTEX; formula.assignment.len()];
+    for (vertex, &literal) in graph_literals.iter().enumerate().skip(1) {
+        let var = literal.unsigned_abs() as usize;
+        if var >= vertex_by_var.len() || vertex_by_var[var] != NO_VERTEX {
+            return None;
+        }
+        vertex_by_var[var] = u32::try_from(vertex).ok()?;
+    }
+
+    let mut predecessors = Vec::with_capacity(predecessor_literals.len());
+    for literal in predecessor_literals {
+        let vertex = *vertex_by_var.get(literal.unsigned_abs() as usize)?;
+        if vertex == NO_VERTEX {
+            return None;
+        }
+        predecessors.push(vertex);
+    }
 
     Some(ConflictAnalysis {
         current_level,
-        uip_clause_literals: learned_lits,
-        trail,
-        first_uip_pos,
-        successors,
-        present,
-        reason_of,
-        pos_of,
+        uip_clause_literals: learned_literals,
+        graph_literals,
+        trail_positions,
+        predecessors,
+        pred_index,
     })
-}
-
-fn current_level_context(
-    history: &History,
-    formula: &Formula,
-) -> (Vec<Literal>, Vec<Option<usize>>, Vec<Option<usize>>) {
-    let level = &history.decision_levels[history.get_decision_level()];
-
-    let mut trail = Vec::new();
-    let mut pos_of = vec![None; formula.assignment.len() * 2];
-    let mut reason_of = Vec::new();
-
-    if let Some(decision) = level.get_decision_literal() {
-        pos_of[decision.get_unsigned_index() as usize] = Some(trail.len());
-        trail.push(decision.clone());
-        reason_of.push(None);
-    }
-
-    for lit in level.implied_literals_iter() {
-        pos_of[lit.get_unsigned_index() as usize] = Some(trail.len());
-        trail.push(lit.clone());
-        reason_of.push(level.get_reason(lit));
-    }
-
-    (trail, pos_of, reason_of)
 }

@@ -131,8 +131,6 @@ pub fn solve_cdcl<'py, W: Write>(
                     pre_clause_without_z,
                     post_clause_without_z,
                     pre_lbd,
-                    post_lbd,
-                    backtrack_level,
                 } => learn_dip_clauses(
                     formula,
                     &mut history,
@@ -143,8 +141,6 @@ pub fn solve_cdcl<'py, W: Write>(
                     pre_clause_without_z,
                     post_clause_without_z,
                     pre_lbd,
-                    post_lbd,
-                    backtrack_level,
                     guidance,
                 )?,
             };
@@ -233,17 +229,25 @@ fn learn_dip_clauses<W: Write>(
     pre_clause_without_z: Vec<Literal>,
     post_clause_without_z: Vec<Literal>,
     pre_lbd: i64,
-    post_lbd: i64,
-    backtrack_level: usize,
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Clause>> {
     let z = extension_literal(formula, logger, &dip_a, &dip_b);
     observe_dip_extension(guidance, &dip_a, &dip_b, &z)?;
-    let post_clause = prefixed_clause(z.negated(), post_clause_without_z, post_lbd);
+
+    let raw_post_clause = prefixed_clause(z.negated(), post_clause_without_z, 0);
+    let (mut post_literals, minimized_literals, minimization_time) =
+        history.minimize_clause_literals(formula, raw_post_clause.get_literals().clone());
+    formula
+        .stats
+        .add_minimized_literals(minimized_literals as u64);
+    formula.stats.record_minimization_time(minimization_time);
+    order_asserting_clause(&mut post_literals, history);
+    let (post_backtrack_level, post_lbd) = dip_post_clause_metrics(&post_literals, history);
+    let post_clause = Clause::from_literals(post_literals, post_lbd);
     let pre_clause = prefixed_clause(z.clone(), pre_clause_without_z, pre_lbd);
 
     let Some(actual_backtrack) =
-        backtrack_until_not_conflicting(&post_clause, backtrack_level, history, formula)
+        backtrack_until_not_conflicting(&post_clause, post_backtrack_level, history, formula)
     else {
         return Ok(None);
     };
@@ -332,11 +336,45 @@ fn observe_dip_extension(
     Ok(())
 }
 
+fn dip_post_clause_metrics(literals: &[Literal], history: &History) -> (usize, i64) {
+    let mut levels = Vec::new();
+    let mut backtrack_level = 0;
+    for literal in literals.iter().skip(1) {
+        let Some(level) = history.get_literal_level(literal) else {
+            continue;
+        };
+        backtrack_level = backtrack_level.max(level);
+        if !levels.contains(&level) {
+            levels.push(level);
+        }
+    }
+
+    // The unassigned extension literal forms its own LBD block.
+    (backtrack_level, levels.len() as i64 + 1)
+}
+
+fn order_asserting_clause(literals: &mut [Literal], history: &History) {
+    if literals.len() <= 2 {
+        return;
+    }
+
+    let mut highest = 1;
+    let mut highest_level = history.get_literal_level(&literals[1]).unwrap_or(0);
+    for index in 2..literals.len() {
+        let level = history.get_literal_level(&literals[index]).unwrap_or(0);
+        if level > highest_level {
+            highest = index;
+            highest_level = level;
+        }
+    }
+    literals.swap(1, highest);
+}
+
 fn prefixed_clause(first: Literal, rest: Vec<Literal>, lbd: i64) -> Clause {
-    let mut lits = Vec::with_capacity(rest.len() + 1);
-    lits.push(first);
-    lits.extend(rest);
-    Clause::from_literals(lits, lbd)
+    let mut literals = Vec::with_capacity(rest.len() + 1);
+    literals.push(first.clone());
+    literals.extend(rest.into_iter().filter(|literal| literal != &first));
+    Clause::from_literals(literals, lbd)
 }
 
 fn unsat<W: Write>(logger: &mut Option<DratLogger<W>>) -> PyResult<Option<Vec<bool>>> {
@@ -514,6 +552,24 @@ mod tests {
         assert_eq!(formula.assignment.get_value(1), None);
         assert_eq!(formula.assignment.get_value(2), None);
         assert_eq!(formula.get_clause_at_idx(1).lock_count, 0);
+    }
+
+    #[test]
+    fn dip_post_metrics_include_all_lower_literals_after_fresh_extension() {
+        let mut history = History::new();
+        let lower = Literal::new(1);
+        let higher = Literal::new(2);
+        let extension = Literal::new(3);
+        history.add_decision(&lower);
+        history.add_decision(&higher);
+
+        let (backtrack_level, lbd) = dip_post_clause_metrics(
+            &[extension.negated(), lower.negated(), higher.negated()],
+            &history,
+        );
+
+        assert_eq!(backtrack_level, 2);
+        assert_eq!(lbd, 3);
     }
 
     #[test]

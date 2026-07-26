@@ -32,11 +32,11 @@ def solve_example() -> None:
     print("c Solving SAT problem...", flush=True)
     solver.solve(
         algorithm="cdcl",
-        implication_point="dip",
+        implication_point="uip",
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=["bve", "bva"],
+        inprocessing=[],
         inprocessing_budget=0.5,
     )
 

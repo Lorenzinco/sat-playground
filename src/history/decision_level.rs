@@ -40,6 +40,38 @@ impl DecisionLevel {
         self.implied_literals.iter().rev().map(|(lit, _)| lit)
     }
 
+    pub fn trail_len(&self) -> usize {
+        usize::from(self.decision_literal.is_some()) + self.implied_literals.len()
+    }
+
+    pub fn trail_literal(&self, position: usize) -> Option<&Literal> {
+        match (&self.decision_literal, position) {
+            (Some(literal), 0) => Some(literal),
+            (Some(_), position) => self
+                .implied_literals
+                .get(position - 1)
+                .map(|(literal, _)| literal),
+            (None, position) => self
+                .implied_literals
+                .get(position)
+                .map(|(literal, _)| literal),
+        }
+    }
+
+    pub fn trail_reason(&self, position: usize) -> Option<usize> {
+        match (&self.decision_literal, position) {
+            (Some(_), 0) => None,
+            (Some(_), position) => self
+                .implied_literals
+                .get(position - 1)
+                .and_then(|(_, reason)| *reason),
+            (None, position) => self
+                .implied_literals
+                .get(position)
+                .and_then(|(_, reason)| *reason),
+        }
+    }
+
     pub fn get_reason(&self, lit: &Literal) -> Option<usize> {
         self.reason_by_unsigned
             .get(lit.get_unsigned_index() as usize)

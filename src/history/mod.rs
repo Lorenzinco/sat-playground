@@ -3,7 +3,9 @@ pub mod conflict_analysis;
 pub mod conflict_graph;
 pub mod decision_level;
 pub mod dip;
+mod dip_clause;
 pub mod implication_level;
+pub mod two_vertex_bottlenecks;
 pub mod uip;
 
 use pyo3::prelude::*;
@@ -38,8 +40,6 @@ pub enum ConflictLearnResult {
         pre_clause_without_z: Vec<Literal>,  // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>, // ¬D
         pre_lbd: i64,
-        post_lbd: i64,
-        backtrack_level: usize, // = max(l_C, l_D)
     },
 }
 
@@ -570,12 +570,9 @@ mod history {
         match result {
             ConflictLearnResult::Dip {
                 pre_clause_without_z,
-                backtrack_level,
                 ..
             } => {
-                // If DIP is returned, it must be meaningful (non-empty post in the new logic).
                 assert!(!pre_clause_without_z.is_empty());
-                assert_eq!(backtrack_level, 0);
             }
             ConflictLearnResult::Uip {
                 clause,
