@@ -3,71 +3,94 @@ use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::history::History;
+use crate::process::ProcessBudget;
 use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 // CaDiCaL-FX's default factor bound requires a reduction of at least one clause.
 const FACTOR_BOUND: usize = 1;
 const GATE_DEFINITION_CLAUSES: usize = 4;
 const MIN_GATE_MATCHES: usize = GATE_DEFINITION_CLAUSES + FACTOR_BOUND;
+const MAX_FACTOR_CLAUSE_SIZE: usize = 20;
 
-pub fn process<W: Write>(
+pub(crate) fn process<W: Write>(
     formula: &mut Formula,
+    budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     mut history: Option<&mut History>,
 ) -> PyResult<()> {
+    if budget.exhausted() {
+        return Ok(());
+    }
+
     let initial_clause_limit = formula.get_clauses().len();
     let initial_variable_limit = formula.assignment.len();
-    let index = AndIndex::new(formula, initial_clause_limit, initial_variable_limit);
-    let schedule = initial_literal_schedule(formula, initial_clause_limit, initial_variable_limit);
+    let schedule = match initial_literal_schedule(
+        formula,
+        initial_clause_limit,
+        initial_variable_limit,
+        budget,
+        &mut signal,
+    )? {
+        BudgetResult::Complete(schedule) => schedule,
+        BudgetResult::Exhausted => return Ok(()),
+    };
+    if budget.exhausted() {
+        return Ok(());
+    }
+
     let mut pending_deleted = vec![false; initial_clause_limit];
     let mut deletion_indices = Vec::new();
     let mut gate_variables_seen = vec![false; initial_variable_limit];
-    let mut and_workspace = AndWorkspace::new(initial_variable_limit, initial_clause_limit);
-    let mut gate_workspace = GateWorkspace::new(initial_variable_limit, initial_clause_limit);
 
-    for start in schedule {
-        let search_result = (|| {
-            check_signal(&mut signal)?;
-            let and_candidate = build_and_candidate(
-                &index,
+    let run_result = (|| -> PyResult<()> {
+        for start in schedule {
+            if !continue_search(budget, &mut signal)? {
+                break;
+            }
+
+            let and_candidate = match build_and_candidate(
+                formula,
+                initial_clause_limit,
                 start,
                 &pending_deleted,
-                &mut and_workspace,
+                budget,
                 &mut signal,
-            )?;
+            )? {
+                BudgetResult::Complete(candidate) => candidate,
+                BudgetResult::Exhausted => break,
+            };
 
             let variable = start.unsigned_abs() as usize;
             let gate_candidate = if !gate_variables_seen[variable] {
                 gate_variables_seen[variable] = true;
-                if formula.assignment.get_value(variable).is_none()
-                    && has_live_eligible_occurrence(
-                        formula,
-                        -start,
-                        initial_clause_limit,
-                        &pending_deleted,
-                    )
-                {
-                    let pairs = extract_pairs(
+                let has_opposite = match has_live_eligible_occurrence(
+                    formula,
+                    -start,
+                    initial_clause_limit,
+                    &pending_deleted,
+                    budget,
+                    &mut signal,
+                )? {
+                    BudgetResult::Complete(has_opposite) => has_opposite,
+                    BudgetResult::Exhausted => break,
+                };
+                if formula.assignment.get_value(variable).is_none() && has_opposite {
+                    match build_gate_candidate(
                         formula,
                         initial_clause_limit,
                         &pending_deleted,
                         start,
-                        &mut gate_workspace,
+                        budget,
                         &mut signal,
-                    )?;
-                    prefilter_candidates(&mut gate_workspace);
-                    group_pairs(
-                        &pairs,
-                        start,
-                        initial_clause_limit,
-                        &mut gate_workspace,
-                        &mut signal,
-                    )?
+                    )? {
+                        BudgetResult::Complete(candidate) => candidate,
+                        BudgetResult::Exhausted => break,
+                    }
                 } else {
                     None
                 }
@@ -75,7 +98,7 @@ pub fn process<W: Write>(
                 None
             };
 
-            Ok(match (and_candidate, gate_candidate) {
+            let candidate = match (and_candidate, gate_candidate) {
                 (Some(and_candidate), Some(gate_candidate)) => {
                     if gate_candidate.clause_saving >= and_candidate.clause_saving {
                         Some(FactorCandidate::Gate(gate_candidate))
@@ -86,35 +109,29 @@ pub fn process<W: Write>(
                 (Some(candidate), None) => Some(FactorCandidate::And(candidate)),
                 (None, Some(candidate)) => Some(FactorCandidate::Gate(candidate)),
                 (None, None) => None,
-            })
-        })();
+            };
 
-        let candidate = match search_result {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                finalize_pending_deletions(
+            // Applying a selected candidate is deliberately atomic. Once this
+            // check succeeds, definition clauses, quotients, and source claims
+            // are completed without consulting the deadline.
+            if !continue_search(budget, &mut signal)? {
+                break;
+            }
+            if let Some(candidate) = candidate {
+                apply_factorization_candidate(
                     formula,
                     logger,
-                    history.as_deref_mut(),
-                    &pending_deleted,
+                    &mut pending_deleted,
                     &mut deletion_indices,
+                    candidate,
                 );
-                return Err(error);
             }
-        };
-
-        if let Some(candidate) = candidate {
-            apply_factorization_candidate(
-                formula,
-                logger,
-                &index,
-                &mut pending_deleted,
-                &mut deletion_indices,
-                candidate,
-            );
         }
-    }
+        Ok(())
+    })();
 
+    // This is the only compaction point, including cancellation and ordinary
+    // budget exhaustion.
     finalize_pending_deletions(
         formula,
         logger,
@@ -122,37 +139,56 @@ pub fn process<W: Write>(
         &pending_deleted,
         &mut deletion_indices,
     );
-    Ok(())
+    run_result
 }
 
 fn initial_literal_schedule(
     formula: &Formula,
     initial_clause_limit: usize,
     initial_variable_limit: usize,
-) -> Vec<i32> {
+    budget: &ProcessBudget,
+    signal: &mut Option<(Python<'_>, &mut u64)>,
+) -> PyResult<BudgetResult<Vec<i32>>> {
+    if !continue_search(budget, signal)? {
+        return Ok(BudgetResult::Exhausted);
+    }
+
     let mut schedule = Vec::new();
     for variable in 1..initial_variable_limit {
         for literal in [variable as i32, -(variable as i32)] {
-            let count = formula
-                .occurrence_of(&Literal::new(literal))
-                .iter()
-                .copied()
-                .filter(|&idx| {
-                    idx < initial_clause_limit
-                        && factor_eligible_clause(&formula.get_clauses()[idx])
-                })
-                .count();
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            let mut count = 0;
+            for &idx in formula.occurrence_of(&Literal::new(literal)) {
+                if !continue_search(budget, signal)? {
+                    return Ok(BudgetResult::Exhausted);
+                }
+                if idx < initial_clause_limit && factor_eligible_clause(&formula.get_clauses()[idx])
+                {
+                    count += 1;
+                }
+            }
             if count > 1 {
                 schedule.push((literal, count));
             }
         }
+    }
+
+    if !continue_search(budget, signal)? {
+        return Ok(BudgetResult::Exhausted);
     }
     schedule.sort_by(|(lit_a, count_a), (lit_b, count_b)| {
         count_a
             .cmp(count_b)
             .then_with(|| literal_tie_key(*lit_a).cmp(&literal_tie_key(*lit_b)))
     });
-    schedule.into_iter().map(|(literal, _)| literal).collect()
+    if !continue_search(budget, signal)? {
+        return Ok(BudgetResult::Exhausted);
+    }
+    Ok(BudgetResult::Complete(
+        schedule.into_iter().map(|(literal, _)| literal).collect(),
+    ))
 }
 
 fn has_live_eligible_occurrence(
@@ -160,79 +196,387 @@ fn has_live_eligible_occurrence(
     literal: i32,
     initial_clause_limit: usize,
     pending_deleted: &[bool],
-) -> bool {
-    formula
-        .occurrence_of(&Literal::new(literal))
-        .iter()
-        .copied()
-        .any(|idx| {
-            idx < initial_clause_limit
-                && !pending_deleted[idx]
-                && factor_eligible_clause(&formula.get_clauses()[idx])
-        })
+    budget: &ProcessBudget,
+    signal: &mut Option<(Python<'_>, &mut u64)>,
+) -> PyResult<BudgetResult<bool>> {
+    for &idx in formula.occurrence_of(&Literal::new(literal)) {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        if live_factor_clause(formula, idx, initial_clause_limit, pending_deleted) {
+            return Ok(BudgetResult::Complete(true));
+        }
+    }
+    Ok(BudgetResult::Complete(false))
 }
 
-/// Algorithm 1 from the paper: pair clauses containing `target` with clauses
-/// containing `-target` that have the same size and exactly one other
-/// unmatched literal on either side.
-fn extract_pairs(
+fn build_and_candidate(
     formula: &Formula,
     initial_clause_limit: usize,
+    start: i32,
     pending_deleted: &[bool],
-    target: i32,
-    workspace: &mut GateWorkspace,
+    budget: &ProcessBudget,
     signal: &mut Option<(Python<'_>, &mut u64)>,
-) -> PyResult<Vec<ExtractedPair>> {
-    let mut pairs = Vec::new();
-    workspace.begin_variable_counts();
-    let target_occurrences = formula.occurrence_of(&Literal::new(target));
-    let opposite_occurrences = formula.occurrence_of(&Literal::new(-target));
+) -> PyResult<BudgetResult<Option<AndCandidate>>> {
+    let mut partials = Vec::<LocalAndPartial>::new();
+    let mut partial_hash_buckets = HashMap::<u64, Vec<usize>>::new();
+    let mut sorted_clause = Vec::new();
 
-    for &first_clause in target_occurrences {
-        check_signal(signal)?;
-        if !live_gate_clause(formula, first_clause, initial_clause_limit, pending_deleted) {
+    // Only clauses containing this scheduled literal seed the local search.
+    // Equal partials are interned, preserving physical duplicate clauses in
+    // the cell discovered below rather than duplicating quotient clauses.
+    for &clause_idx in formula.occurrence_of(&Literal::new(start)) {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        if !live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
             continue;
         }
-        let first = &formula.get_clauses()[first_clause];
-        if first.len() < 3 {
+        sorted_clause.clear();
+        sorted_clause.extend(
+            formula.get_clauses()[clause_idx]
+                .iter()
+                .map(Literal::get_index),
+        );
+        sorted_clause.sort_unstable();
+        if is_tautological(&sorted_clause) {
             continue;
         }
+        let partial = sorted_without(&sorted_clause, start);
+        let hash = stable_signature_hash(&partial);
+        if find_exact_vector(&partials, &partial_hash_buckets, hash, &partial).is_none() {
+            let partial_id = partials.len();
+            partials.push(LocalAndPartial {
+                literals: partial,
+                cells: Vec::new(),
+            });
+            partial_hash_buckets
+                .entry(hash)
+                .or_default()
+                .push(partial_id);
+        }
+    }
+    if partials.is_empty() {
+        return Ok(BudgetResult::Complete(None));
+    }
 
-        for &second_clause in opposite_occurrences {
-            check_signal(signal)?;
-            if !live_gate_clause(
-                formula,
-                second_clause,
-                initial_clause_limit,
-                pending_deleted,
-            ) {
+    // Discover each row lazily through the shortest Formula occurrence list.
+    // Candidate clauses are sorted into a reused scratch vector, then compared
+    // with the partial by a linear two-pointer subset-plus-one check.
+    for partial in &mut partials {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        let anchor = *partial
+            .literals
+            .iter()
+            .min_by_key(|&&literal| {
+                (
+                    formula.occurrence_of(&Literal::new(literal)).len(),
+                    literal_tie_key(literal),
+                )
+            })
+            .expect("eligible factor clauses have non-empty partials");
+        let mut cells = BTreeMap::<i32, Vec<usize>>::new();
+        for &clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            if !live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
                 continue;
             }
-            let second = &formula.get_clauses()[second_clause];
-            if second.len() != first.len() || second.len() < 3 {
+            let clause = &formula.get_clauses()[clause_idx];
+            if clause.len() != partial.literals.len() + 1 {
                 continue;
             }
-
-            let Some((first_branch, second_branch)) =
-                exact_pair_differences(first, second, target, &mut workspace.literal_marks)
-            else {
+            sorted_clause.clear();
+            sorted_clause.extend(clause.iter().map(Literal::get_index));
+            sorted_clause.sort_unstable();
+            if is_tautological(&sorted_clause) {
+                continue;
+            }
+            let Some(extra) = one_extra_literal(&partial.literals, &sorted_clause) else {
                 continue;
             };
+            cells.entry(extra).or_default().push(clause_idx);
+        }
+        partial.cells = cells
+            .into_iter()
+            .map(|(literal, source_indices)| LocalAndCell {
+                literal,
+                source_indices,
+            })
+            .collect();
+        partial
+            .cells
+            .sort_unstable_by_key(|cell| literal_tie_key(cell.literal));
+    }
 
-            workspace.record_variable(second_branch.unsigned_abs() as usize);
-            pairs.push(ExtractedPair {
-                first_clause,
-                second_clause,
-                first_branch,
-                second_branch,
+    let mut literals = vec![start];
+    let mut partial_ids = partials
+        .iter()
+        .enumerate()
+        .filter_map(|(partial_id, partial)| partial.cell(start).is_some().then_some(partial_id))
+        .collect::<Vec<_>>();
+    let mut best = None;
+
+    loop {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        let mut counts = BTreeMap::<i32, usize>::new();
+        for &partial_id in &partial_ids {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            for cell in &partials[partial_id].cells {
+                if literals.contains(&cell.literal) {
+                    continue;
+                }
+                *counts.entry(cell.literal).or_default() += 1;
+            }
+        }
+
+        let Some((next_literal, remaining_partials)) = choose_next_literal(&counts) else {
+            break;
+        };
+        if remaining_partials <= 1 {
+            break;
+        }
+        literals.push(next_literal);
+        partial_ids.retain(|&partial_id| partials[partial_id].cell(next_literal).is_some());
+
+        let mut source_indices = Vec::new();
+        for &literal in &literals {
+            for &partial_id in &partial_ids {
+                if !continue_search(budget, signal)? {
+                    return Ok(BudgetResult::Exhausted);
+                }
+                let cell = partials[partial_id]
+                    .cell(literal)
+                    .expect("selected AND grid has every cell");
+                source_indices.extend_from_slice(&cell.source_indices);
+            }
+        }
+        source_indices.sort_unstable();
+        source_indices.dedup();
+        let clause_saving =
+            source_indices.len() as isize - (literals.len() + partial_ids.len()) as isize;
+
+        // The best quotient can occur after a temporary plateau or decline, so
+        // keep extending the greedy factor chain and remember its best prefix.
+        if best
+            .as_ref()
+            .is_none_or(|candidate: &AndCandidate| clause_saving > candidate.clause_saving)
+        {
+            best = Some(AndCandidate {
+                literals: literals.clone(),
+                partials: partial_ids
+                    .iter()
+                    .map(|&partial_id| partials[partial_id].literals.clone())
+                    .collect(),
+                source_indices,
+                clause_saving,
             });
         }
     }
 
-    Ok(pairs)
+    Ok(BudgetResult::Complete(best.filter(|candidate| {
+        candidate.clause_saving >= FACTOR_BOUND as isize
+    })))
+}
+
+fn choose_next_literal(counts: &BTreeMap<i32, usize>) -> Option<(i32, usize)> {
+    let mut best = None;
+    for (&literal, &count) in counts {
+        if best.is_none_or(|(best_literal, best_count)| {
+            count > best_count
+                || (count == best_count && literal_tie_key(literal) < literal_tie_key(best_literal))
+        }) {
+            best = Some((literal, count));
+        }
+    }
+    best
+}
+
+fn build_gate_candidate(
+    formula: &Formula,
+    initial_clause_limit: usize,
+    pending_deleted: &[bool],
+    target: i32,
+    budget: &ProcessBudget,
+    signal: &mut Option<(Python<'_>, &mut u64)>,
+) -> PyResult<BudgetResult<Option<GateCandidate>>> {
+    let pairs = match extract_signature_pairs(
+        formula,
+        initial_clause_limit,
+        pending_deleted,
+        target,
+        budget,
+        signal,
+    )? {
+        BudgetResult::Complete(pairs) => pairs,
+        BudgetResult::Exhausted => return Ok(BudgetResult::Exhausted),
+    };
+    group_pairs(&pairs, target, initial_clause_limit, budget, signal)
+}
+
+/// Algorithms 1 and 2 from the paper, indexed by exact common remainders.
+/// Clauses are first bucketed by size. Within a bucket, every possible branch
+/// is removed with the target, and equal remainders are interned by a stable
+/// hash plus an exact equality check. Duplicate physical clauses are paired
+/// one-to-one rather than expanded into a Cartesian product.
+fn extract_signature_pairs(
+    formula: &Formula,
+    initial_clause_limit: usize,
+    pending_deleted: &[bool],
+    target: i32,
+    budget: &ProcessBudget,
+    signal: &mut Option<(Python<'_>, &mut u64)>,
+) -> PyResult<BudgetResult<Vec<ExtractedPair>>> {
+    if !continue_search(budget, signal)? {
+        return Ok(BudgetResult::Exhausted);
+    }
+    let mut first_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
+        std::array::from_fn(|_| Vec::new());
+    let mut second_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
+        std::array::from_fn(|_| Vec::new());
+
+    for &clause_idx in formula.occurrence_of(&Literal::new(target)) {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+            let size = formula.get_clauses()[clause_idx].len();
+            first_by_size[size].push(clause_idx);
+        }
+    }
+    for &clause_idx in formula.occurrence_of(&Literal::new(-target)) {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+            let size = formula.get_clauses()[clause_idx].len();
+            second_by_size[size].push(clause_idx);
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let mut sorted_clause = Vec::new();
+    let mut remainder = Vec::new();
+    for size in 3..=MAX_FACTOR_CLAUSE_SIZE {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        if first_by_size[size].is_empty() || second_by_size[size].is_empty() {
+            continue;
+        }
+        let mut signatures = Vec::<GateSignature>::new();
+        let mut hash_buckets = HashMap::<u64, Vec<usize>>::new();
+
+        for &clause_idx in &first_by_size[size] {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            sorted_clause.clear();
+            sorted_clause.extend(
+                formula.get_clauses()[clause_idx]
+                    .iter()
+                    .map(Literal::get_index),
+            );
+            sorted_clause.sort_unstable();
+            if is_tautological(&sorted_clause) {
+                continue;
+            }
+            for &branch in &sorted_clause {
+                if branch == target {
+                    continue;
+                }
+                if !continue_search(budget, signal)? {
+                    return Ok(BudgetResult::Exhausted);
+                }
+                sorted_without_two_into(&sorted_clause, target, branch, &mut remainder);
+                let hash = stable_signature_hash(&remainder);
+                let signature_id =
+                    intern_gate_signature(&mut signatures, &mut hash_buckets, hash, &remainder);
+                signatures[signature_id]
+                    .first_branches
+                    .entry(branch)
+                    .or_default()
+                    .push(clause_idx);
+            }
+        }
+
+        for &clause_idx in &second_by_size[size] {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            sorted_clause.clear();
+            sorted_clause.extend(
+                formula.get_clauses()[clause_idx]
+                    .iter()
+                    .map(Literal::get_index),
+            );
+            sorted_clause.sort_unstable();
+            if is_tautological(&sorted_clause) {
+                continue;
+            }
+            for &branch in &sorted_clause {
+                if branch == -target {
+                    continue;
+                }
+                if !continue_search(budget, signal)? {
+                    return Ok(BudgetResult::Exhausted);
+                }
+                sorted_without_two_into(&sorted_clause, -target, branch, &mut remainder);
+                let hash = stable_signature_hash(&remainder);
+                let signature_id =
+                    intern_gate_signature(&mut signatures, &mut hash_buckets, hash, &remainder);
+                signatures[signature_id]
+                    .second_branches
+                    .entry(branch)
+                    .or_default()
+                    .push(clause_idx);
+            }
+        }
+
+        for signature in signatures {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            for (first_branch, first_clauses) in &signature.first_branches {
+                for (second_branch, second_clauses) in &signature.second_branches {
+                    if !continue_search(budget, signal)? {
+                        return Ok(BudgetResult::Exhausted);
+                    }
+                    for (&first_clause, &second_clause) in first_clauses.iter().zip(second_clauses)
+                    {
+                        pairs.push(ExtractedPair {
+                            first_clause,
+                            second_clause,
+                            first_branch: *first_branch,
+                            second_branch: *second_branch,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(BudgetResult::Complete(pairs))
 }
 
 fn live_gate_clause(
+    formula: &Formula,
+    clause_idx: usize,
+    initial_clause_limit: usize,
+    pending_deleted: &[bool],
+) -> bool {
+    live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted)
+        && formula.get_clauses()[clause_idx].len() >= 3
+}
+
+fn live_factor_clause(
     formula: &Formula,
     clause_idx: usize,
     initial_clause_limit: usize,
@@ -243,89 +587,32 @@ fn live_gate_clause(
         && factor_eligible_clause(&formula.get_clauses()[clause_idx])
 }
 
-fn exact_pair_differences(
-    first: &Clause,
-    second: &Clause,
-    target: i32,
-    marks: &mut LiteralMarks,
-) -> Option<(i32, i32)> {
-    let first_stamp = marks.next_stamp();
-    for literal in first {
-        marks.marks[signed_literal_index(literal.get_index())] = first_stamp;
-    }
-
-    let mut second_branch = None;
-    let mut saw_opposite_target = false;
-    let mut second_differences = 0usize;
-    for literal in second {
-        let literal = literal.get_index();
-        if marks.marks[signed_literal_index(literal)] == first_stamp {
-            continue;
-        }
-        second_differences += 1;
-        if literal == -target {
-            saw_opposite_target = true;
-        } else if second_branch.replace(literal).is_some() {
-            return None;
-        }
-    }
-    if second_differences != 2 || !saw_opposite_target {
-        return None;
-    }
-
-    let second_stamp = marks.next_stamp();
-    for literal in second {
-        marks.marks[signed_literal_index(literal.get_index())] = second_stamp;
-    }
-
-    let mut first_branch = None;
-    let mut saw_target = false;
-    let mut first_differences = 0usize;
-    for literal in first {
-        let literal = literal.get_index();
-        if marks.marks[signed_literal_index(literal)] == second_stamp {
-            continue;
-        }
-        first_differences += 1;
-        if literal == target {
-            saw_target = true;
-        } else if first_branch.replace(literal).is_some() {
-            return None;
-        }
-    }
-    if first_differences != 2 || !saw_target {
-        return None;
-    }
-
-    Some((first_branch?, second_branch?))
-}
-
-/// Algorithm 2 from the paper: discard variables whose phase-oblivious pair
-/// count cannot meet the factor bound after paying for the four gate clauses.
-fn prefilter_candidates(workspace: &mut GateWorkspace) {
-    let candidate_stamp = workspace.next_candidate_stamp();
-    for position in 0..workspace.counted_variables.len() {
-        let variable = workspace.counted_variables[position];
-        if workspace.variable_counts[variable] >= MIN_GATE_MATCHES {
-            workspace.candidate_variables[variable] = candidate_stamp;
-        }
-    }
-}
-
 /// Algorithm 3 from the paper: normalize simultaneous polarity flips, select
 /// the largest group, and claim each physical clause at most once.
 fn group_pairs(
     pairs: &[ExtractedPair],
     target: i32,
     initial_clause_limit: usize,
-    workspace: &mut GateWorkspace,
+    budget: &ProcessBudget,
     signal: &mut Option<(Python<'_>, &mut u64)>,
-) -> PyResult<Option<GateCandidate>> {
-    workspace.group_entries.clear();
-    for (pair_idx, pair) in pairs.iter().enumerate() {
-        check_signal(signal)?;
-        let variable = pair.second_branch.unsigned_abs() as usize;
-        if workspace.candidate_variables[variable] != workspace.candidate_stamp {
+) -> PyResult<BudgetResult<Option<GateCandidate>>> {
+    let mut variable_counts = BTreeMap::<u32, usize>::new();
+    for pair in pairs {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        *variable_counts
+            .entry(pair.second_branch.unsigned_abs())
+            .or_default() += 1;
+    }
+
+    let mut groups = BTreeMap::<(u32, u32, bool), Vec<ExtractedPair>>::new();
+    for &pair in pairs {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
+        }
+        let variable = pair.second_branch.unsigned_abs();
+        if variable_counts.get(&variable).copied().unwrap_or_default() < MIN_GATE_MATCHES {
             continue;
         }
         let normalized_first = if pair.second_branch.is_positive() {
@@ -333,110 +620,83 @@ fn group_pairs(
         } else {
             -pair.first_branch
         };
-        workspace
-            .group_entries
-            .push((variable as u32, normalized_first, pair_idx));
+        let (literal_variable, literal_negative) = literal_tie_key(normalized_first);
+        groups
+            .entry((variable, literal_variable, literal_negative))
+            .or_default()
+            .push(pair);
     }
-    workspace
-        .group_entries
-        .sort_unstable_by_key(|&(variable, literal, _)| (variable, literal_tie_key(literal)));
 
-    // Rank groups by physically disjoint matches rather than raw extracted
-    // pairs. Duplicate clauses otherwise create a Cartesian product that can
-    // hide another profitable group.
-    let mut best_group = None;
-    let mut position = 0;
-    while position < workspace.group_entries.len() {
-        let (variable, literal, _) = workspace.group_entries[position];
-        let mut end = position + 1;
-        while end < workspace.group_entries.len()
-            && workspace.group_entries[end].0 == variable
-            && workspace.group_entries[end].1 == literal
-        {
-            end += 1;
+    let mut claimed = vec![false; initial_clause_limit];
+    let mut best_group: Option<(u32, i32, Vec<GateMatch>)> = None;
+    for ((variable, literal_variable, literal_negative), group) in groups {
+        if !continue_search(budget, signal)? {
+            return Ok(BudgetResult::Exhausted);
         }
-
-        let claim_stamp = workspace.next_claim_stamp();
-        let mut count = 0;
-        for entry in &workspace.group_entries[position..end] {
-            let pair = pairs[entry.2];
-            if workspace.claimed_clauses[pair.first_clause] == claim_stamp
-                || workspace.claimed_clauses[pair.second_clause] == claim_stamp
-            {
+        let literal = if literal_negative {
+            -(literal_variable as i32)
+        } else {
+            literal_variable as i32
+        };
+        let mut matches = Vec::new();
+        let mut claimed_here = Vec::new();
+        for pair in group {
+            if !continue_search(budget, signal)? {
+                return Ok(BudgetResult::Exhausted);
+            }
+            if claimed[pair.first_clause] || claimed[pair.second_clause] {
                 continue;
             }
-            workspace.claimed_clauses[pair.first_clause] = claim_stamp;
-            workspace.claimed_clauses[pair.second_clause] = claim_stamp;
-            count += 1;
+            claimed[pair.first_clause] = true;
+            claimed[pair.second_clause] = true;
+            claimed_here.push(pair.first_clause);
+            claimed_here.push(pair.second_clause);
+            matches.push(GateMatch {
+                first_clause: pair.first_clause,
+                second_clause: pair.second_clause,
+                output_positive: pair.second_branch.is_negative(),
+            });
+        }
+        for clause_idx in claimed_here {
+            claimed[clause_idx] = false;
         }
 
-        if best_group.is_none_or(|(best_count, best_variable, best_literal)| {
-            group_is_better(
-                count,
-                variable,
-                literal,
-                best_count,
-                best_variable,
-                best_literal,
-            )
-        }) {
-            best_group = Some((count, variable, literal));
-        }
-        position = end;
-    }
-
-    let Some((best_count, best_variable, best_second)) = best_group else {
-        return Ok(None);
-    };
-    if best_count < MIN_GATE_MATCHES {
-        return Ok(None);
-    }
-
-    let best_third = best_variable as i32;
-    let claim_stamp = workspace.next_claim_stamp();
-    let mut matches = Vec::with_capacity(best_count);
-    for pair in pairs {
-        check_signal(signal)?;
-        let output_positive =
-            if pair.second_branch == best_third && pair.first_branch == best_second {
-                false
-            } else if pair.second_branch == -best_third && pair.first_branch == -best_second {
-                true
-            } else {
-                continue;
-            };
-
-        if workspace.claimed_clauses[pair.first_clause] == claim_stamp
-            || workspace.claimed_clauses[pair.second_clause] == claim_stamp
+        if best_group
+            .as_ref()
+            .is_none_or(|(best_variable, best_literal, best_matches)| {
+                group_is_better(
+                    matches.len(),
+                    variable,
+                    literal,
+                    best_matches.len(),
+                    *best_variable,
+                    *best_literal,
+                )
+            })
         {
-            continue;
+            best_group = Some((variable, literal, matches));
         }
-        workspace.claimed_clauses[pair.first_clause] = claim_stamp;
-        workspace.claimed_clauses[pair.second_clause] = claim_stamp;
-        matches.push(GateMatch {
-            first_clause: pair.first_clause,
-            second_clause: pair.second_clause,
-            output_positive,
-        });
     }
 
+    let Some((best_variable, best_second, matches)) = best_group else {
+        return Ok(BudgetResult::Complete(None));
+    };
     let clause_saving = matches.len() as isize - GATE_DEFINITION_CLAUSES as isize;
     if clause_saving < FACTOR_BOUND as isize {
-        return Ok(None);
+        return Ok(BudgetResult::Complete(None));
     }
-
     debug_assert!(matches.iter().all(|gate_match| {
         gate_match.first_clause < initial_clause_limit
             && gate_match.second_clause < initial_clause_limit
     }));
 
-    Ok(Some(GateCandidate {
+    Ok(BudgetResult::Complete(Some(GateCandidate {
         target,
         second: best_second,
-        third: best_third,
+        third: best_variable as i32,
         matches,
         clause_saving,
-    }))
+    })))
 }
 
 fn group_is_better(
@@ -457,107 +717,9 @@ fn group_is_better(
                         < (best_variable, literal_tie_key(best_literal)))))
 }
 
-fn build_and_candidate(
-    index: &AndIndex,
-    start: i32,
-    pending_deleted: &[bool],
-    workspace: &mut AndWorkspace,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
-) -> PyResult<Option<AndCandidate>> {
-    let start_index = signed_literal_index(start);
-    let Some(start_partials) = index.literal_to_partials.get(start_index) else {
-        return Ok(None);
-    };
-
-    let selected_stamp = workspace.next_selected_stamp();
-    workspace.selected_literals[start_index] = selected_stamp;
-    let mut literals = vec![start];
-    let mut partial_ids = start_partials
-        .iter()
-        .copied()
-        .filter(|&partial_id| index.has_live_clause_for(start, partial_id, pending_deleted))
-        .collect::<Vec<_>>();
-    let mut touched_literals = Vec::new();
-    let mut best = None;
-
-    loop {
-        check_signal(signal)?;
-        let count_stamp = workspace.next_count_stamp();
-        touched_literals.clear();
-        for &partial_id in &partial_ids {
-            for &candidate_lit in &index.partial_to_literals[partial_id] {
-                let candidate_index = signed_literal_index(candidate_lit);
-                if workspace.selected_literals[candidate_index] == selected_stamp
-                    || !index.has_live_clause_for(candidate_lit, partial_id, pending_deleted)
-                {
-                    continue;
-                }
-                if workspace.count_stamps[candidate_index] != count_stamp {
-                    workspace.count_stamps[candidate_index] = count_stamp;
-                    workspace.literal_counts[candidate_index] = 0;
-                    touched_literals.push(candidate_lit);
-                }
-                workspace.literal_counts[candidate_index] += 1;
-            }
-        }
-
-        let Some((next_lit, remaining_partials)) =
-            choose_next_literal(&touched_literals, &workspace.literal_counts)
-        else {
-            break;
-        };
-        if remaining_partials <= 1 {
-            break;
-        }
-
-        workspace.selected_literals[signed_literal_index(next_lit)] = selected_stamp;
-        literals.push(next_lit);
-        partial_ids
-            .retain(|&partial_id| index.has_live_clause_for(next_lit, partial_id, pending_deleted));
-
-        let deleted_clauses =
-            index.live_source_count(&literals, &partial_ids, pending_deleted, workspace);
-        let clause_saving =
-            deleted_clauses as isize - (literals.len() + partial_ids.len()) as isize;
-
-        // The best quotient can occur after a temporary plateau or decline, so
-        // keep extending the greedy factor chain and remember its best prefix.
-        if best
-            .as_ref()
-            .is_none_or(|candidate: &AndCandidate| clause_saving > candidate.clause_saving)
-        {
-            best = Some(AndCandidate {
-                literals: literals.clone(),
-                partial_ids: partial_ids.clone(),
-                clause_saving,
-            });
-        }
-    }
-
-    Ok(best.filter(|candidate| candidate.clause_saving >= FACTOR_BOUND as isize))
-}
-
-fn choose_next_literal(literals: &[i32], counts: &[usize]) -> Option<(i32, usize)> {
-    let mut best = None;
-    for &literal in literals {
-        let count = counts[signed_literal_index(literal)];
-        if count == 0 {
-            continue;
-        }
-        if best.is_none_or(|(best_literal, best_count)| {
-            count > best_count
-                || (count == best_count && literal_tie_key(literal) < literal_tie_key(best_literal))
-        }) {
-            best = Some((literal, count));
-        }
-    }
-    best
-}
-
 fn apply_factorization_candidate<W: Write>(
     formula: &mut Formula,
     logger: &mut Option<DratLogger<W>>,
-    index: &AndIndex,
     pending_deleted: &mut [bool],
     deletion_indices: &mut Vec<usize>,
     candidate: FactorCandidate,
@@ -566,7 +728,6 @@ fn apply_factorization_candidate<W: Write>(
         FactorCandidate::And(candidate) => apply_and_candidate(
             formula,
             logger,
-            index,
             pending_deleted,
             deletion_indices,
             candidate,
@@ -584,7 +745,6 @@ fn apply_factorization_candidate<W: Write>(
 fn apply_and_candidate<W: Write>(
     formula: &mut Formula,
     logger: &mut Option<DratLogger<W>>,
-    index: &AndIndex,
     pending_deleted: &mut [bool],
     deletion_indices: &mut Vec<usize>,
     candidate: AndCandidate,
@@ -592,29 +752,20 @@ fn apply_and_candidate<W: Write>(
     let z = formula.add_literal();
     formula.stats.add_bva_literal();
 
-    for &partial_id in &candidate.partial_ids {
-        let partial = &index.partials[partial_id];
+    for partial in candidate.partials {
         let mut literals = Vec::with_capacity(partial.len() + 1);
         literals.push(z.clone());
-        literals.extend(partial.iter().map(|&literal| Literal::new(literal)));
+        literals.extend(partial.into_iter().map(Literal::new));
         formula.add_clause_unchecked(factor_clause(literals), logger);
     }
-    for &literal in &candidate.literals {
+    for literal in candidate.literals {
         formula.add_clause_unchecked(
             factor_clause(vec![z.negated(), Literal::new(literal)]),
             logger,
         );
     }
-
-    for &literal in &candidate.literals {
-        for &partial_id in &candidate.partial_ids {
-            let cell_id = index
-                .cell_id(literal, partial_id)
-                .expect("selected AND grid has every cell");
-            for &clause_idx in &index.cells[cell_id] {
-                claim_clause(clause_idx, pending_deleted, deletion_indices);
-            }
-        }
+    for clause_idx in candidate.source_indices {
+        claim_clause(clause_idx, pending_deleted, deletion_indices);
     }
 }
 
@@ -708,7 +859,7 @@ fn apply_gate_candidate<W: Write>(
 
     // Source clauses remain available until every proof-safe addition above is
     // complete, but become invisible to all later searches in this pass.
-    for gate_match in &candidate.matches {
+    for gate_match in candidate.matches {
         claim_clause(gate_match.first_clause, pending_deleted, deletion_indices);
         claim_clause(gate_match.second_clause, pending_deleted, deletion_indices);
     }
@@ -757,6 +908,17 @@ fn factor_clause(literals: Vec<Literal>) -> Clause {
     clause
 }
 
+fn continue_search(
+    budget: &ProcessBudget,
+    signal: &mut Option<(Python<'_>, &mut u64)>,
+) -> PyResult<bool> {
+    if budget.exhausted() {
+        return Ok(false);
+    }
+    check_signal(signal)?;
+    Ok(true)
+}
+
 fn check_signal(signal: &mut Option<(Python<'_>, &mut u64)>) -> PyResult<()> {
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
@@ -768,21 +930,53 @@ fn literal_tie_key(literal: i32) -> (u32, bool) {
     (literal.unsigned_abs(), literal.is_negative())
 }
 
-fn signed_literal_index(literal: i32) -> usize {
-    let variable = literal.unsigned_abs() as usize;
-    if literal.is_negative() {
-        variable * 2
-    } else {
-        variable * 2 - 1
-    }
-}
-
 fn sorted_without(sorted_clause: &[i32], literal_to_remove: i32) -> Vec<i32> {
     sorted_clause
         .iter()
         .copied()
         .filter(|&literal| literal != literal_to_remove)
         .collect()
+}
+
+fn sorted_without_two_into(
+    sorted_clause: &[i32],
+    first_to_remove: i32,
+    second_to_remove: i32,
+    output: &mut Vec<i32>,
+) {
+    output.clear();
+    output.extend(
+        sorted_clause
+            .iter()
+            .copied()
+            .filter(|&literal| literal != first_to_remove && literal != second_to_remove),
+    );
+}
+
+fn one_extra_literal(partial: &[i32], clause: &[i32]) -> Option<i32> {
+    if clause.len() != partial.len() + 1 {
+        return None;
+    }
+    let mut partial_position = 0;
+    let mut clause_position = 0;
+    let mut extra = None;
+    while clause_position < clause.len() {
+        if partial_position < partial.len() && partial[partial_position] == clause[clause_position]
+        {
+            partial_position += 1;
+            clause_position += 1;
+        } else if extra.is_none() {
+            extra = Some(clause[clause_position]);
+            clause_position += 1;
+        } else {
+            return None;
+        }
+    }
+    if partial_position == partial.len() {
+        extra
+    } else {
+        None
+    }
 }
 
 fn is_tautological(sorted_clause: &[i32]) -> bool {
@@ -792,7 +986,64 @@ fn is_tautological(sorted_clause: &[i32]) -> bool {
 }
 
 fn factor_eligible_clause(clause: &Clause) -> bool {
-    clause.lock_count == 0 && clause.len() >= 2 && (clause.lbd != 0 || clause.bva_generated)
+    clause.lock_count == 0
+        && (2..=MAX_FACTOR_CLAUSE_SIZE).contains(&clause.len())
+        && (clause.lbd != 0 || clause.bva_generated)
+}
+
+// Explicit FNV-1a-style hashing keeps scheduling and grouping deterministic.
+// Hash equality is only a lookup hint; every intern operation also compares the
+// complete vector before reusing an entry.
+fn stable_signature_hash(literals: &[i32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    hash ^= literals.len() as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+    for &literal in literals {
+        hash ^= literal as u32 as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn intern_gate_signature(
+    signatures: &mut Vec<GateSignature>,
+    hash_buckets: &mut HashMap<u64, Vec<usize>>,
+    hash: u64,
+    remainder: &[i32],
+) -> usize {
+    if let Some(signature_ids) = hash_buckets.get(&hash) {
+        for &signature_id in signature_ids {
+            if signatures[signature_id].remainder == remainder {
+                return signature_id;
+            }
+        }
+    }
+    let signature_id = signatures.len();
+    signatures.push(GateSignature {
+        remainder: remainder.to_vec(),
+        first_branches: BTreeMap::new(),
+        second_branches: BTreeMap::new(),
+    });
+    hash_buckets.entry(hash).or_default().push(signature_id);
+    signature_id
+}
+
+fn find_exact_vector(
+    partials: &[LocalAndPartial],
+    hash_buckets: &HashMap<u64, Vec<usize>>,
+    hash: u64,
+    candidate: &[i32],
+) -> Option<usize> {
+    hash_buckets
+        .get(&hash)?
+        .iter()
+        .copied()
+        .find(|&id| partials[id].literals == candidate)
+}
+
+enum BudgetResult<T> {
+    Complete(T),
+    Exhausted,
 }
 
 enum FactorCandidate {
@@ -806,6 +1057,12 @@ struct ExtractedPair {
     second_clause: usize,
     first_branch: i32,
     second_branch: i32,
+}
+
+struct GateSignature {
+    remainder: Vec<i32>,
+    first_branches: BTreeMap<i32, Vec<usize>>,
+    second_branches: BTreeMap<i32, Vec<usize>>,
 }
 
 struct GateMatch {
@@ -824,270 +1081,43 @@ struct GateCandidate {
 
 struct AndCandidate {
     literals: Vec<i32>,
-    partial_ids: Vec<usize>,
+    partials: Vec<Vec<i32>>,
+    source_indices: Vec<usize>,
     clause_saving: isize,
 }
 
-struct AndIndex {
-    partials: Vec<Vec<i32>>,
-    partial_to_literals: Vec<Vec<i32>>,
-    partial_to_cells: Vec<Vec<usize>>,
-    literal_to_partials: Vec<Vec<usize>>,
-    cells: Vec<Vec<usize>>,
+struct LocalAndPartial {
+    literals: Vec<i32>,
+    cells: Vec<LocalAndCell>,
 }
 
-impl AndIndex {
-    fn new(formula: &Formula, initial_clause_limit: usize, initial_variable_limit: usize) -> Self {
-        let dense_literal_limit = initial_variable_limit.saturating_mul(2).saturating_add(1);
-        let mut partial_ids = HashMap::<Vec<i32>, usize>::new();
-        let mut cell_ids = HashMap::<(usize, usize), usize>::new();
-        let mut partial_to_literals = Vec::<Vec<i32>>::new();
-        let mut partial_to_cells = Vec::<Vec<usize>>::new();
-        let mut literal_to_partials = vec![Vec::new(); dense_literal_limit];
-        let mut cells = Vec::<Vec<usize>>::new();
-
-        for (clause_idx, clause) in formula
-            .get_clauses()
-            .iter()
-            .take(initial_clause_limit)
-            .enumerate()
-        {
-            if !factor_eligible_clause(clause) {
-                continue;
-            }
-            let sorted_clause = clause.sorted_literal_indices();
-            if is_tautological(&sorted_clause) {
-                continue;
-            }
-
-            for &literal in &sorted_clause {
-                let partial = sorted_without(&sorted_clause, literal);
-                let partial_id = if let Some(&partial_id) = partial_ids.get(&partial) {
-                    partial_id
-                } else {
-                    let partial_id = partial_ids.len();
-                    partial_ids.insert(partial, partial_id);
-                    partial_to_literals.push(Vec::new());
-                    partial_to_cells.push(Vec::new());
-                    partial_id
-                };
-
-                let literal_index = signed_literal_index(literal);
-                let cell_id = if let Some(&cell_id) = cell_ids.get(&(literal_index, partial_id)) {
-                    cell_id
-                } else {
-                    let cell_id = cells.len();
-                    cell_ids.insert((literal_index, partial_id), cell_id);
-                    cells.push(Vec::new());
-                    partial_to_literals[partial_id].push(literal);
-                    partial_to_cells[partial_id].push(cell_id);
-                    literal_to_partials[literal_index].push(partial_id);
-                    cell_id
-                };
-                cells[cell_id].push(clause_idx);
-            }
-        }
-
-        let mut partials = vec![Vec::new(); partial_ids.len()];
-        for (partial, partial_id) in partial_ids {
-            partials[partial_id] = partial;
-        }
-
-        for partial_id in 0..partials.len() {
-            let literals = std::mem::take(&mut partial_to_literals[partial_id]);
-            let cell_list = std::mem::take(&mut partial_to_cells[partial_id]);
-            let mut adjacency = literals.into_iter().zip(cell_list).collect::<Vec<_>>();
-            adjacency.sort_unstable_by_key(|(literal, _)| literal_tie_key(*literal));
-            for (literal, cell_id) in adjacency {
-                partial_to_literals[partial_id].push(literal);
-                partial_to_cells[partial_id].push(cell_id);
-            }
-        }
-        for partials in &mut literal_to_partials {
-            partials.sort_unstable();
-        }
-
-        Self {
-            partials,
-            partial_to_literals,
-            partial_to_cells,
-            literal_to_partials,
-            cells,
-        }
-    }
-
-    fn cell_id(&self, literal: i32, partial_id: usize) -> Option<usize> {
-        let position = self.partial_to_literals[partial_id]
-            .binary_search_by_key(&literal_tie_key(literal), |candidate| {
-                literal_tie_key(*candidate)
-            })
-            .ok()?;
-        Some(self.partial_to_cells[partial_id][position])
-    }
-
-    fn has_live_clause_for(
-        &self,
-        literal: i32,
-        partial_id: usize,
-        pending_deleted: &[bool],
-    ) -> bool {
-        self.cell_id(literal, partial_id).is_some_and(|cell_id| {
-            self.cells[cell_id]
-                .iter()
-                .any(|&clause_idx| !pending_deleted[clause_idx])
-        })
-    }
-
-    fn live_source_count(
-        &self,
-        literals: &[i32],
-        partial_ids: &[usize],
-        pending_deleted: &[bool],
-        workspace: &mut AndWorkspace,
-    ) -> usize {
-        let stamp = workspace.next_clause_stamp();
-        let mut count = 0;
-        for &literal in literals {
-            for &partial_id in partial_ids {
-                let Some(cell_id) = self.cell_id(literal, partial_id) else {
-                    continue;
-                };
-                for &clause_idx in &self.cells[cell_id] {
-                    if !pending_deleted[clause_idx] && workspace.clause_stamps[clause_idx] != stamp
-                    {
-                        workspace.clause_stamps[clause_idx] = stamp;
-                        count += 1;
-                    }
-                }
-            }
-        }
-        count
+impl LocalAndPartial {
+    fn cell(&self, literal: i32) -> Option<&LocalAndCell> {
+        self.cells.iter().find(|cell| cell.literal == literal)
     }
 }
 
-struct LiteralMarks {
-    marks: Vec<u32>,
-    stamp: u32,
-}
-
-impl LiteralMarks {
-    fn new(initial_variable_limit: usize) -> Self {
-        Self {
-            marks: vec![0; initial_variable_limit.saturating_mul(2).saturating_add(1)],
-            stamp: 0,
-        }
-    }
-
-    fn next_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.stamp, &mut self.marks)
-    }
-}
-
-struct AndWorkspace {
-    literal_counts: Vec<usize>,
-    count_stamps: Vec<u32>,
-    count_stamp: u32,
-    selected_literals: Vec<u32>,
-    selected_stamp: u32,
-    clause_stamps: Vec<u32>,
-    clause_stamp: u32,
-}
-
-impl AndWorkspace {
-    fn new(initial_variable_limit: usize, initial_clause_limit: usize) -> Self {
-        let dense_literal_limit = initial_variable_limit.saturating_mul(2).saturating_add(1);
-        Self {
-            literal_counts: vec![0; dense_literal_limit],
-            count_stamps: vec![0; dense_literal_limit],
-            count_stamp: 0,
-            selected_literals: vec![0; dense_literal_limit],
-            selected_stamp: 0,
-            clause_stamps: vec![0; initial_clause_limit],
-            clause_stamp: 0,
-        }
-    }
-
-    fn next_count_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.count_stamp, &mut self.count_stamps)
-    }
-
-    fn next_selected_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.selected_stamp, &mut self.selected_literals)
-    }
-
-    fn next_clause_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.clause_stamp, &mut self.clause_stamps)
-    }
-}
-
-struct GateWorkspace {
-    literal_marks: LiteralMarks,
-    variable_counts: Vec<usize>,
-    variable_count_stamps: Vec<u32>,
-    variable_count_stamp: u32,
-    counted_variables: Vec<usize>,
-    candidate_variables: Vec<u32>,
-    candidate_stamp: u32,
-    group_entries: Vec<(u32, i32, usize)>,
-    claimed_clauses: Vec<u32>,
-    claim_stamp: u32,
-}
-
-impl GateWorkspace {
-    fn new(initial_variable_limit: usize, initial_clause_limit: usize) -> Self {
-        Self {
-            literal_marks: LiteralMarks::new(initial_variable_limit),
-            variable_counts: vec![0; initial_variable_limit],
-            variable_count_stamps: vec![0; initial_variable_limit],
-            variable_count_stamp: 0,
-            counted_variables: Vec::new(),
-            candidate_variables: vec![0; initial_variable_limit],
-            candidate_stamp: 0,
-            group_entries: Vec::new(),
-            claimed_clauses: vec![0; initial_clause_limit],
-            claim_stamp: 0,
-        }
-    }
-
-    fn begin_variable_counts(&mut self) {
-        next_dense_stamp(
-            &mut self.variable_count_stamp,
-            &mut self.variable_count_stamps,
-        );
-        self.counted_variables.clear();
-    }
-
-    fn record_variable(&mut self, variable: usize) {
-        if self.variable_count_stamps[variable] != self.variable_count_stamp {
-            self.variable_count_stamps[variable] = self.variable_count_stamp;
-            self.variable_counts[variable] = 0;
-            self.counted_variables.push(variable);
-        }
-        self.variable_counts[variable] += 1;
-    }
-
-    fn next_candidate_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.candidate_stamp, &mut self.candidate_variables)
-    }
-
-    fn next_claim_stamp(&mut self) -> u32 {
-        next_dense_stamp(&mut self.claim_stamp, &mut self.claimed_clauses)
-    }
-}
-
-fn next_dense_stamp(stamp: &mut u32, marks: &mut [u32]) -> u32 {
-    if *stamp == u32::MAX {
-        marks.fill(0);
-        *stamp = 1;
-    } else {
-        *stamp += 1;
-    }
-    *stamp
+struct LocalAndCell {
+    literal: i32,
+    source_indices: Vec<usize>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_BUDGET: f32 = 60.0;
+
+    fn process_with_budget<W: Write>(
+        formula: &mut Formula,
+        budget_seconds: f32,
+        logger: &mut Option<DratLogger<W>>,
+        signal: Option<(Python<'_>, &mut u64)>,
+        history: Option<&mut History>,
+    ) -> PyResult<()> {
+        let budget = ProcessBudget::new(budget_seconds);
+        process(formula, &budget, logger, signal, history)
+    }
 
     fn sorted_clauses(formula: &Formula) -> Vec<Vec<i32>> {
         let mut clauses = formula
@@ -1136,57 +1166,73 @@ mod tests {
     fn gate_candidate(formula: &Formula, target: i32) -> GateCandidate {
         let initial_clause_limit = formula.get_clauses().len();
         let pending_deleted = vec![false; initial_clause_limit];
-        let mut workspace = GateWorkspace::new(formula.assignment.len(), initial_clause_limit);
+        let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
-        let pairs = extract_pairs(
+        match build_gate_candidate(
             formula,
             initial_clause_limit,
             &pending_deleted,
             target,
-            &mut workspace,
+            &budget,
             &mut signal,
         )
-        .unwrap();
-        prefilter_candidates(&mut workspace);
-        group_pairs(
-            &pairs,
-            target,
+        .unwrap()
+        {
+            BudgetResult::Complete(Some(candidate)) => candidate,
+            BudgetResult::Complete(None) => panic!("expected gate candidate"),
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        }
+    }
+
+    fn and_candidate(formula: &Formula, start: i32) -> Option<AndCandidate> {
+        let initial_clause_limit = formula.get_clauses().len();
+        let pending_deleted = vec![false; initial_clause_limit];
+        let budget = ProcessBudget::new(TEST_BUDGET);
+        let mut signal = None;
+        match build_and_candidate(
+            formula,
             initial_clause_limit,
-            &mut workspace,
+            start,
+            &pending_deleted,
+            &budget,
             &mut signal,
         )
         .unwrap()
-        .unwrap()
+        {
+            BudgetResult::Complete(candidate) => candidate,
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        }
     }
 
     #[test]
-    fn extract_prefilter_and_group_pairs_follow_the_paper_algorithms() {
+    fn signature_extraction_and_grouping_follow_the_paper_algorithms() {
         let formula = ite_formula();
         let initial_clause_limit = formula.get_clauses().len();
         let pending_deleted = vec![false; initial_clause_limit];
-        let mut workspace = GateWorkspace::new(formula.assignment.len(), initial_clause_limit);
+        let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
-
-        let pairs = extract_pairs(
+        let pairs = match extract_signature_pairs(
             &formula,
             initial_clause_limit,
             &pending_deleted,
             1,
-            &mut workspace,
+            &budget,
             &mut signal,
         )
-        .unwrap();
+        .unwrap()
+        {
+            BudgetResult::Complete(pairs) => pairs,
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        };
         assert_eq!(pairs.len(), 5);
-        assert_eq!(workspace.variable_counts[3], 5);
         assert_eq!(pairs[0].first_branch, 2);
         assert_eq!(pairs[0].second_branch, 3);
 
-        prefilter_candidates(&mut workspace);
-        assert_eq!(workspace.candidate_variables[3], workspace.candidate_stamp);
-
-        let candidate = group_pairs(&pairs, 1, initial_clause_limit, &mut workspace, &mut signal)
-            .unwrap()
-            .unwrap();
+        let candidate =
+            match group_pairs(&pairs, 1, initial_clause_limit, &budget, &mut signal).unwrap() {
+                BudgetResult::Complete(Some(candidate)) => candidate,
+                _ => panic!("expected gate candidate"),
+            };
         assert_ne!(candidate.second, -candidate.third);
         assert_eq!(candidate.second, 2);
         assert_eq!(candidate.third, 3);
@@ -1207,7 +1253,8 @@ mod tests {
         let mut formula = ite_formula_with_schedule_padding();
         let mut logger = None;
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.assignment.len(), 16);
         assert_eq!(formula.get_clauses().len(), 29);
@@ -1250,6 +1297,37 @@ mod tests {
     }
 
     #[test]
+    fn ite_group_wins_an_equal_sized_xor_group() {
+        let mut pairs = Vec::new();
+        for offset in 0..5 {
+            pairs.push(ExtractedPair {
+                first_clause: offset * 2,
+                second_clause: offset * 2 + 1,
+                first_branch: -3,
+                second_branch: 3,
+            });
+            pairs.push(ExtractedPair {
+                first_clause: 10 + offset * 2,
+                second_clause: 10 + offset * 2 + 1,
+                first_branch: 2,
+                second_branch: 4,
+            });
+        }
+        let budget = ProcessBudget::new(TEST_BUDGET);
+        let mut signal = None;
+
+        let candidate = match group_pairs(&pairs, 1, 20, &budget, &mut signal).unwrap() {
+            BudgetResult::Complete(Some(candidate)) => candidate,
+            _ => panic!("expected gate candidate"),
+        };
+
+        assert_eq!(candidate.matches.len(), 5);
+        assert_eq!(candidate.second, 2);
+        assert_eq!(candidate.third, 4);
+        assert_ne!(candidate.second, -candidate.third);
+    }
+
+    #[test]
     fn grouping_does_not_reuse_a_physical_clause() {
         let formula = Formula::from_vec(vec![
             vec![1, 2, 10],
@@ -1261,25 +1339,26 @@ mod tests {
         ]);
         let initial_clause_limit = formula.get_clauses().len();
         let pending_deleted = vec![false; initial_clause_limit];
-        let mut workspace = GateWorkspace::new(formula.assignment.len(), initial_clause_limit);
+        let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
-        let pairs = extract_pairs(
+        let pairs = match extract_signature_pairs(
             &formula,
             initial_clause_limit,
             &pending_deleted,
             1,
-            &mut workspace,
+            &budget,
             &mut signal,
         )
-        .unwrap();
-        assert_eq!(pairs.len(), 5);
-        prefilter_candidates(&mut workspace);
-
-        assert!(
-            group_pairs(&pairs, 1, initial_clause_limit, &mut workspace, &mut signal,)
-                .unwrap()
-                .is_none()
-        );
+        .unwrap()
+        {
+            BudgetResult::Complete(pairs) => pairs,
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        };
+        assert_eq!(pairs.len(), 1);
+        assert!(matches!(
+            group_pairs(&pairs, 1, initial_clause_limit, &budget, &mut signal,).unwrap(),
+            BudgetResult::Complete(None)
+        ));
     }
 
     #[test]
@@ -1311,7 +1390,7 @@ mod tests {
         let mut proof = Vec::new();
         let mut logger = Some(DratLogger::new(&mut proof));
 
-        process(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget(&mut formula, TEST_BUDGET, &mut logger, None, None).unwrap();
         drop(logger);
         let proof = String::from_utf8(proof).unwrap();
 
@@ -1345,27 +1424,13 @@ mod tests {
             vec![4, 10],
             vec![4, 11],
         ]);
-        let initial_clause_limit = formula.get_clauses().len();
-        let index = AndIndex::new(&formula, initial_clause_limit, formula.assignment.len());
-        let pending_deleted = vec![false; initial_clause_limit];
-        let mut workspace = AndWorkspace::new(formula.assignment.len(), initial_clause_limit);
-        let mut signal = None;
 
-        let candidate =
-            build_and_candidate(&index, 1, &pending_deleted, &mut workspace, &mut signal)
-                .unwrap()
-                .unwrap();
+        let candidate = and_candidate(&formula, 1).unwrap();
 
         assert_eq!(candidate.clause_saving, 2);
         assert_eq!(candidate.literals, vec![1, 2, 3, 4]);
-        assert_eq!(
-            candidate
-                .partial_ids
-                .iter()
-                .map(|&partial_id| index.partials[partial_id].clone())
-                .collect::<Vec<_>>(),
-            vec![vec![10], vec![11]]
-        );
+        assert_eq!(candidate.partials, vec![vec![10], vec![11]]);
+        assert_eq!(candidate.source_indices.len(), 8);
     }
 
     #[test]
@@ -1382,7 +1447,8 @@ mod tests {
         ]);
 
         let mut logger = None;
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.assignment.len(), 8);
         assert_eq!(formula.get_clauses().len(), 6);
@@ -1405,7 +1471,8 @@ mod tests {
         let mut formula = Formula::from_vec(vec![vec![1, 3], vec![1, 4], vec![2, 3], vec![2, 4]]);
 
         let mut logger = None;
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.assignment.len(), 5);
         assert_eq!(formula.get_clauses().len(), 4);
@@ -1423,7 +1490,8 @@ mod tests {
         ]);
 
         let mut logger = None;
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.assignment.len(), 7);
         assert_eq!(formula.get_clauses().len(), 4);
@@ -1445,7 +1513,8 @@ mod tests {
         ]);
 
         let mut logger = None;
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.get_clauses().len(), 6);
         assert_eq!(formula.stats.bva_literals, 1);
@@ -1459,6 +1528,26 @@ mod tests {
         assert!(clauses.contains(&vec![3, 5, aux]));
         assert!(clauses.contains(&vec![6, aux]));
         assert!(clauses.contains(&vec![7, aux]));
+    }
+
+    #[test]
+    fn duplicate_and_cells_preserve_physical_clause_savings() {
+        let mut clauses = Vec::new();
+        for literal in [1, 2] {
+            for partial in [10, 11] {
+                clauses.push(vec![literal, partial]);
+                clauses.push(vec![literal, partial]);
+            }
+        }
+        let mut formula = Formula::from_vec(clauses);
+        let mut logger = None;
+
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
+
+        assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(formula.stats.clauses_deleted, 8);
+        assert_eq!(formula.get_clauses().len(), 4);
     }
 
     #[test]
@@ -1477,7 +1566,8 @@ mod tests {
         let mut formula = Formula::from_vec(clauses);
         let mut logger = None;
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         assert_eq!(formula.stats.bva_literals, 2);
         assert_eq!(formula.stats.clauses_deleted, 16);
@@ -1497,30 +1587,44 @@ mod tests {
             vec![2, 6],
         ]);
         let initial_clause_limit = formula.get_clauses().len();
-        let index = AndIndex::new(&formula, initial_clause_limit, formula.assignment.len());
         let mut pending_deleted = vec![false; initial_clause_limit];
         let mut deletion_indices = Vec::new();
-        let mut workspace = AndWorkspace::new(formula.assignment.len(), initial_clause_limit);
+        let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
-        let candidate =
-            build_and_candidate(&index, 3, &pending_deleted, &mut workspace, &mut signal)
-                .unwrap()
-                .unwrap();
+        let candidate = match build_and_candidate(
+            &formula,
+            initial_clause_limit,
+            3,
+            &pending_deleted,
+            &budget,
+            &mut signal,
+        )
+        .unwrap()
+        {
+            BudgetResult::Complete(Some(candidate)) => candidate,
+            _ => panic!("expected AND candidate"),
+        };
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
         apply_and_candidate(
             &mut formula,
             &mut logger,
-            &index,
             &mut pending_deleted,
             &mut deletion_indices,
             candidate,
         );
 
-        assert!(
-            build_and_candidate(&index, 4, &pending_deleted, &mut workspace, &mut signal,)
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            build_and_candidate(
+                &formula,
+                initial_clause_limit,
+                4,
+                &pending_deleted,
+                &budget,
+                &mut signal,
+            )
+            .unwrap(),
+            BudgetResult::Complete(None)
+        ));
         assert_eq!(deletion_indices.len(), initial_clause_limit);
     }
 
@@ -1542,7 +1646,14 @@ mod tests {
         formula.assign_implication(reason_literal.clone(), &mut history, Some(8));
         let mut logger = None;
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, Some(&mut history)).unwrap();
+        process_with_budget::<std::io::Empty>(
+            &mut formula,
+            TEST_BUDGET,
+            &mut logger,
+            None,
+            Some(&mut history),
+        )
+        .unwrap();
 
         assert_eq!(
             history.decision_levels[0].get_reason(&reason_literal),
@@ -1559,7 +1670,8 @@ mod tests {
     fn finalization_rebuilds_consistent_formula_occurrences() {
         let mut formula = ite_formula();
         let mut logger = None;
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
 
         for variable in 1..formula.assignment.len() {
             for literal in [variable as i32, -(variable as i32)] {
@@ -1577,5 +1689,146 @@ mod tests {
                 assert_eq!(formula.occurrence_of(&Literal::new(literal)), expected);
             }
         }
+    }
+
+    #[test]
+    fn zero_budget_skips_a_profitable_and_grid() {
+        let clauses = [1, 2]
+            .into_iter()
+            .flat_map(|literal| (10..=13).map(move |partial| vec![literal, partial]))
+            .collect::<Vec<_>>();
+        let mut formula = Formula::from_vec(clauses);
+        let original = sorted_clauses(&formula);
+        let original_variables = formula.assignment.len();
+        let mut logger = None;
+
+        process_with_budget::<std::io::Empty>(&mut formula, 0.0, &mut logger, None, None).unwrap();
+
+        assert_eq!(formula.assignment.len(), original_variables);
+        assert_eq!(sorted_clauses(&formula), original);
+        assert_eq!(formula.stats.bva_literals, 0);
+    }
+
+    #[test]
+    fn zero_budget_skips_a_profitable_gate() {
+        let mut formula = ite_formula();
+        let original = sorted_clauses(&formula);
+        let original_variables = formula.assignment.len();
+        let mut logger = None;
+
+        process_with_budget::<std::io::Empty>(&mut formula, 0.0, &mut logger, None, None).unwrap();
+
+        assert_eq!(formula.assignment.len(), original_variables);
+        assert_eq!(sorted_clauses(&formula), original);
+        assert_eq!(formula.stats.bva_literals, 0);
+    }
+
+    #[test]
+    fn clauses_over_factor_size_limit_are_skipped() {
+        let common = (100..=119).collect::<Vec<_>>();
+        let mut clauses = Vec::new();
+        for literal in [1, 2] {
+            for extra in 10..=13 {
+                let mut clause = common.clone();
+                clause.push(literal);
+                clause.push(extra);
+                clauses.push(clause);
+            }
+        }
+        let mut formula = Formula::from_vec(clauses);
+        let original = sorted_clauses(&formula);
+        let mut logger = None;
+
+        process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
+            .unwrap();
+
+        assert_eq!(sorted_clauses(&formula), original);
+        assert_eq!(formula.stats.bva_literals, 0);
+        assert_eq!(formula.stats.clauses_deleted, 0);
+    }
+
+    #[test]
+    fn gate_clauses_over_factor_size_limit_are_skipped() {
+        let common = (100..=117).collect::<Vec<_>>();
+        let mut clauses = Vec::new();
+        for remainder in 10..=14 {
+            let mut first = common.clone();
+            first.extend([1, 2, remainder]);
+            clauses.push(first);
+            let mut second = common.clone();
+            second.extend([-1, 3, remainder]);
+            clauses.push(second);
+        }
+        let formula = Formula::from_vec(clauses);
+        let initial_clause_limit = formula.get_clauses().len();
+        let pending_deleted = vec![false; initial_clause_limit];
+        let budget = ProcessBudget::new(TEST_BUDGET);
+        let mut signal = None;
+
+        let pairs = match extract_signature_pairs(
+            &formula,
+            initial_clause_limit,
+            &pending_deleted,
+            1,
+            &budget,
+            &mut signal,
+        )
+        .unwrap()
+        {
+            BudgetResult::Complete(pairs) => pairs,
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        };
+
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn gate_size_buckets_do_not_cross_match() {
+        let formula = Formula::from_vec(vec![
+            vec![1, 2, 10],
+            vec![1, 2, 11],
+            vec![1, 2, 12],
+            vec![1, 2, 13],
+            vec![1, 2, 14],
+            vec![-1, 3, 10, 20],
+            vec![-1, 3, 11, 20],
+            vec![-1, 3, 12, 20],
+            vec![-1, 3, 13, 20],
+            vec![-1, 3, 14, 20],
+        ]);
+        let initial_clause_limit = formula.get_clauses().len();
+        let pending_deleted = vec![false; initial_clause_limit];
+        let budget = ProcessBudget::new(TEST_BUDGET);
+        let mut signal = None;
+
+        let pairs = match extract_signature_pairs(
+            &formula,
+            initial_clause_limit,
+            &pending_deleted,
+            1,
+            &budget,
+            &mut signal,
+        )
+        .unwrap()
+        {
+            BudgetResult::Complete(pairs) => pairs,
+            BudgetResult::Exhausted => panic!("test budget exhausted"),
+        };
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn signature_hash_collisions_require_exact_remainder_equality() {
+        let mut signatures = Vec::new();
+        let mut buckets = HashMap::new();
+
+        let first = intern_gate_signature(&mut signatures, &mut buckets, 7, &[2, 10]);
+        let collision = intern_gate_signature(&mut signatures, &mut buckets, 7, &[3, 10]);
+        let repeated = intern_gate_signature(&mut signatures, &mut buckets, 7, &[2, 10]);
+
+        assert_eq!(first, 0);
+        assert_eq!(collision, 1);
+        assert_eq!(repeated, first);
+        assert_eq!(signatures.len(), 2);
     }
 }

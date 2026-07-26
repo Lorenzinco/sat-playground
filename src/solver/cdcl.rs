@@ -29,25 +29,7 @@ pub fn solve_cdcl<'py, W: Write>(
     heuristics: &mut Heuristics,
     logger: &mut Option<DratLogger<W>>,
     inprocessing: Vec<Process>,
-) -> PyResult<Option<Vec<bool>>> {
-    solve_cdcl_guided(
-        py,
-        formula,
-        implication_point,
-        heuristics,
-        logger,
-        inprocessing,
-        &mut None,
-    )
-}
-
-pub fn solve_cdcl_guided<'py, W: Write>(
-    py: Python<'_>,
-    formula: &mut Formula,
-    implication_point: ImplicationPoint,
-    heuristics: &mut Heuristics,
-    logger: &mut Option<DratLogger<W>>,
-    inprocessing: Vec<Process>,
+    inprocessing_budget: f32,
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
@@ -195,6 +177,7 @@ pub fn solve_cdcl_guided<'py, W: Write>(
                     formula,
                     &mut history,
                     &inprocessing,
+                    inprocessing_budget,
                     run_inprocessing,
                     logger,
                 )?;
@@ -392,6 +375,7 @@ fn restart<W: Write>(
     formula: &mut Formula,
     history: &mut History,
     inprocessing: &[Process],
+    inprocessing_budget: f32,
     run_inprocessing: bool,
     logger: &mut Option<DratLogger<W>>,
 ) -> PyResult<()> {
@@ -403,6 +387,7 @@ fn restart<W: Write>(
         let inprocessing_start = Instant::now();
         formula.process(
             inprocessing.to_vec(),
+            inprocessing_budget,
             logger,
             Some((py, steps)),
             false,
@@ -516,6 +501,7 @@ mod tests {
                 &mut formula,
                 &mut history,
                 &[],
+                60.0,
                 true,
                 &mut logger,
             )
@@ -600,6 +586,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_none());
@@ -620,6 +608,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_some());
@@ -640,6 +630,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_none());
@@ -661,6 +653,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_none());
@@ -681,6 +675,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_some());
@@ -701,6 +697,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_none());
@@ -722,6 +720,8 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
+                    60.0,
+                    &mut None,
                 )
                 .unwrap();
                 assert!(res.is_none());

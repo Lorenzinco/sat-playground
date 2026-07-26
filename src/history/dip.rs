@@ -7,7 +7,7 @@ use crate::history::{ConflictLearnResult, History};
 
 use std::collections::HashSet;
 
-const DIP_MAX_CLAUSE_LBD: i64 = 120;
+const DIP_MAX_CLAUSE_LBD: i64 = 2;
 
 struct DipCandidate {
     dip_a: Literal,

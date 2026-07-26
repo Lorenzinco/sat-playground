@@ -35,6 +35,9 @@ class Sat:
         drat_path: str|None = None,
         extension_guidance: dict[str, object]|None = None,
         extension_guidance_log_path: str|None = None,
+        *,
+        preprocessing_budget: float=5.0,
+        inprocessing_budget: float=0.075,
         ) -> None:
         """Solve the SAT problem.
 
@@ -43,6 +46,8 @@ class Sat:
             implication_point: UIP/DIP mode for CDCL.
             preprocess: Preprocessing techniques to apply.
             heuristics: Literal selection heuristic.
+            preprocessing_budget: Wall-clock preprocessing budget in seconds; zero skips preprocessing techniques.
+            inprocessing_budget: Wall-clock budget in seconds for each inprocessing phase; zero skips inprocessing techniques.
             drat_path: If given, write a DRAT proof to this path.
             extension_guidance: Optional compact guidance dictionary from Reduction.
             extension_guidance_log_path: Optional path for one line per observed DIP.
@@ -131,6 +136,18 @@ class Stats:
     def bva_literals(self)->int: ...
     """
     The number of auxiliary literals added by bounded variable addition.
+    """
+
+    @property
+    def bve_eliminated_variables(self)->int: ...
+    """
+    The number of variables eliminated by bounded variable elimination.
+    """
+
+    @property
+    def bve_resolvents(self)->int: ...
+    """
+    The number of resolvents added by bounded variable elimination.
     """
 
     @property

@@ -52,6 +52,8 @@ pub fn solve<'py, W: Write>(
     heuristics: Heuristics,
     logger: &mut Option<DratLogger<W>>,
     guidance: &mut Option<GuidanceTracker>,
+    preprocessing_budget: f32,
+    inprocessing_budget: f32,
 ) -> PyResult<Option<Vec<bool>>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
@@ -65,6 +67,7 @@ pub fn solve<'py, W: Write>(
     let mut preprocessing_steps = 0;
     formula.process(
         preprocess.clone(),
+        preprocessing_budget,
         logger,
         Some((py, &mut preprocessing_steps)),
         true,
@@ -127,13 +130,14 @@ pub fn solve<'py, W: Write>(
     let solve_start = Instant::now();
     let result = match algorithm {
         Algorithm::DPLL => dpll::solve_dpll(py, formula),
-        Algorithm::CDCL => cdcl::solve_cdcl_guided(
+        Algorithm::CDCL => cdcl::solve_cdcl(
             py,
             formula,
             implication_point,
             &mut heuristics,
             logger,
             inprocessing,
+            inprocessing_budget,
             guidance,
         ),
     };

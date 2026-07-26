@@ -6,3 +6,6 @@ build-backend = "maturin"
 name = "clsat"
 version = "0.1.0"
 requires-python = ">=3.8"
+
+[project.optional-dependencies]
+benchmark = ["matplotlib>=3.7"]

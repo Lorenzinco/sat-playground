@@ -3,28 +3,37 @@ use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::history::History;
+use crate::process::ProcessBudget;
 use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
 use std::collections::HashSet;
 use std::io::Write;
 
-pub fn process<W: Write>(
+pub(crate) fn process<W: Write>(
     formula: &mut Formula,
+    budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     mut history: Option<&mut History>,
 ) -> PyResult<()> {
-    while apply_best_bve_step(formula, logger, &mut signal, history.as_deref_mut())? {}
+    while !budget.exhausted()
+        && apply_best_bve_step(formula, budget, logger, &mut signal, history.as_deref_mut())?
+    {}
     Ok(())
 }
 
 fn apply_best_bve_step<W: Write>(
     formula: &mut Formula,
+    budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     signal: &mut Option<(Python<'_>, &mut u64)>,
     history: Option<&mut History>,
 ) -> PyResult<bool> {
+    if budget.exhausted() {
+        return Ok(false);
+    }
+
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
     }
@@ -33,11 +42,18 @@ fn apply_best_bve_step<W: Write>(
     let mut best_saving = 0isize;
 
     for var in 1..formula.assignment.len() {
+        if budget.exhausted() {
+            return Ok(false);
+        }
+
         if let Some((py, steps)) = signal.as_mut() {
             signal_checker(*py, *steps)?;
         }
 
-        let Some(candidate) = elimination_candidate(formula, var, signal)? else {
+        let Some(candidate) = elimination_candidate(formula, var, budget, signal)? else {
+            if budget.exhausted() {
+                return Ok(false);
+            }
             continue;
         };
 
@@ -45,6 +61,10 @@ fn apply_best_bve_step<W: Write>(
             best_saving = candidate.saving;
             best = Some(candidate);
         }
+    }
+
+    if budget.exhausted() {
+        return Ok(false);
     }
 
     let Some(candidate) = best else {
@@ -85,8 +105,13 @@ struct EliminationCandidate {
 fn elimination_candidate(
     formula: &Formula,
     var: usize,
+    budget: &ProcessBudget,
     signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<Option<EliminationCandidate>> {
+    if budget.exhausted() {
+        return Ok(None);
+    }
+
     let positive_literal = Literal::new(var as i32);
     let negative_literal = Literal::new(-(var as i32));
     let pos = formula.occurrence_of(&positive_literal);
@@ -100,23 +125,32 @@ fn elimination_candidate(
     to_delete.sort_unstable();
     to_delete.dedup();
 
-    if to_delete.iter().any(|&idx| {
-        let clause = &formula.get_clauses()[idx];
-        clause.lock_count > 0 || clause.lbd == 0
-    }) {
-        return Ok(None);
-    }
-
     let mut resolvents = Vec::new();
     let mut seen = HashSet::new();
     let mut deleted_literals = 0usize;
 
     for &idx in &to_delete {
-        deleted_literals += formula.get_clauses()[idx].len();
+        if budget.exhausted() {
+            return Ok(None);
+        }
+
+        let clause = &formula.get_clauses()[idx];
+        if clause.lock_count > 0 || clause.lbd == 0 {
+            return Ok(None);
+        }
+        deleted_literals += clause.len();
     }
 
     for &pos_idx in pos {
+        if budget.exhausted() {
+            return Ok(None);
+        }
+
         for &neg_idx in neg {
+            if budget.exhausted() {
+                return Ok(None);
+            }
+
             if let Some((py, steps)) = signal.as_mut() {
                 signal_checker(*py, *steps)?;
             }
@@ -137,7 +171,13 @@ fn elimination_candidate(
         return Ok(None);
     }
 
-    let added_literals = resolvents.iter().map(Clause::len).sum::<usize>();
+    let mut added_literals = 0;
+    for resolvent in &resolvents {
+        if budget.exhausted() {
+            return Ok(None);
+        }
+        added_literals += resolvent.len();
+    }
     let saving = deleted_literals as isize - added_literals as isize;
 
     if resolvents.len() <= to_delete.len() && saving > 0 {
@@ -159,8 +199,9 @@ mod tests {
     fn bve_eliminates_when_it_saves_literals() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
         let mut logger = None;
+        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.get_clauses().len(), 1);
         assert_eq!(
@@ -176,8 +217,9 @@ mod tests {
     fn bve_preserves_unit_contradiction_as_empty_clause() {
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
         let mut logger = None;
+        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.get_clauses().len(), 1);
         assert_eq!(formula.get_clauses()[0].len(), 0);
@@ -187,11 +229,26 @@ mod tests {
     }
 
     #[test]
+    fn bve_zero_budget_skips_elimination() {
+        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+        let mut logger = None;
+        let budget = ProcessBudget::new(0.0);
+
+        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+
+        assert_eq!(formula.get_clauses().len(), 2);
+        assert_eq!(formula.stats.bve_eliminated_variables, 0);
+        assert_eq!(formula.stats.bve_resolvents, 0);
+        assert_eq!(formula.stats.clauses_deleted, 0);
+    }
+
+    #[test]
     fn bve_is_noop_when_resolution_would_grow_formula() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![1, 3], vec![-1, 4], vec![-1, 5]]);
         let mut logger = None;
+        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.get_clauses().len(), 4);
         assert_eq!(formula.stats.bve_eliminated_variables, 0);

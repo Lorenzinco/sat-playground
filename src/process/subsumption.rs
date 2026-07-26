@@ -190,6 +190,7 @@ mod tests {
         formula
             .process::<std::io::Empty>(
                 vec![crate::process::Process::Subsumption],
+                60.0,
                 &mut None,
                 None,
                 true,
@@ -214,6 +215,7 @@ mod tests {
         formula
             .process::<std::io::Empty>(
                 vec![crate::process::Process::Subsumption],
+                60.0,
                 &mut None,
                 None,
                 true,

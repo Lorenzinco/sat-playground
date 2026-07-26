@@ -7,7 +7,7 @@ use crate::drat::DratLogger;
 use crate::formula::extension::ExtensionMap;
 use crate::history::History;
 use crate::process;
-use crate::process::Process;
+use crate::process::{Process, ProcessBudget};
 use crate::python::signal_checker;
 use crate::python::stats::Stats;
 use crate::two_watched::Watch;
@@ -323,6 +323,7 @@ impl Formula {
     pub fn process<W: Write>(
         &mut self,
         methods: Vec<Process>,
+        budget: f32,
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
         replace_subsumption_setting: bool,
@@ -334,16 +335,21 @@ impl Formula {
             self.self_subsuming = true;
         }
         let mut signal = signal;
+        let budget = ProcessBudget::new(budget);
 
         for method in methods {
+            if budget.exhausted() {
+                break;
+            }
+
             match method {
                 Process::BVA => {
                     let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                    process::bva::process(self, logger, signal, history.as_deref_mut())?;
+                    process::bva::process(self, &budget, logger, signal, history.as_deref_mut())?;
                 }
                 Process::BVE => {
                     let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                    process::bve::process(self, logger, signal, history.as_deref_mut())?;
+                    process::bve::process(self, &budget, logger, signal, history.as_deref_mut())?;
                 }
                 Process::Subsumption => {}
                 _ => println!("Not yet implemented!"),
@@ -834,6 +840,41 @@ mod tests {
                 assert_eq!(actual, expected_list, "watchlist mismatch for {:?}", lit);
             }
         }
+    }
+
+    #[test]
+    fn zero_budget_process_skips_transformations() {
+        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
+        let original_clauses: Vec<Vec<i32>> = formula
+            .get_clauses()
+            .iter()
+            .map(|clause| {
+                clause
+                    .get_literals()
+                    .iter()
+                    .map(Literal::get_index)
+                    .collect()
+            })
+            .collect();
+
+        formula
+            .process::<Empty>(vec![Process::BVE], 0.0, &mut None, None, true, None)
+            .unwrap();
+
+        let clauses: Vec<Vec<i32>> = formula
+            .get_clauses()
+            .iter()
+            .map(|clause| {
+                clause
+                    .get_literals()
+                    .iter()
+                    .map(Literal::get_index)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(clauses, original_clauses);
+        assert_eq!(formula.stats.bve_eliminated_variables, 0);
+        assert_eq!(formula.stats.clauses_deleted, 0);
     }
 
     #[test]
