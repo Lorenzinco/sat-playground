@@ -8,6 +8,7 @@ pub use process as preprocess;
 pub mod python;
 pub mod solver;
 pub mod two_watched;
+pub mod circuits;
 
 #[pyo3::pymodule]
 mod clsat {

@@ -14,9 +14,7 @@ pub(super) struct ConflictAnalysis {
     /// Assigned literals for graph vertices. Vertex 0 is the synthetic conflict
     /// and therefore uses the otherwise-invalid literal value 0.
     pub graph_literals: Vec<i32>,
-    /// Positions in the current decision-level trail, aligned with
-    /// `graph_literals`. The conflict position is `u32::MAX`.
-    pub trail_positions: Vec<u32>,
+
     /// Flat predecessor CSR. The sink is vertex 0 and the first UIP is the
     /// final (source) vertex; every predecessor has a larger vertex ID.
     pub predecessors: Vec<u32>,
@@ -60,7 +58,6 @@ pub(super) fn analyze_conflict_graph(
     let mut predecessor_literals = Vec::<i32>::new();
     let mut pred_index = Vec::<u32>::new();
     let mut graph_literals = vec![0];
-    let mut trail_positions = vec![NO_VERTEX];
 
     let mut path_count = 0usize;
     let mut current_clause = conflict_clause_index;
@@ -108,7 +105,6 @@ pub(super) fn analyze_conflict_graph(
         seen.reset(propagated_var);
         path_count = path_count.checked_sub(1)?;
         graph_literals.push(propagated.get_index());
-        trail_positions.push(u32::try_from(position).ok()?);
 
         if path_count == 0 {
             learned_literals.push(propagated.negated());
@@ -145,7 +141,6 @@ pub(super) fn analyze_conflict_graph(
         current_level,
         uip_clause_literals: learned_literals,
         graph_literals,
-        trail_positions,
         predecessors,
         pred_index,
     })

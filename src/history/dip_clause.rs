@@ -5,10 +5,8 @@ use crate::formula::literal::Literal;
 use crate::history::History;
 use crate::history::conflict_analysis::ConflictAnalysis;
 
-pub(super) struct DipClauses {
-    pub pre: Vec<Literal>,
+pub(super) struct DipClause {
     pub post: Vec<Literal>,
-    pub pre_lbd: i64,
     pub post_lbd: i64,
 }
 
@@ -18,15 +16,13 @@ pub(super) fn extract(
     formula: &Formula,
     conflict_clause_index: usize,
     dip_vertices: (u32, u32),
-) -> Option<(Literal, Literal, DipClauses)> {
+) -> Option<(Literal, Literal, DipClause)> {
     let dip_a = graph_literal(analysis, dip_vertices.0)?;
     let dip_b = graph_literal(analysis, dip_vertices.1)?;
     if dip_a.get_index().unsigned_abs() == dip_b.get_index().unsigned_abs() {
         return None;
     }
 
-    let dip_a_position = graph_position(analysis, dip_vertices.0)?;
-    let dip_b_position = graph_position(analysis, dip_vertices.1)?;
     let (post, post_levels) = extract_post(
         analysis,
         history,
@@ -35,24 +31,12 @@ pub(super) fn extract(
         &dip_a,
         &dip_b,
     )?;
-    let (pre, pre_levels) = extract_pre(
-        analysis,
-        history,
-        formula,
-        &dip_a,
-        dip_a_position,
-        &dip_b,
-        dip_b_position,
-    )?;
 
-    let pre_lbd = pre_levels.len() + 1;
     Some((
         dip_a,
         dip_b,
-        DipClauses {
-            pre,
+        DipClause {
             post,
-            pre_lbd: pre_lbd as i64,
             post_lbd: post_levels.len() as i64,
         },
     ))
@@ -61,11 +45,6 @@ pub(super) fn extract(
 fn graph_literal(analysis: &ConflictAnalysis, vertex: u32) -> Option<Literal> {
     let raw = *analysis.graph_literals.get(vertex as usize)?;
     (raw != 0).then(|| Literal::new(raw))
-}
-
-fn graph_position(analysis: &ConflictAnalysis, vertex: u32) -> Option<usize> {
-    let position = *analysis.trail_positions.get(vertex as usize)?;
-    (position != u32::MAX).then_some(position as usize)
 }
 
 fn extract_post(
@@ -125,71 +104,6 @@ fn extract_post(
             }
         }
     }
-}
-
-fn extract_pre(
-    analysis: &ConflictAnalysis,
-    history: &History,
-    formula: &Formula,
-    dip_a: &Literal,
-    dip_a_position: usize,
-    dip_b: &Literal,
-    dip_b_position: usize,
-) -> Option<(Vec<Literal>, Vec<usize>)> {
-    let level = &history.decision_levels[analysis.current_level];
-    let mut seen = BitVec::<u64>::new(formula.assignment.len() + 1);
-    seen.set(dip_a.get_index().unsigned_abs() as usize);
-    seen.set(dip_b.get_index().unsigned_abs() as usize);
-
-    let mut lower_literals = Vec::new();
-    let mut lower_levels = Vec::new();
-    let mut open = 2usize;
-    let mut trail_cursor = dip_a_position.max(dip_b_position) + 1;
-
-    let first_uip = loop {
-        trail_cursor = trail_cursor.checked_sub(1)?;
-        let literal = level.trail_literal(trail_cursor)?;
-        let var = literal.get_index().unsigned_abs() as usize;
-        if !seen.test(var) {
-            continue;
-        }
-
-        seen.reset(var);
-        open = open.checked_sub(1)?;
-        if open == 0 {
-            break literal.clone();
-        }
-
-        let reason = level.trail_reason(trail_cursor)?;
-        for reason_literal in formula.get_clauses()[reason].iter() {
-            let reason_var = reason_literal.get_index().unsigned_abs() as usize;
-            if reason_var == var || seen.test(reason_var) {
-                continue;
-            }
-
-            let reason_level = history.get_literal_level(reason_literal)?;
-            if reason_level == 0 {
-                continue;
-            }
-
-            seen.set(reason_var);
-            if reason_level == analysis.current_level {
-                open += 1;
-            } else {
-                lower_literals.push(reason_literal.clone());
-                push_level(&mut lower_levels, reason_level);
-            }
-        }
-    };
-
-    if analysis.graph_literals.last().copied()? != first_uip.get_index() {
-        return None;
-    }
-
-    let mut pre = Vec::with_capacity(lower_literals.len() + 1);
-    pre.push(first_uip.negated());
-    pre.extend(lower_literals);
-    Some((pre, lower_levels))
 }
 
 #[allow(clippy::too_many_arguments)]

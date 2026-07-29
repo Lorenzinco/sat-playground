@@ -128,9 +128,7 @@ pub fn solve_cdcl<'py, W: Write>(
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    pre_clause_without_z,
                     post_clause_without_z,
-                    pre_lbd,
                 } => learn_dip_clauses(
                     formula,
                     &mut history,
@@ -138,9 +136,7 @@ pub fn solve_cdcl<'py, W: Write>(
                     &mut propagation,
                     dip_a,
                     dip_b,
-                    pre_clause_without_z,
                     post_clause_without_z,
-                    pre_lbd,
                     guidance,
                 )?,
             };
@@ -226,9 +222,7 @@ fn learn_dip_clauses<W: Write>(
     propagation: &mut Vec<Literal>,
     dip_a: Literal,
     dip_b: Literal,
-    pre_clause_without_z: Vec<Literal>,
     post_clause_without_z: Vec<Literal>,
-    pre_lbd: i64,
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Clause>> {
     let z = extension_literal(formula, logger, &dip_a, &dip_b);
@@ -244,7 +238,6 @@ fn learn_dip_clauses<W: Write>(
     order_asserting_clause(&mut post_literals, history);
     let (post_backtrack_level, post_lbd) = dip_post_clause_metrics(&post_literals, history);
     let post_clause = Clause::from_literals(post_literals, post_lbd);
-    let pre_clause = prefixed_clause(z.clone(), pre_clause_without_z, pre_lbd);
 
     let Some(actual_backtrack) =
         backtrack_until_not_conflicting(&post_clause, post_backtrack_level, history, formula)
@@ -253,11 +246,7 @@ fn learn_dip_clauses<W: Write>(
     };
 
     let mut learned = Clause::new();
-    for lit in post_clause
-        .get_literals()
-        .iter()
-        .chain(pre_clause.get_literals())
-    {
+    for lit in post_clause.iter() {
         let _ = learned.add_literal(lit);
     }
 
@@ -271,18 +260,15 @@ fn learn_dip_clauses<W: Write>(
             post_label, post_clause
         )));
     }
-    if !post_clause.is_satisfied(&formula.assignment) && !post_clause.is_unit(&formula.assignment) {
+    if !post_clause.is_unit(&formula.assignment) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{} is neither satisfied nor asserting after backtrack: {:?}",
+            "{} is not asserting after backtrack: {:?}",
             post_label, post_clause
         )));
     }
 
     formula.stats.add_learnt_clause(&post_clause);
     let post_idx = formula.add_clause_unchecked(post_clause, logger);
-
-    formula.stats.add_learnt_clause(&pre_clause);
-    let pre_idx = formula.add_clause_unchecked(pre_clause.clone(), logger);
 
     if let Some(post_unit) = formula
         .get_clause_at_idx(post_idx)
@@ -304,21 +290,6 @@ fn learn_dip_clauses<W: Write>(
         .is_empty(&formula.assignment)
     {
         return Ok(None);
-    }
-
-    if pre_clause.is_empty(&formula.assignment) {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "DIP pre clause became conflicting immediately after post propagation: {:?}",
-            pre_clause
-        )));
-    }
-
-    if let Some(asserting_lit) = pre_clause.get_unit_literal(&formula.assignment).cloned() {
-        if let AssignResult::Assigned(lit) =
-            formula.assign_implication(asserting_lit, history, Some(pre_idx))
-        {
-            propagation.push(lit);
-        }
     }
 
     Ok(Some(learned))

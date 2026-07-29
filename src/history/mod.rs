@@ -37,9 +37,7 @@ pub enum ConflictLearnResult {
     Dip {
         dip_a: Literal,
         dip_b: Literal,
-        pre_clause_without_z: Vec<Literal>,  // ¬f ∨ ¬C
         post_clause_without_z: Vec<Literal>, // ¬D
-        pre_lbd: i64,
     },
 }
 
@@ -569,10 +567,9 @@ mod history {
 
         match result {
             ConflictLearnResult::Dip {
-                pre_clause_without_z,
                 ..
             } => {
-                assert!(!pre_clause_without_z.is_empty());
+                unreachable!()
             }
             ConflictLearnResult::Uip {
                 clause,

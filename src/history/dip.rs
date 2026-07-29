@@ -28,18 +28,28 @@ pub(super) fn learn_from_analysis(
 ) -> Option<ConflictLearnResult> {
     let pair =
         two_vertex_bottlenecks::find_middle_pair(&analysis.predecessors, &analysis.pred_index)?;
-    let (dip_a, dip_b, clauses) =
+    let (dip_a, dip_b, clause) =
         dip_clause::extract(analysis, history, formula, conflict_clause_index, pair)?;
-    if clauses.pre_lbd > MAX_DIP_CLAUSE_LBD || clauses.post_lbd > MAX_DIP_CLAUSE_LBD {
+
+    // A reused, assigned extension makes the post clause non-asserting: if z is
+    // false it is already satisfied, and if z is true its level also affects
+    // the required backtrack. Fall back to 1-UIP so every conflict makes progress.
+    if formula
+        .extensions
+        .substitute(&dip_a, &dip_b)
+        .is_some_and(|z| z.eval(&formula.assignment).is_some())
+    {
+        return None;
+    }
+
+    if clause.post_lbd > MAX_DIP_CLAUSE_LBD {
         return None;
     }
 
     Some(ConflictLearnResult::Dip {
         dip_a,
         dip_b,
-        pre_clause_without_z: clauses.pre,
-        post_clause_without_z: clauses.post,
-        pre_lbd: clauses.pre_lbd,
+        post_clause_without_z: clause.post,
     })
 }
 #[cfg(test)]
@@ -160,35 +170,22 @@ mod tests {
 
         let conflict_idx = 7;
 
-        let (dip_a, dip_b, pre_clause_without_z, post_clause_without_z) =
+        let (dip_a, dip_b, post_clause_without_z) =
             match history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP) {
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    pre_clause_without_z,
                     post_clause_without_z,
                     ..
-                } => (dip_a, dip_b, pre_clause_without_z, post_clause_without_z),
+                } => (dip_a, dip_b, post_clause_without_z),
                 _ => panic!("Expected DIP result"),
             };
 
-        assert_unique_literals(&pre_clause_without_z);
         assert_unique_literals(&post_clause_without_z);
 
         // The xMaple middle heuristic picks the pair nearest the middle of
         // the two complete source-to-conflict paths.
         assert_eq!(unordered_pair(&dip_a, &dip_b), unordered_pair(&c, &d));
-
-        // Pre-clause should contain ¬x2, ¬p, ¬q only.
-        let not_x2 = x2.negated();
-        let not_p = p.negated();
-        let not_q = q.negated();
-
-        let pre_set = lit_set(&pre_clause_without_z);
-        let expected_pre: HashSet<_> = [lit_key(&not_x2), lit_key(&not_p), lit_key(&not_q)]
-            .into_iter()
-            .collect();
-        assert_eq!(pre_set, expected_pre);
 
         // Post-clause should contain the lower-level inputs to the post-DIP region.
         let r = Literal::new(9);
@@ -293,7 +290,6 @@ mod tests {
         let (dip_a, dip_b, clauses) =
             dip_clause::extract(&analysis, &history, &formula, conflict_idx, pair)
                 .expect("Figure 1 DIP clauses");
-        let pre = clauses.pre;
         let post = clauses.post;
 
         // The middle heuristic chooses the third row of Figure 2.
@@ -302,26 +298,13 @@ mod tests {
             unordered_pair(&x(10).negated(), &x(11))
         );
 
-        assert_unique_literals(&pre);
         assert_unique_literals(&post);
 
         // Figure 2 third row:
-        // pre-DIP:  ¬x5 ∨ y1 ∨ ¬y3 ∨ ¬y4 ∨ ¬y5 ∨ y6 ∨ z
         // post-DIP: ¬z
-        let expected_pre: HashSet<_> = [
-            lit_key(&x(5).negated()),
-            lit_key(&y(1)),
-            lit_key(&y(3).negated()),
-            lit_key(&y(4).negated()),
-            lit_key(&y(5).negated()),
-            lit_key(&y(6)),
-        ]
-        .into_iter()
-        .collect();
 
         let expected_post = HashSet::new();
 
-        assert_eq!(lit_set(&pre), expected_pre);
         assert_eq!(lit_set(&post), expected_post);
     }
 
@@ -393,40 +376,68 @@ mod tests {
 
         let conflict_idx = 6;
 
-        let (dip_a, dip_b, pre_clause_without_z, post_clause_without_z) =
+        let (dip_a, dip_b, post_clause_without_z) =
             match history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP) {
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
-                    pre_clause_without_z,
                     post_clause_without_z,
                     ..
-                } => (dip_a, dip_b, pre_clause_without_z, post_clause_without_z),
+                } => (dip_a, dip_b, post_clause_without_z),
                 _ => panic!("Expected DIP result"),
             };
 
-        assert_unique_literals(&pre_clause_without_z);
         assert_unique_literals(&post_clause_without_z);
 
         // DIPs should still be {c, d}
         assert_eq!(unordered_pair(&dip_a, &dip_b), unordered_pair(&c, &d));
-
-        // Pre-clause should contain ¬x2, ¬p, ¬q only.
-        let not_x2 = x2.negated();
-        let not_p = p.negated();
-        let not_q = q.negated();
-
-        let pre_set = lit_set(&pre_clause_without_z);
-        let expected_pre: HashSet<_> = [lit_key(&not_x2), lit_key(&not_p), lit_key(&not_q)]
-            .into_iter()
-            .collect();
-        assert_eq!(pre_set, expected_pre);
 
         // Post-clause should contain ¬y (y is level 2, conflict contains ¬y)
         let not_y = y.negated();
         let post_set = lit_set(&post_clause_without_z);
         let expected_post: HashSet<_> = [lit_key(&not_y)].into_iter().collect();
         assert_eq!(post_set, expected_post);
+    }
+
+    #[test]
+    fn assigned_reused_extension_falls_back_to_uip() {
+        let clauses = vec![
+            vec![-3, -2, 4],  // ¬f ∨ ¬p ∨ a
+            vec![-3, 5],      // ¬f ∨ b
+            vec![-4, -5, -1], // ¬a ∨ ¬b ∨ ¬d
+        ];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+
+        let d = Literal::new(1);
+        let p = Literal::new(2);
+        let f = Literal::new(3);
+        let a = Literal::new(4);
+        let b = Literal::new(5);
+
+        formula.assignment.assign_history(&d, &mut history);
+        formula.assignment.assign_history(&p, &mut history);
+        formula.assignment.assign_history(&f, &mut history);
+        formula
+            .assignment
+            .assign(a.get_index().abs() as usize, true);
+        history.add_implication(&a, Some(0));
+        formula
+            .assignment
+            .assign(b.get_index().abs() as usize, true);
+        history.add_implication(&b, Some(1));
+
+        let z = formula.add_literal();
+        formula.extensions.add_substitution(&a, &b, &z);
+        formula
+            .assignment
+            .assign(z.get_index().abs() as usize, false);
+        history.add_implication(&z.negated(), None);
+
+        assert!(matches!(
+            history.analyze_conflict(&formula, 2, ImplicationPoint::DIP),
+            ConflictLearnResult::Uip { .. }
+        ));
     }
 
     #[test]
@@ -614,14 +625,13 @@ mod tests {
 
         let result = history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP);
 
-        let (dip_a, dip_b, pre_clause_without_z, post_clause_without_z) = match result {
+        let (dip_a, dip_b, post_clause_without_z) = match result {
             ConflictLearnResult::Dip {
                 dip_a,
                 dip_b,
-                pre_clause_without_z,
                 post_clause_without_z,
                 ..
-            } => (dip_a, dip_b, pre_clause_without_z, post_clause_without_z),
+            } => (dip_a, dip_b, post_clause_without_z),
             ConflictLearnResult::Uip {
                 clause,
                 backtrack_level,
@@ -641,14 +651,6 @@ mod tests {
         };
 
         assert_eq!(unordered(&dip_a, &dip_b), unordered(&a, &b));
-
-        // pre_clause_without_z represents:
-        //   ¬f ∨ ¬C
-        //
-        // Expected:
-        //   ¬f ∨ ¬p
-        assert!(pre_clause_without_z.contains(&f.negated()));
-        assert!(pre_clause_without_z.contains(&p.negated()));
 
         // post_clause_without_z represents:
         //   ¬D
@@ -671,10 +673,6 @@ mod tests {
         // pre-DIP:  z ∨ ¬f ∨ ¬p
         // post-DIP: ¬z ∨ ¬d
         let z = formula.add_literal();
-
-        let mut pre_lits = vec![z.clone()];
-        pre_lits.extend(pre_clause_without_z.clone());
-        let pre_dip = Clause::from_literals(pre_lits, -1);
 
         let mut post_lits = vec![z.negated()];
         post_lits.extend(post_clause_without_z.clone());
@@ -729,12 +727,5 @@ mod tests {
         formula
             .assignment
             .assign(z.get_index().abs() as usize, false);
-
-        // Both f and p are unassigned, so the pre-DIP clause is not asserting.
-        assert!(!pre_dip.is_unit(&formula.assignment));
-        assert_eq!(
-            pre_dip.get_unassigned_literals(&formula.assignment).len(),
-            2
-        );
     }
 }

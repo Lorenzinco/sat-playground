@@ -27,17 +27,16 @@ def parse_dimacs(filename: Path) -> List[List[int]]:
 
 
 def solve_example() -> None:
-    clauses = parse_dimacs(Path("input.dimacs"))
+    clauses = parse_dimacs(Path("tests/unsat/2bitadd_10.cnf"))
     solver = clsat.Sat(clauses)
     print("c Solving SAT problem...", flush=True)
     solver.solve(
         algorithm="cdcl",
-        implication_point="uip",
+        implication_point="dip",
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=[],
-        inprocessing_budget=0.5,
+        inprocessing=["bva"],
     )
 
     if solver.model is not None:
@@ -55,12 +54,11 @@ def solve_example() -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "solve-example":
-        if len(arguments) > 1:
-            raise SystemExit("solve-example does not accept additional arguments")
+    if arguments and arguments[0] == "benchmark":
+        return benchmark_main(arguments)
+    else:
         solve_example()
-        return 0
-    return benchmark_main(arguments)
+    return 0
 
 
 if __name__ == "__main__":
