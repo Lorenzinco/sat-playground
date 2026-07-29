@@ -3,7 +3,7 @@
 .venv
 .zed
 .ropeproject
-clsat/__pycache__
+__pycache__
 clsat/*.so
 clsat/libclsat.dylib.dSYM
 *.drat
