@@ -5,11 +5,12 @@ use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Clone)]
+#[repr(C)]
 pub struct Clause {
     // The first two literals are the watched literals, avoiding per-clause watch indices.
     literals: Box<[Literal]>,
-    lock_count: u32,
     lbd: i16,
+    lock_count: u8,
     bva_generated: bool,
 }
 

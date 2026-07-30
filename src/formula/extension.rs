@@ -1,5 +1,10 @@
+use crate::drat::DratLogger;
+use crate::formula::Formula;
+use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
+
 use std::collections::HashMap;
+use std::io::Write;
 
 #[derive(Clone)]
 pub struct ExtensionMap {
@@ -36,4 +41,37 @@ impl ExtensionMap {
             self.map.insert((idx2, idx1), substitute.get_index());
         }
     }
+}
+
+pub fn extension_literal<W: Write>(
+    formula: &mut Formula,
+    logger: &mut Option<DratLogger<W>>,
+    x: &Literal,
+    y: &Literal,
+) -> Literal {
+    if let Some(ext_lit) = formula.extensions.substitute(x, y) {
+        return ext_lit;
+    }
+
+    let z = formula.add_literal();
+    formula.stats.add_extension_literal();
+    formula.extensions.add_substitution(x, y, &z);
+
+    formula.add_clause(
+        Clause::from_literals(vec![z.clone(), x.negated(), y.negated()], 0),
+        logger,
+        None,
+    );
+    formula.add_clause(
+        Clause::from_literals(vec![z.negated(), x.clone()], 0),
+        logger,
+        None,
+    );
+    formula.add_clause(
+        Clause::from_literals(vec![z.negated(), y.clone()], 0),
+        logger,
+        None,
+    );
+
+    z
 }

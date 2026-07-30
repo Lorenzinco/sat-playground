@@ -9,6 +9,9 @@ use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
 use crate::process::Process;
+
+use crate::formula::extension::extension_literal;
+
 use crate::python::signal_checker;
 
 use pyo3::Python;
@@ -413,39 +416,6 @@ fn restart<W: Write>(
 
     formula.stats.record_restart_time(restart_start.elapsed());
     Ok(())
-}
-
-fn extension_literal<W: Write>(
-    formula: &mut Formula,
-    logger: &mut Option<DratLogger<W>>,
-    dip_a: &Literal,
-    dip_b: &Literal,
-) -> Literal {
-    if let Some(ext_lit) = formula.extensions.substitute(dip_a, dip_b) {
-        return ext_lit;
-    }
-
-    let z = formula.add_literal();
-    formula.stats.add_extension_literal();
-    formula.extensions.add_substitution(dip_a, dip_b, &z);
-
-    formula.add_clause(
-        Clause::from_literals(vec![z.clone(), dip_a.negated(), dip_b.negated()], 0),
-        logger,
-        None,
-    );
-    formula.add_clause(
-        Clause::from_literals(vec![z.negated(), dip_a.clone()], 0),
-        logger,
-        None,
-    );
-    formula.add_clause(
-        Clause::from_literals(vec![z.negated(), dip_b.clone()], 0),
-        logger,
-        None,
-    );
-
-    z
 }
 
 #[cfg(test)]

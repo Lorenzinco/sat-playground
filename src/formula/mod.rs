@@ -12,7 +12,7 @@ use crate::process;
 use crate::process::{Process, ProcessBudget};
 use crate::python::signal_checker;
 use crate::python::stats::Stats;
-use crate::two_watched::Watch;
+use crate::watchlist::Watch;
 use assignment::AssignResult;
 use assignment::Assignment;
 use clause::Clause;
@@ -750,90 +750,187 @@ impl Formula {
     ) -> Option<usize> {
         while let Some(lit) = queue.pop_front() {
             let false_lit = lit.negated();
-
-            // Taking the list gives propagation exclusive ownership and cleans only
-            // the watchlist that was actually encountered.
+    
+            // Take ownership of this literal's watchlist. We reuse this same
+            // allocation and compact surviving entries in place.
             let garbage = &self.garbage;
-            let watching_clauses = self
+            let mut watching_clauses = self
                 .watch
-                .take_live(&false_lit, |clause_idx| !garbage.is_garbage(clause_idx));
-            let mut keep_watchlist = Vec::new();
-            let mut conflict = None;
-
-            for &clause_idx in &watching_clauses {
-                // If we already hit a conflict, just push the rest back
-                if conflict.is_some() {
-                    keep_watchlist.push(clause_idx);
-                    continue;
-                }
-
-                let clause = &mut self.clauses[clause_idx as usize];
-
-                if clause.len() < 2 {
-                    keep_watchlist.push(clause_idx);
-                    if clause
-                        .get_literals()
-                        .first()
-                        .is_some_and(|watched| watched == &false_lit)
-                    {
-                        conflict = Some(clause_idx);
-                    }
-                    continue;
-                }
-
-                let false_idx = if clause.get_literals()[0] == false_lit {
-                    0
-                } else {
-                    debug_assert_eq!(clause.get_literals()[1], false_lit);
-                    1
-                };
-                let other_idx = 1 - false_idx;
-                let other_lit = clause.get_literals()[other_idx].clone();
-
-                // 1. If the other watched literal is True, the clause is already satisfied.
-                if other_lit.eval(&self.assignment) == Some(true) {
-                    keep_watchlist.push(clause_idx);
-                    continue;
-                }
-
-                // 2. Try to find a new unassigned (or true) literal in the clause to watch
-                let mut found_new_watch = false;
-                for k in 2..clause.get_literals().len() {
-                    let candidate = clause.get_literals()[k].clone();
-                    if candidate.eval(&self.assignment) != Some(false) {
-                        clause.replace_watched_literal(false_idx, k);
-                        // Add to candidate's watchlist (we don't remove from false_lit because we already took it!)
-                        self.watch.add_to_watchlist(clause_idx as usize, &candidate);
-                        found_new_watch = true;
-                        break;
-                    }
-                }
-
-                // 3. If we couldn't find a new literal to watch...
-                if !found_new_watch {
-                    keep_watchlist.push(clause_idx);
-                    if other_lit.eval(&self.assignment) == Some(false) {
-                        conflict = Some(clause_idx);
+                .take_live(&false_lit, |clause_idx| {
+                    !garbage.is_garbage(clause_idx)
+                });
+    
+            let original_len = watching_clauses.len();
+            let mut read_idx = 0;
+            let mut write_idx = 0;
+    
+            while read_idx < original_len {
+                let clause_idx = watching_clauses[read_idx];
+                let clause_usize = clause_idx as usize;
+    
+                // Unless we find a replacement watch, this clause remains in the
+                // current watchlist.
+                let mut keep_current_watch = true;
+                let mut conflict_found = false;
+    
+                {
+                    let clause = &mut self.clauses[clause_usize];
+    
+                    /*
+                     * Clauses shorter than two literals cannot participate in the
+                     * normal two-watched-literal procedure.
+                     */
+                    if clause.len() < 2 {
+                        if clause
+                            .get_literals()
+                            .first()
+                            .is_some_and(|watched| watched == &false_lit)
+                        {
+                            conflict_found = true;
+                        }
                     } else {
-                        self.assignment.assign(
-                            other_lit.get_index().abs() as usize,
-                            !other_lit.is_negated(),
-                        );
-                        history.add_implication(&other_lit, Some(clause_idx as usize));
-                        clause.increment_lock_count();
-                        queue.push_back(other_lit);
+                        /*
+                         * Determine which of the first two entries is the watch
+                         * that has just become false.
+                         */
+                        let false_idx = {
+                            let literals = clause.get_literals();
+    
+                            if literals[0] == false_lit {
+                                0
+                            } else {
+                                debug_assert_eq!(literals[1], false_lit);
+                                1
+                            }
+                        };
+    
+                        let other_idx = 1 - false_idx;
+                        let other_lit = clause.get_literals()[other_idx].clone();
+                        let other_value = other_lit.eval(&self.assignment);
+    
+                        /*
+                         * If the other watched literal is true, the clause is
+                         * already satisfied and remains on this watchlist.
+                         */
+                        if other_value != Some(true) {
+                            /*
+                             * Search for a non-false replacement watch.
+                             *
+                             * Do this with an explicit loop because this is a very
+                             * hot path and it avoids iterator/closure machinery in
+                             * profiles.
+                             */
+                            let mut replacement = None;
+    
+                            for candidate_idx in 2..clause.len() {
+                                let candidate = &clause.get_literals()[candidate_idx];
+    
+                                if candidate.eval(&self.assignment) != Some(false) {
+                                    replacement = Some(candidate_idx);
+                                    break;
+                                }
+                            }
+    
+                            if let Some(replacement_idx) = replacement {
+                                /*
+                                 * Clone before modifying the clause because
+                                 * replace_watched_literal mutably borrows it.
+                                 */
+                                let replacement_lit =
+                                    clause.get_literals()[replacement_idx].clone();
+    
+                                clause.replace_watched_literal(
+                                    false_idx,
+                                    replacement_idx,
+                                );
+    
+                                self.watch.add_to_watchlist(
+                                    clause_usize,
+                                    &replacement_lit,
+                                );
+    
+                                // The clause now watches replacement_lit instead
+                                // of false_lit, so remove it from this watchlist.
+                                keep_current_watch = false;
+                            } else {
+                                /*
+                                 * No replacement exists:
+                                 *
+                                 * - other false      => conflict
+                                 * - other unassigned => unit propagation
+                                 */
+                                match other_value {
+                                    Some(false) => {
+                                        conflict_found = true;
+                                    }
+    
+                                    None => {
+                                        self.assignment.assign(
+                                            other_lit.get_index().abs() as usize,
+                                            !other_lit.is_negated(),
+                                        );
+    
+                                        history.add_implication(
+                                            &other_lit,
+                                            Some(clause_usize),
+                                        );
+    
+                                        clause.increment_lock_count();
+                                        queue.push_back(other_lit);
+                                    }
+    
+                                    Some(true) => {
+                                        // Handled by the outer condition.
+                                        unreachable!();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+    
+                /*
+                 * Compact retained entries toward the beginning of the same
+                 * allocation.
+                 */
+                if keep_current_watch {
+                    if write_idx != read_idx {
+                        watching_clauses[write_idx] = clause_idx;
+                    }
+    
+                    write_idx += 1;
+                }
+    
+                read_idx += 1;
+    
+                if conflict_found {
+                    /*
+                     * All unprocessed clauses still watch false_lit. Preserve the
+                     * entire remaining tail in one overlapping-safe bulk move
+                     * instead of pushing each entry individually.
+                     */
+                    let remaining = original_len - read_idx;
+    
+                    if remaining != 0 && write_idx != read_idx {
+                        watching_clauses.copy_within(
+                            read_idx..original_len,
+                            write_idx,
+                        );
+                    }
+    
+                    write_idx += remaining;
+                    watching_clauses.truncate(write_idx);
+    
+                    self.watch.set(&false_lit, watching_clauses);
+    
+                    return Some(clause_usize);
+                }
             }
-
-            // Set the remaining watchlist back
-            self.watch.set(&false_lit, keep_watchlist);
-
-            if let Some(c) = conflict {
-                return Some(c as usize);
-            }
+    
+            watching_clauses.truncate(write_idx);
+            self.watch.set(&false_lit, watching_clauses);
         }
-
+    
         None
     }
 

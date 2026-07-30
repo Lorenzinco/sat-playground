@@ -8,4 +8,5 @@ clsat/*.so
 clsat/libclsat.dylib.dSYM
 *.drat
 *.dimacs
+*.trace
 /benchmark_result
