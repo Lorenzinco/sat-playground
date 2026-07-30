@@ -5,10 +5,10 @@ pub mod heuristics;
 pub mod history;
 pub mod process;
 pub use process as preprocess;
+pub mod circuits;
 pub mod python;
 pub mod solver;
 pub mod two_watched;
-pub mod circuits;
 
 #[pyo3::pymodule]
 mod clsat {

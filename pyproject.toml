@@ -9,3 +9,6 @@ requires-python = ">=3.8"
 
 [project.optional-dependencies]
 benchmark = ["matplotlib>=3.7"]
+
+[tool.maturin]
+features = ["extension-module"]

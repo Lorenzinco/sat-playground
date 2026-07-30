@@ -25,7 +25,7 @@ pub fn preprocess(formula: &mut Formula) {
     formula.stats.record_subsumption_time(start.elapsed());
 }
 
-pub fn check_new_clause(formula: &Formula, new_clause: &Clause) -> IncrementalSubsumption {
+pub fn check_new_clause(formula: &mut Formula, new_clause: &Clause) -> IncrementalSubsumption {
     let mut subset_checks = 0;
 
     let mut existing_subsumers = formula.candidate_indices_for_clause(new_clause);
@@ -33,8 +33,8 @@ pub fn check_new_clause(formula: &Formula, new_clause: &Clause) -> IncrementalSu
     existing_subsumers.dedup();
 
     for idx in existing_subsumers {
-        let existing = &formula.get_clauses()[idx];
-        if existing.lock_count > 0 || existing.len() > new_clause.len() {
+        let existing = formula.get_clause_at_idx(idx);
+        if existing.lock_count() > 0 || existing.len() > new_clause.len() {
             continue;
         }
 
@@ -58,8 +58,8 @@ pub fn check_new_clause(formula: &Formula, new_clause: &Clause) -> IncrementalSu
     };
 
     for idx in formula.occurrence_intersection(watch_a, watch_b) {
-        let existing = &formula.get_clauses()[idx];
-        if existing.lock_count > 0 || existing.len() < new_clause.len() {
+        let existing = formula.get_clause_at_idx(idx);
+        if existing.lock_count() > 0 || existing.len() < new_clause.len() {
             continue;
         }
 
@@ -84,38 +84,51 @@ struct SubsumptionResult {
     subset_checks: usize,
 }
 
-fn find_subsumed_clauses(formula: &Formula) -> SubsumptionResult {
-    let clauses = formula.get_clauses();
-    let mut deleted = vec![false; clauses.len()];
+fn find_subsumed_clauses(formula: &mut Formula) -> SubsumptionResult {
+    let mut deleted = vec![false; formula.clause_slots_len()];
     let mut to_delete = Vec::new();
     let mut subset_checks = 0;
 
-    for subsumer_idx in 0..clauses.len() {
-        if deleted[subsumer_idx] || clauses[subsumer_idx].lock_count > 0 {
+    for subsumer_idx in 0..formula.clause_slots_len() {
+        if deleted[subsumer_idx] || formula.is_clause_garbage(subsumer_idx) {
             continue;
         }
 
-        let Some((watch_a, watch_b)) = clauses[subsumer_idx].watched_literals() else {
-            continue;
+        let (watch_a, watch_b, subsumer_len, subsumer_locked) = {
+            let subsumer = formula.get_clause_at_idx(subsumer_idx);
+            let Some((watch_a, watch_b)) = subsumer.watched_literals() else {
+                continue;
+            };
+            (
+                watch_a.clone(),
+                watch_b.cloned(),
+                subsumer.len(),
+                subsumer.lock_count() > 0,
+            )
         };
+        if subsumer_locked {
+            continue;
+        }
 
-        for candidate_idx in formula.occurrence_intersection(watch_a, watch_b) {
-            if candidate_idx == subsumer_idx
-                || deleted[candidate_idx]
-                || clauses[candidate_idx].lock_count > 0
-                || clauses[candidate_idx].len() < clauses[subsumer_idx].len()
-            {
+        for candidate_idx in formula.occurrence_intersection(&watch_a, watch_b.as_ref()) {
+            if candidate_idx == subsumer_idx || deleted[candidate_idx] {
                 continue;
             }
 
-            if clauses[candidate_idx].len() == clauses[subsumer_idx].len()
-                && candidate_idx < subsumer_idx
-            {
+            let candidate = formula.get_clause_at_idx(candidate_idx);
+            if candidate.lock_count() > 0 || candidate.len() < subsumer_len {
+                continue;
+            }
+
+            if candidate.len() == subsumer_len && candidate_idx < subsumer_idx {
                 continue;
             }
 
             subset_checks += 1;
-            if clauses[subsumer_idx].is_subset_of(&clauses[candidate_idx]) {
+            if formula
+                .get_clause_at_idx(subsumer_idx)
+                .is_subset_of(candidate)
+            {
                 deleted[candidate_idx] = true;
                 to_delete.push(candidate_idx);
             }
@@ -142,20 +155,19 @@ mod tests {
 
         preprocess(&mut formula);
 
-        let clauses = formula.get_clauses();
-        assert_eq!(clauses.len(), 2);
+        assert_eq!(formula.live_clause_count(), 2);
         assert_eq!(formula.stats.clauses_subsumed, 1);
         assert!(formula.stats.subsumption_checks > 0);
         assert!(formula.stats.subsumption_nanos > 0);
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.get_literals() == &vec![Literal::new(1), Literal::new(2)])
+            formula
+                .get_clauses()
+                .any(|(_, clause)| clause.get_literals() == vec![Literal::new(1), Literal::new(2)])
         );
         assert!(
-            clauses
-                .iter()
-                .any(|clause| clause.get_literals() == &vec![Literal::new(2), Literal::new(4)])
+            formula
+                .get_clauses()
+                .any(|(_, clause)| clause.get_literals() == vec![Literal::new(2), Literal::new(4)])
         );
     }
 
@@ -165,10 +177,10 @@ mod tests {
 
         preprocess(&mut formula);
 
-        assert_eq!(formula.get_clauses().len(), 1);
+        assert_eq!(formula.live_clause_count(), 1);
         assert_eq!(formula.stats.clauses_subsumed, 2);
         assert_eq!(
-            formula.get_clauses()[0].get_literals(),
+            formula.get_clause_at_idx(0).get_literals(),
             &vec![Literal::new(1), Literal::new(2)]
         );
     }
@@ -176,11 +188,11 @@ mod tests {
     #[test]
     fn subsumption_skips_locked_candidate_clause() {
         let mut formula = Formula::from_vec(vec![vec![1], vec![1, 2]]);
-        formula.get_clause_at_idx_mut(1).lock_count = 1;
+        formula.get_clause_at_idx_mut(1).increment_lock_count();
 
         preprocess(&mut formula);
 
-        assert_eq!(formula.get_clauses().len(), 2);
+        assert_eq!(formula.live_clause_count(), 2);
         assert_eq!(formula.stats.clauses_subsumed, 0);
     }
 
@@ -205,7 +217,7 @@ mod tests {
         );
 
         assert_eq!(idx, 0);
-        assert_eq!(formula.get_clauses().len(), 1);
+        assert_eq!(formula.live_clause_count(), 1);
         assert_eq!(formula.stats.clauses_subsumed, 1);
     }
 
@@ -229,10 +241,12 @@ mod tests {
             None,
         );
 
-        assert_eq!(idx, 0);
-        assert_eq!(formula.get_clauses().len(), 1);
+        assert_eq!(idx, 1);
+        assert_eq!(formula.live_clause_count(), 1);
+        assert_eq!(formula.clause_slots_len(), 2);
+        assert_eq!(formula.get_clauses_and_garbage().count(), 2);
         assert_eq!(
-            formula.get_clauses()[0].get_literals(),
+            formula.get_clause_at_idx(1).get_literals(),
             &vec![Literal::new(1), Literal::new(2)]
         );
         assert_eq!(formula.stats.clauses_subsumed, 1);

@@ -100,7 +100,7 @@ impl Gate {
             } else {
                 self.second
             };
-            let first_source = &formula.get_clauses()[gate_match.first_clause];
+            let first_source = formula.get_clause_at_idx(gate_match.first_clause);
             let mut quotient = Vec::with_capacity(first_source.len() - 1);
             quotient.push(output.clone());
             quotient.extend(first_source.iter().filter_map(|literal| {
@@ -188,21 +188,21 @@ fn extract_signature_pairs(
     let mut second_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
 
-    for &clause_idx in formula.occurrence_of(&Literal::new(target)) {
+    for clause_idx in formula.occurrence_of(&Literal::new(target)) {
         if !continue_search(budget, signal)? {
             return Ok(BudgetResult::Exhausted);
         }
         if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
-            let size = formula.get_clauses()[clause_idx].len();
+            let size = formula.get_clause_at_idx(clause_idx).len();
             first_by_size[size].push(clause_idx);
         }
     }
-    for &clause_idx in formula.occurrence_of(&Literal::new(-target)) {
+    for clause_idx in formula.occurrence_of(&Literal::new(-target)) {
         if !continue_search(budget, signal)? {
             return Ok(BudgetResult::Exhausted);
         }
         if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
-            let size = formula.get_clauses()[clause_idx].len();
+            let size = formula.get_clause_at_idx(clause_idx).len();
             second_by_size[size].push(clause_idx);
         }
     }
@@ -227,7 +227,8 @@ fn extract_signature_pairs(
             }
             sorted_clause.clear();
             sorted_clause.extend(
-                formula.get_clauses()[clause_idx]
+                formula
+                    .get_clause_at_idx(clause_idx)
                     .iter()
                     .map(Literal::get_index),
             );
@@ -261,7 +262,8 @@ fn extract_signature_pairs(
             }
             sorted_clause.clear();
             sorted_clause.extend(
-                formula.get_clauses()[clause_idx]
+                formula
+                    .get_clause_at_idx(clause_idx)
                     .iter()
                     .map(Literal::get_index),
             );
@@ -322,7 +324,7 @@ fn live_gate_clause(
     pending_deleted: &[bool],
 ) -> bool {
     live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted)
-        && formula.get_clauses()[clause_idx].len() >= 3
+        && formula.get_clause_at_idx(clause_idx).len() >= 3
 }
 
 /// Algorithm 3 from the paper: normalize simultaneous polarity flips, select
@@ -517,7 +519,7 @@ mod tests {
     }
 
     fn find_gate(formula: &Formula, target: i32) -> Gate {
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let pending_deleted = vec![false; initial_clause_limit];
         let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
@@ -538,7 +540,7 @@ mod tests {
     }
 
     fn extracted_pairs(formula: &Formula, target: i32) -> Vec<ExtractedPair> {
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let pending_deleted = vec![false; initial_clause_limit];
         let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
@@ -560,8 +562,7 @@ mod tests {
     fn sorted_clauses(formula: &Formula) -> Vec<Vec<i32>> {
         let mut clauses = formula
             .get_clauses()
-            .iter()
-            .map(Clause::sorted_literal_indices)
+            .map(|(_, clause)| Clause::sorted_literal_indices(clause))
             .collect::<Vec<_>>();
         clauses.sort();
         clauses
@@ -581,7 +582,7 @@ mod tests {
         assert_eq!(pairs[0].first_branch, 2);
         assert_eq!(pairs[0].second_branch, 3);
 
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
         let gate = match group_pairs(&pairs, 1, initial_clause_limit, &budget, &mut signal).unwrap()
@@ -608,7 +609,8 @@ mod tests {
     fn ite_application_adds_definitions_and_quotients_then_claims_sources() {
         let mut formula = ite_formula();
         let gate = find_gate(&formula, 1);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
+        let initial_live_clause_count = formula.live_clause_count();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let mut deletion_indices = Vec::new();
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
@@ -621,7 +623,7 @@ mod tests {
         );
 
         assert_eq!(formula.assignment.len(), 16);
-        assert_eq!(formula.get_clauses().len(), initial_clause_limit + 9);
+        assert_eq!(formula.live_clause_count(), initial_live_clause_count + 9);
         assert_eq!(formula.stats.bva_literals, 1);
         assert!(pending_deleted.iter().all(|pending| *pending));
         assert_eq!(
@@ -642,10 +644,12 @@ mod tests {
         }
         assert_eq!(
             formula
-                .get_clauses()
-                .iter()
-                .skip(initial_clause_limit)
-                .filter(|clause| clause.lbd == 0 && clause.bva_generated)
+                .get_clauses_and_garbage()
+                .filter(|(physical_index, clause)| {
+                    *physical_index >= initial_clause_limit
+                        && clause.lbd() == 0
+                        && clause.is_bva_generated()
+                })
                 .count(),
             9
         );
@@ -712,7 +716,7 @@ mod tests {
         let budget = ProcessBudget::new(TEST_BUDGET);
         let mut signal = None;
         assert!(matches!(
-            group_pairs(&pairs, 1, formula.get_clauses().len(), &budget, &mut signal,).unwrap(),
+            group_pairs(&pairs, 1, formula.clause_slots_len(), &budget, &mut signal,).unwrap(),
             BudgetResult::Complete(None)
         ));
     }
@@ -743,7 +747,7 @@ mod tests {
     fn definitions_and_proof_intermediates_precede_each_quotient() {
         let mut formula = ite_formula();
         let gate = find_gate(&formula, 1);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let mut deletion_indices = Vec::new();
         let mut proof = Vec::new();

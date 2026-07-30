@@ -143,7 +143,7 @@ impl Stats {
     pub fn remove_clause(&mut self, clause: &Clause) {
         self.clauses_deleted += 1;
 
-        if clause.lbd > 0 {
+        if clause.lbd() > 0 {
             self.clauses_kept = self.clauses_kept.saturating_sub(1);
             self.learnt_clause_literals_kept = self
                 .learnt_clause_literals_kept

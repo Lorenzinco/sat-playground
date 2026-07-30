@@ -34,7 +34,7 @@ impl AndGate {
         // Only clauses containing the scheduled literal seed this local search.
         // Equal partials are interned, while duplicate physical clauses remain in
         // the cells discovered below and therefore contribute to the savings.
-        for &clause_idx in formula.occurrence_of(&Literal::new(start)) {
+        for clause_idx in formula.occurrence_of(&Literal::new(start)) {
             if !continue_search(budget, signal)? {
                 return Ok(BudgetResult::Exhausted);
             }
@@ -44,7 +44,8 @@ impl AndGate {
 
             sorted_clause.clear();
             sorted_clause.extend(
-                formula.get_clauses()[clause_idx]
+                formula
+                    .get_clause_at_idx(clause_idx)
                     .iter()
                     .map(Literal::get_index),
             );
@@ -72,14 +73,14 @@ impl AndGate {
                 .iter()
                 .min_by_key(|&&literal| {
                     (
-                        formula.occurrence_of(&Literal::new(literal)).len(),
+                        formula.live_occurrences(&Literal::new(literal)).count(),
                         literal_tie_key(literal),
                     )
                 })
                 .expect("eligible factor clauses have non-empty partials");
             let mut cells = BTreeMap::<i32, Vec<usize>>::new();
 
-            for &clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
+            for clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
                 if !continue_search(budget, signal)? {
                     return Ok(BudgetResult::Exhausted);
                 }
@@ -87,7 +88,7 @@ impl AndGate {
                     continue;
                 }
 
-                let clause = &formula.get_clauses()[clause_idx];
+                let clause = formula.get_clause_at_idx(clause_idx);
                 if clause.len() != partial.literals.len() + 1 {
                     continue;
                 }
@@ -343,9 +344,10 @@ mod tests {
     }
 
     fn sorted_generated_clauses(formula: &Formula, initial_clause_limit: usize) -> Vec<Vec<i32>> {
-        let mut clauses = formula.get_clauses()[initial_clause_limit..]
-            .iter()
-            .map(|clause| clause.sorted_literal_indices())
+        let mut clauses = formula
+            .get_clauses_and_garbage()
+            .filter(|(physical_index, _)| *physical_index >= initial_clause_limit)
+            .map(|(_, clause)| clause.sorted_literal_indices())
             .collect::<Vec<_>>();
         clauses.sort();
         clauses
@@ -372,7 +374,7 @@ mod tests {
             vec![4, 10],
             vec![4, 11],
         ]);
-        let pending_deleted = vec![false; formula.get_clauses().len()];
+        let pending_deleted = vec![false; formula.clause_slots_len()];
 
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
 
@@ -394,7 +396,7 @@ mod tests {
             vec![2, 5],
             vec![2, 6],
         ]);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
 
@@ -419,20 +421,21 @@ mod tests {
             ]
         );
         assert!(
-            formula.get_clauses()[initial_clause_limit..]
-                .iter()
-                .all(|clause| clause.bva_generated)
+            formula
+                .get_clauses_and_garbage()
+                .filter(|(physical_index, _)| *physical_index >= initial_clause_limit)
+                .all(|(_, clause)| clause.is_bva_generated())
         );
     }
 
     #[test]
     fn unprofitable_grid_is_a_noop() {
         let formula = Formula::from_vec(vec![vec![1, 3], vec![1, 4], vec![2, 3], vec![2, 4]]);
-        let pending_deleted = vec![false; formula.get_clauses().len()];
+        let pending_deleted = vec![false; formula.clause_slots_len()];
 
         assert!(find(&formula, 1, &pending_deleted).is_none());
         assert_eq!(formula.assignment.len(), 5);
-        assert_eq!(formula.get_clauses().len(), 4);
+        assert_eq!(formula.live_clause_count(), 4);
         assert_eq!(formula.stats.bva_literals, 0);
     }
 
@@ -444,7 +447,7 @@ mod tests {
             vec![1, 2, 5],
             vec![1, 2, 6],
         ]);
-        let pending_deleted = vec![false; formula.get_clauses().len()];
+        let pending_deleted = vec![false; formula.clause_slots_len()];
 
         for start in 1..=6 {
             assert!(find(&formula, start, &pending_deleted).is_none());
@@ -463,7 +466,7 @@ mod tests {
             vec![2, 6],
             vec![2, 7],
         ]);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
         assert_eq!(gate.clause_saving(), 2);
@@ -494,7 +497,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut formula = Formula::from_vec(clauses);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
 
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
@@ -505,7 +508,7 @@ mod tests {
 
         assert_eq!(deletion_indices.len(), 8);
         assert_eq!(deletion_indices, (0..8).collect::<Vec<_>>());
-        assert_eq!(formula.get_clauses().len(), 12);
+        assert_eq!(formula.live_clause_count(), 12);
         assert_eq!(formula.stats.bva_literals, 1);
     }
 
@@ -521,7 +524,7 @@ mod tests {
             vec![2, 5],
             vec![2, 6],
         ]);
-        let initial_clause_limit = formula.get_clauses().len();
+        let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let gate = find(&formula, 3, &pending_deleted).expect("expected profitable grid");
 
@@ -546,7 +549,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let formula = Formula::from_vec(clauses);
-        let pending_deleted = vec![false; formula.get_clauses().len()];
+        let pending_deleted = vec![false; formula.clause_slots_len()];
 
         assert!(find(&formula, 1, &pending_deleted).is_none());
     }

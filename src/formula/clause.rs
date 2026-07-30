@@ -1,16 +1,16 @@
 use super::literal::Literal;
 use crate::formula::Assignment;
-use crate::two_watched::Watched;
+
 use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Clone)]
 pub struct Clause {
-    literals: Vec<Literal>,
-    pub watched: Watched,
-    pub lbd: i64,
-    pub lock_count: usize,
-    pub bva_generated: bool,
+    // The first two literals are the watched literals, avoiding per-clause watch indices.
+    literals: Box<[Literal]>,
+    lock_count: u32,
+    lbd: i16,
+    bva_generated: bool,
 }
 
 impl<'a> IntoIterator for &'a Clause {
@@ -49,35 +49,53 @@ impl fmt::Debug for Clause {
 impl Clause {
     pub fn new() -> Self {
         Self {
-            literals: vec![],
-            watched: Watched::None,
+            literals: Box::new([]),
+            lock_count: 0,
             lbd: -1,
-            lock_count: 0,
             bva_generated: false,
         }
     }
 
-    fn watched_for_len(len: usize) -> Watched {
-        match len {
-            0 => Watched::None,
-            1 => Watched::One(0),
-            _ => Watched::Two(0, 1),
-        }
-    }
-
-    pub fn from_literals(literals: Vec<Literal>, lbd: i64) -> Self {
-        let watched = Self::watched_for_len(literals.len());
+    pub fn from_literals(literals: Vec<Literal>, lbd: i16) -> Self {
+        assert!(lbd >= -1, "LBD must be -1 (unknown) or non-negative");
         Self {
-            literals,
-            watched,
-            lbd,
+            literals: literals.into_boxed_slice(),
             lock_count: 0,
+            lbd,
             bva_generated: false,
         }
     }
 
-    pub fn calculate_lbd(levels: impl IntoIterator<Item = usize>) -> i64 {
-        levels.into_iter().collect::<HashSet<_>>().len() as i64
+    pub fn calculate_lbd(levels: impl IntoIterator<Item = usize>) -> i16 {
+        let distinct_levels = levels.into_iter().collect::<HashSet<_>>().len();
+        i16::try_from(distinct_levels).unwrap_or(i16::MAX)
+    }
+
+    pub fn lbd(&self) -> i16 {
+        self.lbd
+    }
+
+    pub fn lock_count(&self) -> usize {
+        self.lock_count as usize
+    }
+
+    pub fn increment_lock_count(&mut self) {
+        self.lock_count = self
+            .lock_count
+            .checked_add(1)
+            .expect("clause lock count overflow");
+    }
+
+    pub fn decrement_lock_count(&mut self) {
+        self.lock_count = self.lock_count.saturating_sub(1);
+    }
+
+    pub fn is_bva_generated(&self) -> bool {
+        self.bva_generated
+    }
+
+    pub fn mark_bva_generated(&mut self) {
+        self.bva_generated = true;
     }
 
     pub fn len(&self) -> usize {
@@ -121,21 +139,30 @@ impl Clause {
 
     /// Adds a literal to the clause, returns an Error if the literal is already present inside the clause
     pub fn add_literal(&mut self, literal: &Literal) -> Result<(), &str> {
-        if self.literals.contains(literal) {
-            return Err("Literal already inside clause");
+        self.add_literals(std::slice::from_ref(literal))
+    }
+
+    /// Adds many literals in batch, returns an error if any literal is duplicated.
+    pub fn add_literals(&mut self, literals: &[Literal]) -> Result<(), &str> {
+        for (index, literal) in literals.iter().enumerate() {
+            if self.literals.contains(literal) || literals[..index].contains(literal) {
+                return Err("Literal already inside clause");
+            }
         }
 
-        match self.watched {
-            Watched::None => self.watched = Watched::One(0),
-            Watched::One(_) => self.watched = Watched::Two(0, 1),
-            Watched::Two(_, _) => { /* Already ok */ }
+        if literals.is_empty() {
+            return Ok(());
         }
-        self.literals.push(literal.clone());
+
+        let mut combined = std::mem::take(&mut self.literals).into_vec();
+        combined.reserve_exact(literals.len());
+        combined.extend_from_slice(literals);
+        self.literals = combined.into_boxed_slice();
 
         Ok(())
     }
 
-    pub fn get_literals(&self) -> &Vec<Literal> {
+    pub fn get_literals(&self) -> &[Literal] {
         &self.literals
     }
 
@@ -150,11 +177,21 @@ impl Clause {
     }
 
     pub fn watched_literals(&self) -> Option<(&Literal, Option<&Literal>)> {
-        match self.watched {
-            Watched::None => None,
-            Watched::One(i) => Some((&self.literals[i], None)),
-            Watched::Two(i, j) => Some((&self.literals[i], Some(&self.literals[j]))),
+        match self.literals.as_ref() {
+            [] => None,
+            [first] => Some((first, None)),
+            [first, second, ..] => Some((first, Some(second))),
         }
+    }
+
+    pub(crate) fn replace_watched_literal(
+        &mut self,
+        watched_index: usize,
+        replacement_index: usize,
+    ) {
+        debug_assert!(watched_index < 2);
+        debug_assert!(replacement_index >= 2);
+        self.literals.swap(watched_index, replacement_index);
     }
 
     pub fn is_subset_of(&self, other: &Clause) -> bool {
@@ -245,7 +282,7 @@ impl Clause {
 
     pub fn negate(&self) -> Self {
         let negated_literals = self.literals.iter().map(|lit| lit.negated()).collect();
-        Self::from_literals(negated_literals, self.lbd)
+        Self::from_literals(negated_literals, self.lbd())
     }
 
     pub fn get_unit_literal(&self, assignment: &Assignment) -> Option<&Literal> {
@@ -297,4 +334,130 @@ impl Clause {
 
     //     None
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn clause_occupies_three_machine_words() {
+        assert_eq!(size_of::<Clause>(), 24);
+        assert_eq!(size_of::<Clause>(), 3 * size_of::<usize>());
+    }
+
+    #[test]
+    fn lbd_values_larger_than_i8_are_preserved() {
+        let clause = Clause::from_literals(Vec::new(), 200);
+
+        assert_eq!(clause.lbd(), 200);
+        assert_eq!(Clause::calculate_lbd(0..200), 200);
+        assert_eq!(size_of::<Clause>(), 24);
+    }
+
+    #[test]
+    fn lock_count_round_trips_without_changing_lbd() {
+        let mut clause = Clause::from_literals(vec![Literal::new(1)], 7);
+
+        clause.increment_lock_count();
+        clause.increment_lock_count();
+        assert_eq!(clause.lbd(), 7);
+        assert_eq!(clause.lock_count(), 2);
+        assert!(!clause.is_bva_generated());
+
+        clause.decrement_lock_count();
+        clause.decrement_lock_count();
+        clause.decrement_lock_count();
+        assert_eq!(clause.lbd(), 7);
+        assert_eq!(clause.lock_count(), 0);
+    }
+
+    #[test]
+    fn bva_and_lock_metadata_coexist_with_zero_lbd() {
+        let mut clause = Clause::from_literals(vec![Literal::new(1), Literal::new(2)], 0);
+
+        clause.mark_bva_generated();
+        clause.increment_lock_count();
+        assert_eq!(clause.lbd(), 0);
+        assert_eq!(clause.lock_count(), 1);
+        assert!(clause.is_bva_generated());
+
+        clause.decrement_lock_count();
+        assert_eq!(clause.lbd(), 0);
+        assert_eq!(clause.lock_count(), 0);
+        assert!(clause.is_bva_generated());
+    }
+
+    #[test]
+    fn unknown_lbd_survives_locking_and_returns_to_minus_one() {
+        let mut clause = Clause::new();
+
+        clause.increment_lock_count();
+        assert_eq!(clause.lbd(), -1);
+        assert_eq!(clause.lock_count(), 1);
+
+        clause.decrement_lock_count();
+        assert_eq!(clause.lbd(), -1);
+        assert_eq!(clause.lock_count(), 0);
+    }
+
+    #[test]
+    fn add_literals_appends_a_batch_in_order() {
+        let mut clause = Clause::from_literals(vec![Literal::new(1)], -1);
+
+        clause
+            .add_literals(&[Literal::new(2), Literal::new(-3)])
+            .unwrap();
+
+        assert_eq!(
+            clause.get_literals(),
+            &[Literal::new(1), Literal::new(2), Literal::new(-3)]
+        );
+    }
+
+    #[test]
+    fn add_literals_rejects_duplicates_atomically() {
+        let original = vec![Literal::new(1)];
+        let mut clause = Clause::from_literals(original.clone(), -1);
+
+        assert!(
+            clause
+                .add_literals(&[Literal::new(2), Literal::new(1)])
+                .is_err()
+        );
+        assert_eq!(clause.get_literals(), original);
+
+        assert!(
+            clause
+                .add_literals(&[Literal::new(2), Literal::new(2)])
+                .is_err()
+        );
+        assert_eq!(clause.get_literals(), original);
+    }
+
+    #[test]
+    fn add_literal_uses_batch_duplicate_semantics() {
+        let mut clause = Clause::new();
+
+        clause.add_literal(&Literal::new(1)).unwrap();
+        assert!(clause.add_literal(&Literal::new(1)).is_err());
+        assert_eq!(clause.get_literals(), &[Literal::new(1)]);
+    }
+
+    #[test]
+    fn replacing_a_watch_swaps_it_into_the_watched_prefix() {
+        let mut clause =
+            Clause::from_literals(vec![Literal::new(1), Literal::new(2), Literal::new(3)], -1);
+
+        clause.replace_watched_literal(0, 2);
+
+        assert_eq!(
+            clause.get_literals(),
+            &[Literal::new(3), Literal::new(2), Literal::new(1)]
+        );
+        let (first, second) = clause.watched_literals().unwrap();
+        assert_eq!(first, &Literal::new(3));
+        assert_eq!(second, Some(&Literal::new(2)));
+    }
 }

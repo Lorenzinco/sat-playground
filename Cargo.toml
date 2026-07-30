@@ -20,4 +20,6 @@ pyo3-build-config = "0.28.3"
 
 [features]
 extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+# Keep Rust test binaries linked against libpython. Maturin enables
+# `extension-module` explicitly when building the Python extension.
+default = []

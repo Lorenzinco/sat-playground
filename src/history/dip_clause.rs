@@ -117,7 +117,7 @@ fn collect_clause_frontier(
     lower_literals: &mut Vec<Literal>,
     lower_levels: &mut Vec<usize>,
 ) -> Option<()> {
-    for literal in formula.get_clauses()[clause_index].iter() {
+    for literal in formula.get_clause_at_idx(clause_index).iter() {
         let var = literal.get_index().unsigned_abs() as usize;
         if resolved_var == Some(var) || seen.test(var) {
             continue;

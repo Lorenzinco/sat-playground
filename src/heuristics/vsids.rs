@@ -50,7 +50,7 @@ impl Vsids {
         let mut positive_occurrences = vec![0usize; formula.assignment.len()];
         let mut negative_occurrences = vec![0usize; formula.assignment.len()];
 
-        for clause in formula.get_clauses() {
+        for (_, clause) in formula.get_clauses() {
             let weight = if clause.len() == 0 {
                 1.0
             } else {

@@ -105,8 +105,28 @@ impl History {
         None
     }
 
+    pub fn backtrack_until_not_conflicting(
+        &mut self,
+        clause: &Clause,
+        preferred_level: usize,
+        formula: &mut Formula,
+    ) -> Option<usize> {
+        let mut level = preferred_level;
+        loop {
+            formula.revert_decision(level + 1, self);
+            if !clause.is_empty(&formula.assignment) {
+                return Some(level);
+            }
+            if level == 0 {
+                return None;
+            }
+            level -= 1;
+        }
+    }
+
     /// Unsets inside the assignments all of the implications starting from level <level> onwards, also modifies the decision levels and implication levels undoing what's beyond <level>.
     pub fn revert_decision(&mut self, level: usize, assignment: &mut Assignment) {
+        // Does the same thing but also pushes reasons vars inside a vec, little to no overhead
         self.revert_decision_collect_reasons(level, assignment);
     }
 
@@ -320,7 +340,7 @@ mod history {
         assert_eq!(lit.get_index(), -1);
         assert!(lit.is_negated()); // -x1
 
-        assert_eq!(learned.lbd, 1);
+        assert_eq!(learned.lbd(), 1);
         assert_eq!(backtrack_level, 0);
     }
 
@@ -368,7 +388,7 @@ mod history {
         println!("Learned: {}", learned);
 
         assert_eq!(learned.len(), 2);
-        assert_eq!(learned.lbd, 2);
+        assert_eq!(learned.lbd(), 2);
         assert_eq!(backtrack_level, 1);
     }
 
@@ -566,9 +586,7 @@ mod history {
         let result = history.analyze_conflict(&formula, 4, ImplicationPoint::DIP);
 
         match result {
-            ConflictLearnResult::Dip {
-                ..
-            } => {
+            ConflictLearnResult::Dip { .. } => {
                 unreachable!()
             }
             ConflictLearnResult::Uip {

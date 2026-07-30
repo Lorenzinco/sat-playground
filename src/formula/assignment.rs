@@ -12,8 +12,8 @@ pub enum AssignResult {
 }
 
 pub struct Assignment {
-    assigned: BitVec<u64>,
-    value: BitVec<u64>,
+    assigned: BitVec<u8>,
+    value: BitVec<u8>,
 }
 
 impl Clone for Assignment {

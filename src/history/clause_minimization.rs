@@ -8,7 +8,7 @@ use crate::formula::literal::Literal;
 use crate::history::History;
 
 impl History {
-    pub fn clause_levels(&self, literals: &[Literal]) -> (usize, i64) {
+    pub fn clause_levels(&self, literals: &[Literal]) -> (usize, i16) {
         let levels = literals
             .iter()
             .filter_map(|lit| self.get_literal_level(lit))
@@ -82,7 +82,7 @@ impl History {
                     local_seen.push(c_var);
                 }
 
-                for child in formula.get_clauses()[reason_idx].get_literals() {
+                for child in formula.get_clause_at_idx(reason_idx).get_literals() {
                     let child_var = child.get_index().unsigned_abs() as usize;
                     if child_var != c_var {
                         stack.push(child.get_index());

@@ -76,7 +76,7 @@ pub fn graph_from_conflict(
         let get_preds = || -> Vec<Literal> {
             match &node {
                 NodeType::Conflict => {
-                    let clause = &formula.get_clauses()[conflict_clause_idx];
+                    let clause = formula.get_clause_at_idx(conflict_clause_idx);
                     clause.get_literals().iter().map(|l| l.negated()).collect()
                 }
                 NodeType::Literal(lit) => {
@@ -85,7 +85,7 @@ pub fn graph_from_conflict(
                     }
                     if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
                     {
-                        let reason = &formula.get_clauses()[reason_idx];
+                        let reason = formula.get_clause_at_idx(reason_idx);
                         reason
                             .get_literals()
                             .iter()
@@ -443,7 +443,7 @@ pub fn find_clauses_from_dip_pair<W>(
                 if lit_level == current_level {
                     if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
                     {
-                        let reason = &formula.get_clauses()[reason_idx];
+                        let reason = formula.get_clause_at_idx(reason_idx);
                         for reason_lit in reason.get_literals() {
                             if reason_lit == lit {
                                 continue;
@@ -459,7 +459,7 @@ pub fn find_clauses_from_dip_pair<W>(
                     }
                 }
             } else if let Some(NodeType::Conflict) = graph.get_node(node) {
-                let conflict_clause = &formula.get_clauses()[conflict_clause_idx];
+                let conflict_clause = formula.get_clause_at_idx(conflict_clause_idx);
                 for conflict_lit in conflict_clause.get_literals() {
                     let pred = conflict_lit.negated();
                     let pred_level = history.get_literal_level(&pred).unwrap_or(0);

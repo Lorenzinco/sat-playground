@@ -18,13 +18,13 @@ pub(crate) fn process<W: Write>(
     budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
-    mut history: Option<&mut History>,
+    _history: Option<&mut History>,
 ) -> PyResult<()> {
     if budget.exhausted() {
         return Ok(());
     }
 
-    let initial_clause_limit = formula.get_clauses().len();
+    let initial_clause_limit = formula.clause_slots_len();
     let initial_variable_limit = formula.assignment.len();
     let schedule = match initial_literal_schedule(
         formula,
@@ -40,7 +40,9 @@ pub(crate) fn process<W: Write>(
         return Ok(());
     }
 
-    let mut pending_deleted = vec![false; initial_clause_limit];
+    let mut pending_deleted = (0..initial_clause_limit)
+        .map(|idx| formula.is_clause_garbage(idx))
+        .collect::<Vec<_>>();
     let mut deletion_indices = Vec::new();
     let mut gate_variables_seen = vec![false; initial_variable_limit];
 
@@ -109,20 +111,14 @@ pub(crate) fn process<W: Write>(
         Ok(())
     })();
 
-    // Keep source indices stable throughout the pass and compact only once,
-    // including cancellation and ordinary budget exhaustion.
-    finalize_pending_deletions(
-        formula,
-        logger,
-        history.as_deref_mut(),
-        &pending_deleted,
-        &mut deletion_indices,
-    );
+    // Keep source indices stable throughout the pass. Finalization only marks
+    // source clauses; Formula::reduce_db owns deferred compaction and remapping.
+    finalize_pending_deletions(formula, logger, &pending_deleted, &mut deletion_indices);
     run_result
 }
 
 fn initial_literal_schedule(
-    formula: &Formula,
+    formula: &mut Formula,
     initial_clause_limit: usize,
     initial_variable_limit: usize,
     budget: &ProcessBudget,
@@ -138,18 +134,21 @@ fn initial_literal_schedule(
             if !continue_search(budget, signal)? {
                 return Ok(BudgetResult::Exhausted);
             }
+            let literal = Literal::new(literal);
+            formula.clean_occurrence(&literal);
             let mut count = 0;
-            for &idx in formula.occurrence_of(&Literal::new(literal)) {
+            for idx in formula.live_occurrences(&literal) {
                 if !continue_search(budget, signal)? {
                     return Ok(BudgetResult::Exhausted);
                 }
-                if idx < initial_clause_limit && factor_eligible_clause(&formula.get_clauses()[idx])
+                if idx < initial_clause_limit
+                    && factor_eligible_clause(formula.get_clause_at_idx(idx))
                 {
                     count += 1;
                 }
             }
             if count > 1 {
-                schedule.push((literal, count));
+                schedule.push((literal.get_index(), count));
             }
         }
     }
@@ -175,7 +174,7 @@ fn has_live_eligible_occurrence(
     budget: &ProcessBudget,
     signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<BudgetResult<bool>> {
-    for &idx in formula.occurrence_of(&Literal::new(literal)) {
+    for idx in formula.live_occurrences(&Literal::new(literal)) {
         if !continue_search(budget, signal)? {
             return Ok(BudgetResult::Exhausted);
         }
@@ -189,7 +188,6 @@ fn has_live_eligible_occurrence(
 fn finalize_pending_deletions<W: Write>(
     formula: &mut Formula,
     logger: &mut Option<DratLogger<W>>,
-    history: Option<&mut History>,
     pending_deleted: &[bool],
     deletion_indices: &mut Vec<usize>,
 ) {
@@ -199,23 +197,25 @@ fn finalize_pending_deletions<W: Write>(
     deletion_indices.sort_unstable();
 
     debug_assert_eq!(
-        pending_deleted.iter().filter(|&&pending| pending).count(),
+        pending_deleted
+            .iter()
+            .enumerate()
+            .filter(|(idx, pending)| **pending && !formula.is_clause_garbage(*idx))
+            .count(),
         deletion_indices.len()
     );
     for &idx in deletion_indices.iter() {
         debug_assert!(pending_deleted[idx]);
+        debug_assert!(!formula.is_clause_garbage(idx));
         formula.record_clause_removal(idx);
     }
-    let old_to_new = formula.delete_clauses(deletion_indices, logger);
-    if let Some(history) = history {
-        history.remap_clause_indices(&old_to_new);
-    }
+    let newly_deleted = formula.delete_clauses(deletion_indices, logger);
+    debug_assert_eq!(newly_deleted, deletion_indices.len());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formula::clause::Clause;
 
     const TEST_BUDGET: f32 = 60.0;
 
@@ -233,8 +233,7 @@ mod tests {
     fn sorted_clauses(formula: &Formula) -> Vec<Vec<i32>> {
         let mut clauses = formula
             .get_clauses()
-            .iter()
-            .map(Clause::sorted_literal_indices)
+            .map(|(_, clause)| clause.sorted_literal_indices())
             .collect::<Vec<_>>();
         clauses.sort();
         clauses
@@ -259,8 +258,7 @@ mod tests {
     fn bva_selects_and_applies_a_gate_factorization() {
         let mut clauses = ite_formula()
             .get_clauses()
-            .iter()
-            .map(|clause| clause.iter().map(Literal::get_index).collect::<Vec<_>>())
+            .map(|(_, clause)| clause.iter().map(Literal::get_index).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         for remainder in 10..=14 {
             for _ in 0..4 {
@@ -278,13 +276,12 @@ mod tests {
         assert!(
             formula
                 .get_clauses()
-                .iter()
-                .any(|clause| clause.lbd == 0 && clause.bva_generated)
+                .any(|(_, clause)| clause.lbd() == 0 && clause.is_bva_generated())
         );
     }
 
     #[test]
-    fn two_independent_factorizations_are_compacted_together() {
+    fn two_independent_factorizations_are_marked_without_compaction() {
         let mut clauses = Vec::new();
         for literal in [1, 2] {
             for partial in 10..=13 {
@@ -304,11 +301,40 @@ mod tests {
 
         assert_eq!(formula.stats.bva_literals, 2);
         assert_eq!(formula.stats.clauses_deleted, 16);
-        assert_eq!(formula.get_clauses().len(), 12);
+        assert_eq!(formula.live_clause_count(), 12);
+        assert_eq!(formula.clause_slots_len(), 28);
+        assert_eq!(formula.get_clauses_and_garbage().count(), 28);
     }
 
     #[test]
-    fn buffered_finalization_remaps_a_surviving_history_reason_once() {
+    fn existing_garbage_does_not_shrink_the_physical_initial_limit() {
+        let mut clauses = vec![vec![99]];
+        clauses.extend(
+            [1, 2]
+                .into_iter()
+                .flat_map(|literal| (10..=13).map(move |partial| vec![literal, partial])),
+        );
+        let mut formula = Formula::from_vec(clauses);
+        let mut logger = None;
+        assert_eq!(
+            formula.delete_clauses::<std::io::Empty>(&[0], &mut logger),
+            1
+        );
+        assert_eq!(formula.live_clause_count(), 8);
+        assert_eq!(formula.clause_slots_len(), 9);
+        assert_eq!(formula.get_clauses_and_garbage().count(), 9);
+
+        process_with_budget(&mut formula, TEST_BUDGET, &mut logger, None, None).unwrap();
+
+        assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(formula.stats.clauses_deleted, 8);
+        assert_eq!(formula.live_clause_count(), 6);
+        assert_eq!(formula.clause_slots_len(), 15);
+        assert_eq!(formula.get_clauses_and_garbage().count(), 15);
+    }
+
+    #[test]
+    fn buffered_finalization_preserves_a_surviving_physical_history_reason() {
         let mut formula = Formula::from_vec(vec![
             vec![1, 3],
             vec![1, 4],
@@ -336,17 +362,17 @@ mod tests {
 
         assert_eq!(
             history.decision_levels[0].get_reason(&reason_literal),
-            Some(0)
+            Some(8)
         );
-        assert_eq!(formula.get_clause_at_idx(0).lock_count, 1);
+        assert_eq!(formula.get_clause_at_idx(8).lock_count(), 1);
         assert_eq!(
-            formula.get_clause_at_idx(0).get_literals(),
+            formula.get_clause_at_idx(8).get_literals(),
             &vec![reason_literal]
         );
     }
 
     #[test]
-    fn finalization_rebuilds_consistent_occurrence_lists() {
+    fn finalization_exposes_consistent_live_occurrence_lists() {
         let mut formula = ite_formula();
         let mut logger = None;
         process_with_budget::<std::io::Empty>(&mut formula, TEST_BUDGET, &mut logger, None, None)
@@ -356,8 +382,6 @@ mod tests {
             for literal in [variable as i32, -(variable as i32)] {
                 let expected = formula
                     .get_clauses()
-                    .iter()
-                    .enumerate()
                     .filter_map(|(idx, clause)| {
                         clause
                             .iter()
@@ -365,7 +389,12 @@ mod tests {
                             .then_some(idx)
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(formula.occurrence_of(&Literal::new(literal)), expected);
+                assert_eq!(
+                    formula
+                        .live_occurrences(&Literal::new(literal))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
             }
         }
     }

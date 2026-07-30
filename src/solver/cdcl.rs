@@ -39,14 +39,12 @@ pub fn solve_cdcl<'py, W: Write>(
     let mut next_restart_conflicts = RESTART_CONFLICT_SCALE * luby(restart_count + 1);
     let mut next_db_reduction_conflicts = DB_REDUCTION_CONFLICT_INTERVAL;
 
-    if formula.get_clauses().iter().any(|clause| clause.len() == 0) {
+    if formula.get_clauses().any(|(_, clause)| clause.len() == 0) {
         return unsat(logger);
     }
 
     let initial_units: Vec<_> = formula
         .get_clauses()
-        .iter()
-        .enumerate()
         .filter(|(_, clause)| clause.len() == 1)
         .map(|(idx, clause)| (idx, clause.get_literals()[0].clone()))
         .collect();
@@ -188,7 +186,10 @@ fn learn_uip_clause<W: Write>(
     learned: Clause,
     backtrack_level: usize,
 ) -> PyResult<Option<Clause>> {
-    if backtrack_until_not_conflicting(&learned, backtrack_level, history, formula).is_none() {
+    if history
+        .backtrack_until_not_conflicting(&learned, backtrack_level, formula)
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -230,7 +231,7 @@ fn learn_dip_clauses<W: Write>(
 
     let raw_post_clause = prefixed_clause(z.negated(), post_clause_without_z, 0);
     let (mut post_literals, minimized_literals, minimization_time) =
-        history.minimize_clause_literals(formula, raw_post_clause.get_literals().clone());
+        history.minimize_clause_literals(formula, raw_post_clause.get_literals().to_vec());
     formula
         .stats
         .add_minimized_literals(minimized_literals as u64);
@@ -240,15 +241,15 @@ fn learn_dip_clauses<W: Write>(
     let post_clause = Clause::from_literals(post_literals, post_lbd);
 
     let Some(actual_backtrack) =
-        backtrack_until_not_conflicting(&post_clause, post_backtrack_level, history, formula)
+        history.backtrack_until_not_conflicting(&post_clause, post_backtrack_level, formula)
     else {
         return Ok(None);
     };
 
     let mut learned = Clause::new();
-    for lit in post_clause.iter() {
-        let _ = learned.add_literal(lit);
-    }
+    learned
+        .add_literals(post_clause.get_literals())
+        .expect("post clause literals are unique");
 
     let post_label = format!(
         "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={}",
@@ -307,7 +308,7 @@ fn observe_dip_extension(
     Ok(())
 }
 
-fn dip_post_clause_metrics(literals: &[Literal], history: &History) -> (usize, i64) {
+fn dip_post_clause_metrics(literals: &[Literal], history: &History) -> (usize, i16) {
     let mut levels = Vec::new();
     let mut backtrack_level = 0;
     for literal in literals.iter().skip(1) {
@@ -321,7 +322,10 @@ fn dip_post_clause_metrics(literals: &[Literal], history: &History) -> (usize, i
     }
 
     // The unassigned extension literal forms its own LBD block.
-    (backtrack_level, levels.len() as i64 + 1)
+    let lbd = i16::try_from(levels.len())
+        .unwrap_or(i16::MAX)
+        .saturating_add(1);
+    (backtrack_level, lbd)
 }
 
 fn order_asserting_clause(literals: &mut [Literal], history: &History) {
@@ -341,7 +345,7 @@ fn order_asserting_clause(literals: &mut [Literal], history: &History) {
     literals.swap(1, highest);
 }
 
-fn prefixed_clause(first: Literal, rest: Vec<Literal>, lbd: i64) -> Clause {
+fn prefixed_clause(first: Literal, rest: Vec<Literal>, lbd: i16) -> Clause {
     let mut literals = Vec::with_capacity(rest.len() + 1);
     literals.push(first.clone());
     literals.extend(rest.into_iter().filter(|literal| literal != &first));
@@ -409,25 +413,6 @@ fn restart<W: Write>(
 
     formula.stats.record_restart_time(restart_start.elapsed());
     Ok(())
-}
-
-fn backtrack_until_not_conflicting(
-    clause: &Clause,
-    preferred_level: usize,
-    history: &mut History,
-    formula: &mut Formula,
-) -> Option<usize> {
-    let mut level = preferred_level;
-    loop {
-        formula.revert_decision(level + 1, history);
-        if !clause.is_empty(&formula.assignment) {
-            return Some(level);
-        }
-        if level == 0 {
-            return None;
-        }
-        level -= 1;
-    }
 }
 
 fn extension_literal<W: Write>(
@@ -499,7 +484,7 @@ mod tests {
             formula.assign_implication(implied, &mut history, Some(1)),
             AssignResult::Assigned(_)
         ));
-        assert_eq!(formula.get_clause_at_idx(1).lock_count, 1);
+        assert_eq!(formula.get_clause_at_idx(1).lock_count(), 1);
 
         Python::attach(|py| {
             let mut steps = 0;
@@ -522,7 +507,7 @@ mod tests {
         assert_eq!(history.get_decision_level(), 0);
         assert_eq!(formula.assignment.get_value(1), None);
         assert_eq!(formula.assignment.get_value(2), None);
-        assert_eq!(formula.get_clause_at_idx(1).lock_count, 0);
+        assert_eq!(formula.get_clause_at_idx(1).lock_count(), 0);
     }
 
     #[test]
@@ -556,10 +541,13 @@ mod tests {
         assert_eq!(formula.stats.bva_literals, 0);
         assert_eq!(formula.stats.literals_learnt, 1);
 
-        let clauses = formula.get_clauses();
-        assert_eq!(clauses[clauses.len() - 3].lbd, 0);
-        assert_eq!(clauses[clauses.len() - 2].lbd, 0);
-        assert_eq!(clauses[clauses.len() - 1].lbd, 0);
+        let extension_lbds = formula
+            .get_clauses()
+            .rev()
+            .take(3)
+            .map(|(_, clause)| clause.lbd())
+            .collect::<Vec<_>>();
+        assert_eq!(extension_lbds, vec![0, 0, 0]);
     }
 
     #[test]

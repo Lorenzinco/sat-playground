@@ -29,7 +29,7 @@ impl FromPyObject<'_, '_> for Heuristics {
 }
 
 impl Heuristics {
-    pub fn bump(&mut self, literals: &Vec<Literal>) {
+    pub fn bump(&mut self, literals: &[Literal]) {
         match self {
             Heuristics::VSIDS(vsids) => {
                 for literal in literals {

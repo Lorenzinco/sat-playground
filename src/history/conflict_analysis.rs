@@ -67,7 +67,7 @@ pub(super) fn analyze_conflict_graph(
     loop {
         pred_index.push(u32::try_from(predecessor_literals.len()).ok()?);
 
-        for literal in formula.get_clauses()[current_clause].iter() {
+        for literal in formula.get_clause_at_idx(current_clause).iter() {
             let var = literal.get_index().unsigned_abs() as usize;
             if resolved_var == Some(var) {
                 continue;

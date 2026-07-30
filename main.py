@@ -55,7 +55,7 @@ def solve_example() -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "benchmark":
-        return benchmark_main(arguments)
+        return benchmark_main(arguments[1:])
     else:
         solve_example()
     return 0

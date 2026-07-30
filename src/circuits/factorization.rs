@@ -76,19 +76,20 @@ pub(crate) fn live_factor_clause(
     pending_deleted: &[bool],
 ) -> bool {
     clause_idx < initial_clause_limit
+        && !formula.is_clause_garbage(clause_idx)
         && !pending_deleted[clause_idx]
-        && factor_eligible_clause(&formula.get_clauses()[clause_idx])
+        && factor_eligible_clause(formula.get_clause_at_idx(clause_idx))
 }
 
 pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
-    clause.lock_count == 0
+    clause.lock_count() == 0
         && (2..=MAX_FACTOR_CLAUSE_SIZE).contains(&clause.len())
-        && (clause.lbd != 0 || clause.bva_generated)
+        && (clause.lbd() != 0 || clause.is_bva_generated())
 }
 
 pub(crate) fn generated_clause(literals: Vec<Literal>) -> Clause {
     let mut clause = Clause::from_literals(literals, 0);
-    clause.bva_generated = true;
+    clause.mark_bva_generated();
     clause
 }
 
@@ -145,8 +146,8 @@ mod tests {
     #[test]
     fn generated_clauses_are_marked_as_permanent_bva_clauses() {
         let clause = generated_clause(vec![Literal::new(1), Literal::new(-2)]);
-        assert_eq!(clause.lbd, 0);
-        assert!(clause.bva_generated);
+        assert_eq!(clause.lbd(), 0);
+        assert!(clause.is_bva_generated());
     }
 
     #[test]
