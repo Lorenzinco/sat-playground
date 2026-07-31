@@ -1,12 +1,11 @@
 use crate::circuits::factorization::{
-    BudgetResult, FACTOR_BOUND, claim_clause, continue_search, generated_clause, is_tautological,
-    literal_tie_key, live_factor_clause, stable_signature_hash,
+    BudgetResult, FACTOR_BOUND, claim_clause, generated_clause, is_tautological,
+    literal_tie_key, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
-use crate::process::ProcessBudget;
-use pyo3::Python;
+use crate::process::bva::{ClauseWindow, live_window_factor_clause};
 use pyo3::prelude::PyResult;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -21,11 +20,9 @@ pub(crate) struct AndGate {
 impl AndGate {
     pub(crate) fn find(
         formula: &Formula,
-        initial_clause_limit: usize,
+        window: &ClauseWindow,
         start: i32,
         pending_deleted: &[bool],
-        budget: &ProcessBudget,
-        signal: &mut Option<(Python<'_>, &mut u64)>,
     ) -> PyResult<BudgetResult<Option<AndGate>>> {
         let mut partials = Vec::<AndPartial>::new();
         let mut partial_hash_buckets = HashMap::<u64, Vec<usize>>::new();
@@ -35,10 +32,12 @@ impl AndGate {
         // Equal partials are interned, while duplicate physical clauses remain in
         // the cells discovered below and therefore contribute to the savings.
         for clause_idx in formula.occurrence_of(&Literal::new(start)) {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
-            if !live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+            if !live_window_factor_clause(
+                formula,
+                clause_idx,
+                window,
+                pending_deleted,
+            ) {
                 continue;
             }
 
@@ -65,15 +64,22 @@ impl AndGate {
         // Discover each row through its shortest occurrence list. A candidate
         // clause belongs to a cell exactly when it is the partial plus one literal.
         for partial in &mut partials {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             let anchor = *partial
                 .literals
                 .iter()
                 .min_by_key(|&&literal| {
                     (
-                        formula.live_occurrences(&Literal::new(literal)).count(),
+                        formula
+                            .live_occurrences(&Literal::new(literal))
+                            .filter(|&idx| {
+                                live_window_factor_clause(
+                                    formula,
+                                    idx,
+                                    window,
+                                    pending_deleted,
+                                )
+                            })
+                            .count(),
                         literal_tie_key(literal),
                     )
                 })
@@ -81,10 +87,12 @@ impl AndGate {
             let mut cells = BTreeMap::<i32, Vec<usize>>::new();
 
             for clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
-                if !continue_search(budget, signal)? {
-                    return Ok(BudgetResult::Exhausted);
-                }
-                if !live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+                if !live_window_factor_clause(
+                    formula,
+                    clause_idx,
+                    window,
+                    pending_deleted,
+                ) {
                     continue;
                 }
 
@@ -125,14 +133,8 @@ impl AndGate {
         let mut best = None;
 
         loop {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             let mut counts = BTreeMap::<i32, usize>::new();
             for &partial_id in &partial_ids {
-                if !continue_search(budget, signal)? {
-                    return Ok(BudgetResult::Exhausted);
-                }
                 for cell in &partials[partial_id].cells {
                     if !literals.contains(&cell.literal) {
                         *counts.entry(cell.literal).or_default() += 1;
@@ -152,9 +154,6 @@ impl AndGate {
             let mut source_indices = Vec::new();
             for &literal in &literals {
                 for &partial_id in &partial_ids {
-                    if !continue_search(budget, signal)? {
-                        return Ok(BudgetResult::Exhausted);
-                    }
                     let cell = partials[partial_id]
                         .cell(literal)
                         .expect("selected AND grid has every cell");
@@ -323,18 +322,15 @@ fn find_exact_partial(
 mod tests {
     use super::*;
 
-    const TEST_BUDGET: f32 = 60.0;
 
     fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
+        let window = ClauseWindow::all_eligible(formula, pending_deleted.len());
+
         match AndGate::find(
             formula,
-            pending_deleted.len(),
+            &window,
             start,
             pending_deleted,
-            &budget,
-            &mut signal,
         )
         .unwrap()
         {

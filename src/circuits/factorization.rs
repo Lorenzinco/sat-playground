@@ -69,7 +69,7 @@ pub(crate) fn continue_search(
     Ok(true)
 }
 
-pub(crate) fn live_factor_clause(
+/*pub(crate) fn live_factor_clause(
     formula: &Formula,
     clause_idx: usize,
     initial_clause_limit: usize,
@@ -79,7 +79,7 @@ pub(crate) fn live_factor_clause(
         && !formula.is_clause_garbage(clause_idx)
         && !pending_deleted[clause_idx]
         && factor_eligible_clause(formula.get_clause_at_idx(clause_idx))
-}
+}*/
 
 pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
     clause.lock_count() == 0

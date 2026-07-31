@@ -1,12 +1,11 @@
 use crate::circuits::factorization::{
-    BudgetResult, FACTOR_BOUND, MAX_FACTOR_CLAUSE_SIZE, claim_clause, continue_search,
-    generated_clause, is_tautological, literal_tie_key, live_factor_clause, stable_signature_hash,
+    BudgetResult, FACTOR_BOUND, MAX_FACTOR_CLAUSE_SIZE, claim_clause,
+    generated_clause, is_tautological, literal_tie_key, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
-use crate::process::ProcessBudget;
-use pyo3::Python;
+use crate::process::bva::{ClauseWindow, live_window_factor_clause};
 use pyo3::prelude::PyResult;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -25,25 +24,25 @@ pub(crate) struct Gate {
 impl Gate {
     pub(crate) fn find(
         formula: &Formula,
-        initial_clause_limit: usize,
+        window: &ClauseWindow,
         pending_deleted: &[bool],
         target: i32,
-        budget: &ProcessBudget,
-        signal: &mut Option<(Python<'_>, &mut u64)>,
     ) -> PyResult<BudgetResult<Option<Self>>> {
         let pairs = match extract_signature_pairs(
             formula,
-            initial_clause_limit,
+            window,
             pending_deleted,
             target,
-            budget,
-            signal,
         )? {
             BudgetResult::Complete(pairs) => pairs,
             BudgetResult::Exhausted => return Ok(BudgetResult::Exhausted),
         };
 
-        group_pairs(&pairs, target, initial_clause_limit, budget, signal)
+        group_pairs(
+            &pairs,
+            target,
+            pending_deleted.len()
+        )
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
@@ -173,35 +172,24 @@ struct GateMatch {
 /// than expanded into a Cartesian product.
 fn extract_signature_pairs(
     formula: &Formula,
-    initial_clause_limit: usize,
+    window: &ClauseWindow,
     pending_deleted: &[bool],
     target: i32,
-    budget: &ProcessBudget,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<BudgetResult<Vec<ExtractedPair>>> {
-    if !continue_search(budget, signal)? {
-        return Ok(BudgetResult::Exhausted);
-    }
-
+    
     let mut first_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
     let mut second_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
 
     for clause_idx in formula.occurrence_of(&Literal::new(target)) {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
-        if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+        if live_gate_clause(formula, clause_idx, window, pending_deleted) {
             let size = formula.get_clause_at_idx(clause_idx).len();
             first_by_size[size].push(clause_idx);
         }
     }
     for clause_idx in formula.occurrence_of(&Literal::new(-target)) {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
-        if live_gate_clause(formula, clause_idx, initial_clause_limit, pending_deleted) {
+        if live_gate_clause(formula, clause_idx, window, pending_deleted) {
             let size = formula.get_clause_at_idx(clause_idx).len();
             second_by_size[size].push(clause_idx);
         }
@@ -211,9 +199,6 @@ fn extract_signature_pairs(
     let mut sorted_clause = Vec::new();
     let mut remainder = Vec::new();
     for size in 3..=MAX_FACTOR_CLAUSE_SIZE {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
         if first_by_size[size].is_empty() || second_by_size[size].is_empty() {
             continue;
         }
@@ -222,9 +207,6 @@ fn extract_signature_pairs(
         let mut hash_buckets = HashMap::<u64, Vec<usize>>::new();
 
         for &clause_idx in &first_by_size[size] {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             sorted_clause.clear();
             sorted_clause.extend(
                 formula
@@ -241,9 +223,6 @@ fn extract_signature_pairs(
                 if branch == target {
                     continue;
                 }
-                if !continue_search(budget, signal)? {
-                    return Ok(BudgetResult::Exhausted);
-                }
                 sorted_without_two_into(&sorted_clause, target, branch, &mut remainder);
                 let hash = stable_signature_hash(&remainder);
                 let signature_id =
@@ -257,9 +236,6 @@ fn extract_signature_pairs(
         }
 
         for &clause_idx in &second_by_size[size] {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             sorted_clause.clear();
             sorted_clause.extend(
                 formula
@@ -276,9 +252,6 @@ fn extract_signature_pairs(
                 if branch == -target {
                     continue;
                 }
-                if !continue_search(budget, signal)? {
-                    return Ok(BudgetResult::Exhausted);
-                }
                 sorted_without_two_into(&sorted_clause, -target, branch, &mut remainder);
                 let hash = stable_signature_hash(&remainder);
                 let signature_id =
@@ -292,14 +265,8 @@ fn extract_signature_pairs(
         }
 
         for signature in signatures {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             for (first_branch, first_clauses) in &signature.first_branches {
                 for (second_branch, second_clauses) in &signature.second_branches {
-                    if !continue_search(budget, signal)? {
-                        return Ok(BudgetResult::Exhausted);
-                    }
                     for (&first_clause, &second_clause) in first_clauses.iter().zip(second_clauses)
                     {
                         pairs.push(ExtractedPair {
@@ -320,11 +287,15 @@ fn extract_signature_pairs(
 fn live_gate_clause(
     formula: &Formula,
     clause_idx: usize,
-    initial_clause_limit: usize,
+    window: &ClauseWindow,
     pending_deleted: &[bool],
 ) -> bool {
-    live_factor_clause(formula, clause_idx, initial_clause_limit, pending_deleted)
-        && formula.get_clause_at_idx(clause_idx).len() >= 3
+    live_window_factor_clause(
+        formula,
+        clause_idx,
+        window,
+        pending_deleted,
+    ) && formula.get_clause_at_idx(clause_idx).len() >= 3
 }
 
 /// Algorithm 3 from the paper: normalize simultaneous polarity flips, select
@@ -333,14 +304,9 @@ fn group_pairs(
     pairs: &[ExtractedPair],
     target: i32,
     initial_clause_limit: usize,
-    budget: &ProcessBudget,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<BudgetResult<Option<Gate>>> {
     let mut variable_counts = BTreeMap::<u32, usize>::new();
     for pair in pairs {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
         *variable_counts
             .entry(pair.second_branch.unsigned_abs())
             .or_default() += 1;
@@ -348,9 +314,6 @@ fn group_pairs(
 
     let mut groups = BTreeMap::<(u32, u32, bool), Vec<ExtractedPair>>::new();
     for &pair in pairs {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
         let variable = pair.second_branch.unsigned_abs();
         if variable_counts.get(&variable).copied().unwrap_or_default() < MIN_GATE_MATCHES {
             continue;
@@ -370,9 +333,6 @@ fn group_pairs(
     let mut claimed = vec![false; initial_clause_limit];
     let mut best_group: Option<(u32, i32, Vec<GateMatch>)> = None;
     for ((variable, literal_variable, literal_negative), group) in groups {
-        if !continue_search(budget, signal)? {
-            return Ok(BudgetResult::Exhausted);
-        }
         let literal = if literal_negative {
             -(literal_variable as i32)
         } else {
@@ -381,9 +341,6 @@ fn group_pairs(
         let mut matches = Vec::new();
         let mut claimed_here = Vec::new();
         for pair in group {
-            if !continue_search(budget, signal)? {
-                return Ok(BudgetResult::Exhausted);
-            }
             if claimed[pair.first_clause] || claimed[pair.second_clause] {
                 continue;
             }
@@ -501,8 +458,6 @@ mod tests {
     use super::*;
     use crate::formula::clause::Clause;
 
-    const TEST_BUDGET: f32 = 60.0;
-
     fn ite_formula() -> Formula {
         Formula::from_vec(vec![
             vec![1, 2, 10],
@@ -521,15 +476,16 @@ mod tests {
     fn find_gate(formula: &Formula, target: i32) -> Gate {
         let initial_clause_limit = formula.clause_slots_len();
         let pending_deleted = vec![false; initial_clause_limit];
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
-        match Gate::find(
+        let window = ClauseWindow::all_eligible(
             formula,
             initial_clause_limit,
+        );
+
+        match Gate::find(
+            formula,
+            &window,
             &pending_deleted,
             target,
-            &budget,
-            &mut signal,
         )
         .unwrap()
         {
@@ -542,15 +498,16 @@ mod tests {
     fn extracted_pairs(formula: &Formula, target: i32) -> Vec<ExtractedPair> {
         let initial_clause_limit = formula.clause_slots_len();
         let pending_deleted = vec![false; initial_clause_limit];
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
-        match extract_signature_pairs(
+        let window = ClauseWindow::all_eligible(
             formula,
             initial_clause_limit,
+        );
+
+        match extract_signature_pairs(
+            formula,
+            &window,
             &pending_deleted,
             target,
-            &budget,
-            &mut signal,
         )
         .unwrap()
         {
@@ -583,9 +540,7 @@ mod tests {
         assert_eq!(pairs[0].second_branch, 3);
 
         let initial_clause_limit = formula.clause_slots_len();
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
-        let gate = match group_pairs(&pairs, 1, initial_clause_limit, &budget, &mut signal).unwrap()
+        let gate = match group_pairs(&pairs, 1, initial_clause_limit).unwrap()
         {
             BudgetResult::Complete(Some(gate)) => gate,
             _ => panic!("expected gate"),
@@ -686,10 +641,8 @@ mod tests {
                 second_branch: 4,
             });
         }
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
 
-        let gate = match group_pairs(&pairs, 1, 20, &budget, &mut signal).unwrap() {
+        let gate = match group_pairs(&pairs, 1, 20).unwrap() {
             BudgetResult::Complete(Some(gate)) => gate,
             _ => panic!("expected gate"),
         };
@@ -713,10 +666,8 @@ mod tests {
         let pairs = extracted_pairs(&formula, 1);
         assert_eq!(pairs.len(), 1);
 
-        let budget = ProcessBudget::new(TEST_BUDGET);
-        let mut signal = None;
         assert!(matches!(
-            group_pairs(&pairs, 1, formula.clause_slots_len(), &budget, &mut signal,).unwrap(),
+            group_pairs(&pairs, 1, formula.clause_slots_len()).unwrap(),
             BudgetResult::Complete(None)
         ));
     }

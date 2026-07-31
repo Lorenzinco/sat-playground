@@ -25,6 +25,8 @@ use std::fmt;
 use std::io::Write;
 use std::time::Instant;
 
+use rand::seq::SliceRandom;
+
 const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 50_000;
 const DB_REDUCTION_GARBAGE_RATIO: usize = 12;
 
@@ -522,42 +524,61 @@ impl Formula {
         }
         to_delete.len()
     }
-
-    pub fn collect_garbage(&mut self, history: Option<&mut History>) -> Vec<Option<usize>> {
+    
+    pub fn collect_garbage(
+        &mut self,
+        history: Option<&mut History>,
+    ) -> Vec<Option<usize>> {
         assert!(
-            history.is_some() || self.clauses.iter().all(|clause| clause.lock_count() == 0),
+            history.is_some()
+                || self
+                    .clauses
+                    .iter()
+                    .all(|clause| clause.lock_count() == 0),
             "cannot compact locked reason clauses without remapping history"
         );
-        let mut old_to_new = vec![None; self.clauses.len()];
+    
+        let old_len = self.clauses.len();
+        let mut old_to_new = vec![None; old_len];
+    
         if self.garbage.is_empty() {
             for (index, mapped) in old_to_new.iter_mut().enumerate() {
                 *mapped = Some(index);
             }
+    
             return old_to_new;
         }
-
-        let mut new_index = 0;
-        for (old_index, mapped) in old_to_new.iter_mut().enumerate() {
-            if !self.garbage.is_garbage(old_index) {
-                *mapped = Some(new_index);
-                new_index += 1;
-            }
-        }
-
+    
         let old_clauses = std::mem::take(&mut self.clauses);
-        self.clauses = old_clauses
+    
+        let mut surviving = old_clauses
             .into_iter()
             .enumerate()
-            .filter_map(|(index, clause)| (!self.garbage.is_garbage(index)).then_some(clause))
+            .filter(|(old_index, _)| !self.garbage.is_garbage(*old_index))
+            .collect::<Vec<_>>();
+
+        // Randomize clauses indexes so that 
+        surviving.shuffle(&mut rand::rng());
+    
+        self.clauses = surviving
+            .into_iter()
+            .enumerate()
+            .map(|(new_index, (old_index, clause))| {
+                old_to_new[old_index] = Some(new_index);
+                clause
+            })
             .collect();
+    
         self.garbage.reset(self.clauses.len());
         self.rebuild_clause_indices();
+    
         if let Some(history) = history {
             history.remap_clause_indices(&old_to_new);
         }
+    
         old_to_new
     }
-
+    
     fn rebuild_clause_indices(&mut self) {
         self.watch = Watch::new(self.assignment.len());
         self.occurrence = vec![Vec::new(); self.assignment.len() * 2];
