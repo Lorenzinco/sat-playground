@@ -4,20 +4,11 @@ use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
-use crate::process::ProcessBudget;
-use crate::python::signal_checker;
-use pyo3::Python;
-use pyo3::prelude::PyResult;
 use std::io::Write;
 
 // CaDiCaL-FX's default factor bound requires a reduction of at least one clause.
 pub(crate) const FACTOR_BOUND: usize = 1;
 pub(crate) const MAX_FACTOR_CLAUSE_SIZE: usize = 20;
-
-pub(crate) enum BudgetResult<T> {
-    Complete(T),
-    Exhausted,
-}
 
 pub(crate) enum Factorization {
     And(AndGate),
@@ -56,30 +47,16 @@ impl Factorization {
     }
 }
 
-pub(crate) fn continue_search(
-    budget: &ProcessBudget,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
-) -> PyResult<bool> {
-    if budget.exhausted() {
-        return Ok(false);
-    }
-    if let Some((py, steps)) = signal.as_mut() {
-        signal_checker(*py, *steps)?;
-    }
-    Ok(true)
-}
-
-/*pub(crate) fn live_factor_clause(
+pub(crate) fn live_factor_clause(
     formula: &Formula,
     clause_idx: usize,
-    initial_clause_limit: usize,
     pending_deleted: &[bool],
 ) -> bool {
-    clause_idx < initial_clause_limit
-        && !formula.is_clause_garbage(clause_idx)
+    clause_idx < pending_deleted.len()
         && !pending_deleted[clause_idx]
+        && !formula.is_clause_garbage(clause_idx)
         && factor_eligible_clause(formula.get_clause_at_idx(clause_idx))
-}*/
+}
 
 pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
     clause.lock_count() == 0

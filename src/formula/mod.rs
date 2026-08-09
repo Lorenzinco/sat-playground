@@ -669,6 +669,25 @@ impl Formula {
         }
     }
 
+    /// Picks a random literal from a live, non-empty clause.
+    pub fn pick_literal(&self) -> Option<&Literal> {
+        let candidate_count = self
+            .get_clauses()
+            .filter(|(_, clause)| !clause.get_literals().is_empty())
+            .count();
+        if candidate_count == 0 {
+            return None;
+        }
+
+        let clause_offset = rand::random_range(0..candidate_count);
+        let clause = self
+            .get_clauses()
+            .filter_map(|(_, clause)| (!clause.get_literals().is_empty()).then_some(clause))
+            .nth(clause_offset)?;
+        let literal_offset = rand::random_range(0..clause.len());
+        clause.get_literals().get(literal_offset)
+    }
+
     pub fn get_pure_literals(&mut self) -> Vec<Literal> {
         let clauses = self.get_unsatisfied_clauses();
         let assignment = &self.assignment;

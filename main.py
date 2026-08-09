@@ -27,7 +27,7 @@ def parse_dimacs(filename: Path) -> List[List[int]]:
 
 
 def solve_example() -> None:
-    clauses = parse_dimacs(Path("input.dimacs"))
+    clauses = parse_dimacs(Path("tests/unsat/2bitadd_10.cnf"))
     solver = clsat.Sat(clauses)
     print("c Solving SAT problem...", flush=True)
     solver.solve(

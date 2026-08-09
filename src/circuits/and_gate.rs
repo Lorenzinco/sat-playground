@@ -1,12 +1,11 @@
 use crate::circuits::factorization::{
-    BudgetResult, FACTOR_BOUND, claim_clause, generated_clause, is_tautological,
-    literal_tie_key, stable_signature_hash,
+    FACTOR_BOUND, claim_clause, generated_clause, is_tautological, literal_tie_key,
+    live_factor_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
-use crate::process::bva::{ClauseWindow, live_window_factor_clause};
-use pyo3::prelude::PyResult;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
@@ -18,12 +17,7 @@ pub(crate) struct AndGate {
 }
 
 impl AndGate {
-    pub(crate) fn find(
-        formula: &Formula,
-        window: &ClauseWindow,
-        start: i32,
-        pending_deleted: &[bool],
-    ) -> PyResult<BudgetResult<Option<AndGate>>> {
+    pub(crate) fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
         let mut partials = Vec::<AndPartial>::new();
         let mut partial_hash_buckets = HashMap::<u64, Vec<usize>>::new();
         let mut sorted_clause = Vec::new();
@@ -32,12 +26,7 @@ impl AndGate {
         // Equal partials are interned, while duplicate physical clauses remain in
         // the cells discovered below and therefore contribute to the savings.
         for clause_idx in formula.occurrence_of(&Literal::new(start)) {
-            if !live_window_factor_clause(
-                formula,
-                clause_idx,
-                window,
-                pending_deleted,
-            ) {
+            if !live_factor_clause(formula, clause_idx, pending_deleted) {
                 continue;
             }
 
@@ -58,7 +47,7 @@ impl AndGate {
             intern_partial(&mut partials, &mut partial_hash_buckets, hash, &literals);
         }
         if partials.is_empty() {
-            return Ok(BudgetResult::Complete(None));
+            return None;
         }
 
         // Discover each row through its shortest occurrence list. A candidate
@@ -71,14 +60,7 @@ impl AndGate {
                     (
                         formula
                             .live_occurrences(&Literal::new(literal))
-                            .filter(|&idx| {
-                                live_window_factor_clause(
-                                    formula,
-                                    idx,
-                                    window,
-                                    pending_deleted,
-                                )
-                            })
+                            .filter(|&idx| live_factor_clause(formula, idx, pending_deleted))
                             .count(),
                         literal_tie_key(literal),
                     )
@@ -87,12 +69,7 @@ impl AndGate {
             let mut cells = BTreeMap::<i32, Vec<usize>>::new();
 
             for clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
-                if !live_window_factor_clause(
-                    formula,
-                    clause_idx,
-                    window,
-                    pending_deleted,
-                ) {
+                if !live_factor_clause(formula, clause_idx, pending_deleted) {
                     continue;
                 }
 
@@ -183,9 +160,7 @@ impl AndGate {
             }
         }
 
-        Ok(BudgetResult::Complete(best.filter(|gate| {
-            gate.clause_saving >= FACTOR_BOUND as isize
-        })))
+        best.filter(|gate| gate.clause_saving >= FACTOR_BOUND as isize)
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
@@ -201,6 +176,10 @@ impl AndGate {
     ) {
         let auxiliary = formula.add_literal();
         formula.stats.add_bva_literal();
+        formula.extensions.add_and_definition(
+            self.literals.iter().copied().map(Literal::new).collect(),
+            &auxiliary,
+        );
 
         for partial in self.partials {
             let mut literals = Vec::with_capacity(partial.len() + 1);
@@ -321,22 +300,10 @@ fn find_exact_partial(
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::formula::extension::ExtensionDefinition;
 
     fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
-        let window = ClauseWindow::all_eligible(formula, pending_deleted.len());
-
-        match AndGate::find(
-            formula,
-            &window,
-            start,
-            pending_deleted,
-        )
-        .unwrap()
-        {
-            BudgetResult::Complete(gate) => gate,
-            BudgetResult::Exhausted => panic!("test budget exhausted"),
-        }
+        AndGate::find(formula, start, pending_deleted)
     }
 
     fn sorted_generated_clauses(formula: &Formula, initial_clause_limit: usize) -> Vec<Vec<i32>> {
@@ -400,6 +367,19 @@ mod tests {
 
         assert_eq!(formula.assignment.len(), 8);
         assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(
+            formula.extensions.definition(&Literal::new(7)),
+            Some(&ExtensionDefinition::And(vec![
+                Literal::new(1),
+                Literal::new(2),
+            ]))
+        );
+        assert_eq!(
+            formula
+                .extensions
+                .substitute(&Literal::new(1), &Literal::new(2)),
+            None
+        );
         assert!(pending_deleted.iter().all(|pending| *pending));
         assert_eq!(
             deletion_indices,

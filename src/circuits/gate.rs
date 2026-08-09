@@ -1,12 +1,11 @@
 use crate::circuits::factorization::{
-    BudgetResult, FACTOR_BOUND, MAX_FACTOR_CLAUSE_SIZE, claim_clause,
-    generated_clause, is_tautological, literal_tie_key, stable_signature_hash,
+    FACTOR_BOUND, MAX_FACTOR_CLAUSE_SIZE, claim_clause, generated_clause, is_tautological,
+    literal_tie_key, live_factor_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
-use crate::process::bva::{ClauseWindow, live_window_factor_clause};
-use pyo3::prelude::PyResult;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
@@ -22,27 +21,9 @@ pub(crate) struct Gate {
 }
 
 impl Gate {
-    pub(crate) fn find(
-        formula: &Formula,
-        window: &ClauseWindow,
-        pending_deleted: &[bool],
-        target: i32,
-    ) -> PyResult<BudgetResult<Option<Self>>> {
-        let pairs = match extract_signature_pairs(
-            formula,
-            window,
-            pending_deleted,
-            target,
-        )? {
-            BudgetResult::Complete(pairs) => pairs,
-            BudgetResult::Exhausted => return Ok(BudgetResult::Exhausted),
-        };
-
-        group_pairs(
-            &pairs,
-            target,
-            pending_deleted.len()
-        )
+    pub(crate) fn find(formula: &Formula, pending_deleted: &[bool], target: i32) -> Option<Self> {
+        let pairs = extract_signature_pairs(formula, pending_deleted, target);
+        group_pairs(&pairs, target, pending_deleted.len())
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
@@ -58,6 +39,12 @@ impl Gate {
     ) {
         let z = formula.add_literal();
         formula.stats.add_bva_literal();
+        formula.extensions.add_ite_definition(
+            Literal::new(self.target),
+            Literal::new(-self.third),
+            Literal::new(-self.second),
+            &z,
+        );
 
         // z <-> ITE(target, -third, -second). Every resolvent between a
         // positive-z and a negative-z definition clause is tautological, so
@@ -172,24 +159,22 @@ struct GateMatch {
 /// than expanded into a Cartesian product.
 fn extract_signature_pairs(
     formula: &Formula,
-    window: &ClauseWindow,
     pending_deleted: &[bool],
     target: i32,
-) -> PyResult<BudgetResult<Vec<ExtractedPair>>> {
-    
+) -> Vec<ExtractedPair> {
     let mut first_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
     let mut second_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
 
     for clause_idx in formula.occurrence_of(&Literal::new(target)) {
-        if live_gate_clause(formula, clause_idx, window, pending_deleted) {
+        if live_gate_clause(formula, clause_idx, pending_deleted) {
             let size = formula.get_clause_at_idx(clause_idx).len();
             first_by_size[size].push(clause_idx);
         }
     }
     for clause_idx in formula.occurrence_of(&Literal::new(-target)) {
-        if live_gate_clause(formula, clause_idx, window, pending_deleted) {
+        if live_gate_clause(formula, clause_idx, pending_deleted) {
             let size = formula.get_clause_at_idx(clause_idx).len();
             second_by_size[size].push(clause_idx);
         }
@@ -281,30 +266,17 @@ fn extract_signature_pairs(
         }
     }
 
-    Ok(BudgetResult::Complete(pairs))
+    pairs
 }
 
-fn live_gate_clause(
-    formula: &Formula,
-    clause_idx: usize,
-    window: &ClauseWindow,
-    pending_deleted: &[bool],
-) -> bool {
-    live_window_factor_clause(
-        formula,
-        clause_idx,
-        window,
-        pending_deleted,
-    ) && formula.get_clause_at_idx(clause_idx).len() >= 3
+fn live_gate_clause(formula: &Formula, clause_idx: usize, pending_deleted: &[bool]) -> bool {
+    live_factor_clause(formula, clause_idx, pending_deleted)
+        && formula.get_clause_at_idx(clause_idx).len() >= 3
 }
 
 /// Algorithm 3 from the paper: normalize simultaneous polarity flips, select
 /// the largest group, and claim each physical clause at most once per group.
-fn group_pairs(
-    pairs: &[ExtractedPair],
-    target: i32,
-    initial_clause_limit: usize,
-) -> PyResult<BudgetResult<Option<Gate>>> {
+fn group_pairs(pairs: &[ExtractedPair], target: i32, initial_clause_limit: usize) -> Option<Gate> {
     let mut variable_counts = BTreeMap::<u32, usize>::new();
     for pair in pairs {
         *variable_counts
@@ -375,25 +347,23 @@ fn group_pairs(
         }
     }
 
-    let Some((best_variable, best_second, matches)) = best_group else {
-        return Ok(BudgetResult::Complete(None));
-    };
+    let (best_variable, best_second, matches) = best_group?;
     let clause_saving = matches.len() as isize - GATE_DEFINITION_CLAUSES as isize;
     if clause_saving < FACTOR_BOUND as isize {
-        return Ok(BudgetResult::Complete(None));
+        return None;
     }
     debug_assert!(matches.iter().all(|gate_match| {
         gate_match.first_clause < initial_clause_limit
             && gate_match.second_clause < initial_clause_limit
     }));
 
-    Ok(BudgetResult::Complete(Some(Gate {
+    Some(Gate {
         target,
         second: best_second,
         third: best_variable as i32,
         matches,
         clause_saving,
-    })))
+    })
 }
 
 fn group_is_better(
@@ -457,6 +427,7 @@ fn intern_gate_signature(
 mod tests {
     use super::*;
     use crate::formula::clause::Clause;
+    use crate::formula::extension::ExtensionDefinition;
 
     fn ite_formula() -> Formula {
         Formula::from_vec(vec![
@@ -474,46 +445,13 @@ mod tests {
     }
 
     fn find_gate(formula: &Formula, target: i32) -> Gate {
-        let initial_clause_limit = formula.clause_slots_len();
-        let pending_deleted = vec![false; initial_clause_limit];
-        let window = ClauseWindow::all_eligible(
-            formula,
-            initial_clause_limit,
-        );
-
-        match Gate::find(
-            formula,
-            &window,
-            &pending_deleted,
-            target,
-        )
-        .unwrap()
-        {
-            BudgetResult::Complete(Some(gate)) => gate,
-            BudgetResult::Complete(None) => panic!("expected gate"),
-            BudgetResult::Exhausted => panic!("test budget exhausted"),
-        }
+        let pending_deleted = vec![false; formula.clause_slots_len()];
+        Gate::find(formula, &pending_deleted, target).expect("expected gate")
     }
 
     fn extracted_pairs(formula: &Formula, target: i32) -> Vec<ExtractedPair> {
-        let initial_clause_limit = formula.clause_slots_len();
-        let pending_deleted = vec![false; initial_clause_limit];
-        let window = ClauseWindow::all_eligible(
-            formula,
-            initial_clause_limit,
-        );
-
-        match extract_signature_pairs(
-            formula,
-            &window,
-            &pending_deleted,
-            target,
-        )
-        .unwrap()
-        {
-            BudgetResult::Complete(pairs) => pairs,
-            BudgetResult::Exhausted => panic!("test budget exhausted"),
-        }
+        let pending_deleted = vec![false; formula.clause_slots_len()];
+        extract_signature_pairs(formula, &pending_deleted, target)
     }
 
     fn sorted_clauses(formula: &Formula) -> Vec<Vec<i32>> {
@@ -540,11 +478,7 @@ mod tests {
         assert_eq!(pairs[0].second_branch, 3);
 
         let initial_clause_limit = formula.clause_slots_len();
-        let gate = match group_pairs(&pairs, 1, initial_clause_limit).unwrap()
-        {
-            BudgetResult::Complete(Some(gate)) => gate,
-            _ => panic!("expected gate"),
-        };
+        let gate = group_pairs(&pairs, 1, initial_clause_limit).expect("expected gate");
 
         assert_eq!(gate.second, 2);
         assert_eq!(gate.third, 3);
@@ -580,6 +514,14 @@ mod tests {
         assert_eq!(formula.assignment.len(), 16);
         assert_eq!(formula.live_clause_count(), initial_live_clause_count + 9);
         assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(
+            formula.extensions.definition(&Literal::new(15)),
+            Some(&ExtensionDefinition::Ite {
+                condition: Literal::new(1),
+                when_true: Literal::new(-3),
+                when_false: Literal::new(-2),
+            })
+        );
         assert!(pending_deleted.iter().all(|pending| *pending));
         assert_eq!(
             deletion_indices,
@@ -642,10 +584,7 @@ mod tests {
             });
         }
 
-        let gate = match group_pairs(&pairs, 1, 20).unwrap() {
-            BudgetResult::Complete(Some(gate)) => gate,
-            _ => panic!("expected gate"),
-        };
+        let gate = group_pairs(&pairs, 1, 20).expect("expected gate");
 
         assert_eq!(gate.matches.len(), 5);
         assert_eq!(gate.second, 2);
@@ -666,10 +605,7 @@ mod tests {
         let pairs = extracted_pairs(&formula, 1);
         assert_eq!(pairs.len(), 1);
 
-        assert!(matches!(
-            group_pairs(&pairs, 1, formula.clause_slots_len()).unwrap(),
-            BudgetResult::Complete(None)
-        ));
+        assert!(group_pairs(&pairs, 1, formula.clause_slots_len()).is_none());
     }
 
     #[test]

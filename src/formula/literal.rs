@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::formula::assignment::Assignment;
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Literal {
     literal: i32,
 }
