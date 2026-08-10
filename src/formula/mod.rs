@@ -7,6 +7,7 @@ pub mod literal;
 use crate::drat::DratLogger;
 use crate::formula::extension::ExtensionMap;
 use crate::formula::garbage::Garbage;
+use crate::heuristics::vsids::Vsids;
 use crate::history::History;
 use crate::process;
 use crate::process::{Process, ProcessBudget};
@@ -25,9 +26,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::Instant;
 
-use rand::seq::SliceRandom;
-
-const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 50_000;
+const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 100_000;
 const DB_REDUCTION_GARBAGE_RATIO: usize = 12;
 
 pub struct Formula {
@@ -39,6 +38,7 @@ pub struct Formula {
     occurrence_stale: Vec<usize>,
     pub stats: Stats,
     pub extensions: ExtensionMap,
+    pub(crate) vsids: Vsids,
     self_subsuming: bool,
 }
 
@@ -53,6 +53,7 @@ impl Clone for Formula {
             occurrence_stale: self.occurrence_stale.clone(),
             stats: self.stats.clone(),
             extensions: self.extensions.clone(),
+            vsids: self.vsids.clone(),
             self_subsuming: self.self_subsuming,
         }
     }
@@ -115,6 +116,7 @@ impl Formula {
             occurrence_stale: vec![0; storage * 2],
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
+            vsids: Vsids::new(storage),
             self_subsuming: false,
         }
     }
@@ -136,10 +138,12 @@ impl Formula {
             occurrence_stale: vec![0; (max_index as usize + 1) * 2],
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
+            vsids: Vsids::new(max_index as usize + 1),
             self_subsuming: false,
         };
 
         formula.rebuild_clause_indices();
+        formula.rebuild_vsids();
         formula
     }
 
@@ -420,6 +424,43 @@ impl Formula {
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
         replace_subsumption_setting: bool,
+        history: Option<&mut History>,
+    ) -> PyResult<()> {
+        self.process_with_budget(
+            methods,
+            ProcessBudget::new(budget),
+            logger,
+            signal,
+            replace_subsumption_setting,
+            history,
+        )
+    }
+
+    pub(crate) fn process_unbounded<W: Write>(
+        &mut self,
+        methods: Vec<Process>,
+        logger: &mut Option<DratLogger<W>>,
+        signal: Option<(Python<'_>, &mut u64)>,
+        replace_subsumption_setting: bool,
+        history: Option<&mut History>,
+    ) -> PyResult<()> {
+        self.process_with_budget(
+            methods,
+            ProcessBudget::unlimited(),
+            logger,
+            signal,
+            replace_subsumption_setting,
+            history,
+        )
+    }
+
+    fn process_with_budget<W: Write>(
+        &mut self,
+        methods: Vec<Process>,
+        budget: ProcessBudget,
+        logger: &mut Option<DratLogger<W>>,
+        signal: Option<(Python<'_>, &mut u64)>,
+        replace_subsumption_setting: bool,
         mut history: Option<&mut History>,
     ) -> PyResult<()> {
         if replace_subsumption_setting {
@@ -428,7 +469,6 @@ impl Formula {
             self.self_subsuming = true;
         }
         let mut signal = signal;
-        let budget = ProcessBudget::new(budget);
 
         let result: PyResult<()> = (|| -> PyResult<()> {
             for method in methods {
@@ -524,7 +564,7 @@ impl Formula {
         }
         to_delete.len()
     }
-    
+
     pub fn collect_garbage(
         &mut self,
         history: Option<&mut History>,
@@ -551,15 +591,12 @@ impl Formula {
     
         let old_clauses = std::mem::take(&mut self.clauses);
     
-        let mut surviving = old_clauses
+        let surviving = old_clauses
             .into_iter()
             .enumerate()
             .filter(|(old_index, _)| !self.garbage.is_garbage(*old_index))
             .collect::<Vec<_>>();
 
-        // Randomize clauses indexes so that 
-        surviving.shuffle(&mut rand::rng());
-    
         self.clauses = surviving
             .into_iter()
             .enumerate()
@@ -603,6 +640,7 @@ impl Formula {
 
     pub fn add_literal(&mut self) -> Literal {
         let index = self.assignment.add_variable();
+        self.vsids.add_variable();
         self.watch.add_literal();
         self.occurrence.push(Vec::new());
         self.occurrence.push(Vec::new());
@@ -610,6 +648,11 @@ impl Formula {
         self.occurrence_stale.push(0);
 
         Literal::new(index as i32)
+    }
+
+    pub(crate) fn rebuild_vsids(&mut self) {
+        let vsids = Vsids::from_formula(self);
+        self.vsids = vsids;
     }
 
     pub fn set_variable(&mut self, index: usize, value: bool) {

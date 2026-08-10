@@ -154,7 +154,6 @@ def run_worker(
             heuristics=config["heuristics"],
             drat_path=None,
             preprocessing_budget=config["preprocessing_budget"],
-            inprocessing_budget=config["inprocessing_budget"],
         )
         elapsed = time.perf_counter() - started
         model = solver.model

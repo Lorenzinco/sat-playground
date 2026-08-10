@@ -68,6 +68,14 @@ impl ExtensionMap {
         self.add_and_definition(vec![*lit1, *lit2], substitute);
     }
 
+    /// Prevents conflict learning from reusing a substitution variable that BVE
+    /// removed from the live formula. Its definition is intentionally retained
+    /// for model reconstruction.
+    pub fn remove_substitution_variable(&mut self, variable: usize) {
+        self.substitutions
+            .retain(|_, substitute| substitute.unsigned_abs() as usize != variable);
+    }
+
     pub fn add_and_definition(&mut self, inputs: Vec<Literal>, extension: &Literal) {
         assert!(
             !inputs.is_empty(),
@@ -153,6 +161,23 @@ mod tests {
 
         assert_eq!(extensions.substitute(&x, &y), Some(z));
         assert_eq!(extensions.substitute(&y, &x), Some(z));
+        assert_eq!(
+            extensions.definition(&z),
+            Some(&ExtensionDefinition::And(vec![x, y]))
+        );
+    }
+
+    #[test]
+    fn eliminated_substitution_is_removed_but_its_definition_is_retained() {
+        let mut extensions = ExtensionMap::new();
+        let x = Literal::new(1);
+        let y = Literal::new(2);
+        let z = Literal::new(3);
+        extensions.add_substitution(&x, &y, &z);
+
+        extensions.remove_substitution_variable(3);
+
+        assert_eq!(extensions.substitute(&x, &y), None);
         assert_eq!(
             extensions.definition(&z),
             Some(&ExtensionDefinition::And(vec![x, y]))

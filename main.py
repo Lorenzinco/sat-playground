@@ -36,7 +36,7 @@ def solve_example() -> None:
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=["bva"],
+        inprocessing=["bve","bva"],
     )
 
     if solver.model is not None:

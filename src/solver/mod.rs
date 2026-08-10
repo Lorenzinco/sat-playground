@@ -14,7 +14,6 @@ use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::guidance::GuidanceTracker;
 use crate::heuristics::Heuristics;
-use crate::heuristics::vsids::Vsids;
 use crate::history::ImplicationPoint;
 use crate::process::Process;
 
@@ -53,7 +52,6 @@ pub fn solve<'py, W: Write>(
     logger: &mut Option<DratLogger<W>>,
     guidance: &mut Option<GuidanceTracker>,
     preprocessing_budget: f32,
-    inprocessing_budget: f32,
 ) -> PyResult<Option<Vec<bool>>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
@@ -120,10 +118,11 @@ pub fn solve<'py, W: Write>(
         io::stdout().flush().ok();
     });
 
-    // Build branching heuristics after preprocessing so BVA/BVE auxiliary variables
-    // receive meaningful initial activity instead of being appended with score 0.
+    // Refresh the formula-owned activity after preprocessing so auxiliary
+    // variables receive meaningful initial scores.
+    formula.rebuild_vsids();
     let mut heuristics = match requested_heuristics {
-        Heuristics::VSIDS(_) => Heuristics::VSIDS(Vsids::from_formula(formula)),
+        Heuristics::VSIDS => Heuristics::VSIDS,
         _ => Heuristics::None,
     };
 
@@ -137,7 +136,6 @@ pub fn solve<'py, W: Write>(
             &mut heuristics,
             logger,
             inprocessing,
-            inprocessing_budget,
             guidance,
         ),
     };

@@ -6,14 +6,16 @@ use pyo3::prelude::*;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProcessBudget {
-    deadline: Option<Instant>,
+pub(crate) enum ProcessBudget {
+    Exhausted,
+    Unlimited,
+    Deadline(Instant),
 }
 
 impl ProcessBudget {
     pub(crate) fn new(seconds: f32) -> Self {
         if !seconds.is_finite() || seconds <= 0.0 {
-            return Self { deadline: None };
+            return Self::Exhausted;
         }
 
         let now = Instant::now();
@@ -25,14 +27,19 @@ impl ProcessBudget {
             duration /= 2;
         };
 
-        Self {
-            deadline: Some(deadline),
-        }
+        Self::Deadline(deadline)
+    }
+
+    pub(crate) fn unlimited() -> Self {
+        Self::Unlimited
     }
 
     pub(crate) fn exhausted(&self) -> bool {
-        self.deadline
-            .is_none_or(|deadline| Instant::now() >= deadline)
+        match self {
+            Self::Exhausted => true,
+            Self::Unlimited => false,
+            Self::Deadline(deadline) => Instant::now() >= *deadline,
+        }
     }
 }
 
@@ -77,5 +84,10 @@ mod tests {
     #[test]
     fn positive_budget_has_a_future_deadline() {
         assert!(!ProcessBudget::new(60.0).exhausted());
+    }
+
+    #[test]
+    fn unlimited_budget_never_expires() {
+        assert!(!ProcessBudget::unlimited().exhausted());
     }
 }

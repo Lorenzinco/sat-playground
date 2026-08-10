@@ -37,7 +37,6 @@ class Sat:
         extension_guidance_log_path: str|None = None,
         *,
         preprocessing_budget: float=5.0,
-        inprocessing_budget: float=0.075,
         ) -> None:
         """Solve the SAT problem.
 
@@ -47,7 +46,6 @@ class Sat:
             preprocess: Preprocessing techniques to apply.
             heuristics: Literal selection heuristic.
             preprocessing_budget: Wall-clock preprocessing budget in seconds; zero skips preprocessing techniques.
-            inprocessing_budget: Wall-clock budget in seconds for each inprocessing phase; zero skips inprocessing techniques.
             drat_path: If given, write a DRAT proof to this path.
             extension_guidance: Optional compact guidance dictionary from Reduction.
             extension_guidance_log_path: Optional path for one line per observed DIP.

@@ -11,11 +11,12 @@ use pyo3::Python;
 use pyo3::prelude::PyResult;
 use std::io::Write;
 
-/// Attempts one local BVA factorization around a randomly selected literal.
+/// Attempts local BVA factorization around VSIDS-weighted literals.
 ///
 /// There is intentionally no internal time budget or formula-wide schedule:
-/// each invocation samples one literal, evaluates both supported gate shapes,
-/// and atomically applies the better profitable candidate.
+/// each attempt samples a variable proportionally to its VSIDS activity,
+/// chooses one of its live polarities, and atomically applies the better
+/// profitable gate candidate.
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
     _budget: &ProcessBudget,
@@ -23,15 +24,21 @@ pub(crate) fn process<W: Write>(
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
 ) -> PyResult<()> {
+    // Try BVA around variables sampled proportionally to their VSIDS activity.
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
     }
 
-    let Some(start) = formula.pick_literal().map(Literal::get_index) else {
-        return Ok(());
+    let Some(start) = formula
+        .vsids
+        .sample_literal(formula)
+        .map(|literal| literal.get_index())
+    else {
+        return Ok(())
     };
 
     factorize_literal(formula, logger, start);
+
     Ok(())
 }
 

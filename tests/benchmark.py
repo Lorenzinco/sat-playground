@@ -64,7 +64,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--inprocessing", nargs="*", choices=PROCESS_CHOICES, default=[]
     )
     parser.add_argument("--preprocessing-budget", type=float, default=5.0)
-    parser.add_argument("--inprocessing-budget", type=float, default=0.075)
 
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-input", type=Path, help=argparse.SUPPRESS)
@@ -77,7 +76,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "total_timeout",
         "instance_timeout",
         "preprocessing_budget",
-        "inprocessing_budget",
     ):
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0:
@@ -163,7 +161,6 @@ def solver_config(args: argparse.Namespace) -> Dict[str, Any]:
         "preprocess": list(args.preprocess),
         "inprocessing": list(args.inprocessing),
         "preprocessing_budget": args.preprocessing_budget,
-        "inprocessing_budget": args.inprocessing_budget,
     }
 
 

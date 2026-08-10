@@ -10,6 +10,9 @@ use pyo3::prelude::PyResult;
 use std::collections::HashSet;
 use std::io::Write;
 
+/// Attempts one BVE step on a variable sampled with inverse VSIDS weighting.
+/// Lower-activity variables are therefore more likely to be eliminated, while
+/// every live variable with both polarities retains a non-zero probability.
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
     budget: &ProcessBudget,
@@ -17,55 +20,19 @@ pub(crate) fn process<W: Write>(
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
 ) -> PyResult<()> {
-    while !budget.exhausted() && apply_best_bve_step(formula, budget, logger, &mut signal)? {}
-    Ok(())
-}
-
-fn apply_best_bve_step<W: Write>(
-    formula: &mut Formula,
-    budget: &ProcessBudget,
-    logger: &mut Option<DratLogger<W>>,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
-) -> PyResult<bool> {
     if budget.exhausted() {
-        return Ok(false);
+        return Ok(());
     }
 
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
     }
 
-    let mut best = None;
-    let mut best_saving = 0isize;
-
-    for var in 1..formula.assignment.len() {
-        if budget.exhausted() {
-            return Ok(false);
-        }
-
-        if let Some((py, steps)) = signal.as_mut() {
-            signal_checker(*py, *steps)?;
-        }
-
-        let Some(candidate) = elimination_candidate(formula, var, budget, signal)? else {
-            if budget.exhausted() {
-                return Ok(false);
-            }
-            continue;
-        };
-
-        if candidate.saving > best_saving {
-            best_saving = candidate.saving;
-            best = Some(candidate);
-        }
-    }
-
-    if budget.exhausted() {
-        return Ok(false);
-    }
-
-    let Some(candidate) = best else {
-        return Ok(false);
+    let Some(var) = formula.vsids.sample_low_activity_variable(formula) else {
+        return Ok(());
+    };
+    let Some(candidate) = elimination_candidate(formula, var, budget, &mut signal)? else {
+        return Ok(());
     };
     let EliminationCandidate {
         to_delete,
@@ -87,14 +54,14 @@ fn apply_best_bve_step<W: Write>(
     let newly_deleted = formula.delete_clauses(&to_delete, logger);
     debug_assert_eq!(newly_deleted, to_delete.len());
 
+    formula.extensions.remove_substitution_variable(var);
     formula.stats.add_bve_eliminated_variable();
-    Ok(true)
+    Ok(())
 }
 
 struct EliminationCandidate {
     to_delete: Vec<usize>,
     resolvents: Vec<Clause>,
-    saving: isize,
 }
 
 fn elimination_candidate(
@@ -186,7 +153,6 @@ fn elimination_candidate(
         Ok(Some(EliminationCandidate {
             to_delete,
             resolvents,
-            saving,
         }))
     } else {
         Ok(None)
@@ -258,5 +224,22 @@ mod tests {
         assert_eq!(formula.live_clause_count(), 4);
         assert_eq!(formula.stats.bve_eliminated_variables, 0);
         assert_eq!(formula.stats.clauses_deleted, 0);
+    }
+
+    #[test]
+    fn eliminating_a_substitution_variable_invalidates_its_reuse() {
+        let mut formula = Formula::from_vec(vec![vec![3, 4], vec![-3, 5]]);
+        let x = Literal::new(1);
+        let y = Literal::new(2);
+        let substitute = Literal::new(3);
+        formula.extensions.add_substitution(&x, &y, &substitute);
+        let mut logger = None;
+        let budget = ProcessBudget::new(60.0);
+
+        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+
+        assert_eq!(formula.extensions.substitute(&x, &y), None);
+        assert!(formula.extensions.definition(&substitute).is_some());
+        assert_eq!(formula.stats.bve_eliminated_variables, 1);
     }
 }

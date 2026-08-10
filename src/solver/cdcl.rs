@@ -32,7 +32,6 @@ pub fn solve_cdcl<'py, W: Write>(
     heuristics: &mut Heuristics,
     logger: &mut Option<DratLogger<W>>,
     inprocessing: Vec<Process>,
-    inprocessing_budget: f32,
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
@@ -147,8 +146,8 @@ pub fn solve_cdcl<'py, W: Write>(
                 return unsat(logger);
             };
 
-            heuristics.bump(learned.get_literals());
-            heuristics.decay();
+            heuristics.bump(formula, learned.get_literals());
+            heuristics.decay(formula);
 
             if formula.stats.conflicts >= next_db_reduction_conflicts {
                 let reduce_start = Instant::now();
@@ -170,7 +169,6 @@ pub fn solve_cdcl<'py, W: Write>(
                     formula,
                     &mut history,
                     &inprocessing,
-                    inprocessing_budget,
                     run_inprocessing,
                     logger,
                 )?;
@@ -391,7 +389,6 @@ fn restart<W: Write>(
     formula: &mut Formula,
     history: &mut History,
     inprocessing: &[Process],
-    inprocessing_budget: f32,
     run_inprocessing: bool,
     logger: &mut Option<DratLogger<W>>,
 ) -> PyResult<()> {
@@ -401,9 +398,8 @@ fn restart<W: Write>(
 
     if run_inprocessing {
         let inprocessing_start = Instant::now();
-        formula.process(
+        formula.process_unbounded(
             inprocessing.to_vec(),
-            inprocessing_budget,
             logger,
             Some((py, steps)),
             false,
@@ -465,7 +461,6 @@ mod tests {
                 &mut formula,
                 &mut history,
                 &[],
-                60.0,
                 true,
                 &mut logger,
             )
@@ -571,7 +566,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -593,7 +587,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -615,7 +608,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -638,7 +630,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -660,7 +651,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -682,7 +672,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();
@@ -705,7 +694,6 @@ mod tests {
                     &mut Heuristics::Random,
                     &mut None,
                     Vec::new(),
-                    60.0,
                     &mut None,
                 )
                 .unwrap();

@@ -37,7 +37,6 @@ impl Sat {
         extension_guidance: Option<GuidanceSpec>,
         extension_guidance_log_path: Option<String>,
         preprocessing_budget: f32,
-        inprocessing_budget: f32,
     ) -> PyResult<(Option<Vec<bool>>, Stats)> {
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
@@ -70,7 +69,6 @@ impl Sat {
             &mut logger,
             &mut guidance,
             preprocessing_budget,
-            inprocessing_budget,
         );
 
         if let Some(tracker) = &mut guidance {

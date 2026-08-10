@@ -1,1 +1,1 @@
-Clauses struct need to be dismantled and rebuilt to add for lazy garbage collection of clauses at certain tresholds, 
+uip has to be optimized not taking any of the graph calculations
