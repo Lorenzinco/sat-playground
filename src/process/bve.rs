@@ -3,7 +3,6 @@ use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::history::History;
-use crate::process::ProcessBudget;
 use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
@@ -15,14 +14,10 @@ use std::io::Write;
 /// every live variable with both polarities retains a non-zero probability.
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
-    budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
 ) -> PyResult<()> {
-    if budget.exhausted() {
-        return Ok(());
-    }
 
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
@@ -31,7 +26,7 @@ pub(crate) fn process<W: Write>(
     let Some(var) = formula.vsids.sample_low_activity_variable(formula) else {
         return Ok(());
     };
-    let Some(candidate) = elimination_candidate(formula, var, budget, &mut signal)? else {
+    let Some(candidate) = elimination_candidate(formula, var, &mut signal)? else {
         return Ok(());
     };
     let EliminationCandidate {
@@ -67,12 +62,8 @@ struct EliminationCandidate {
 fn elimination_candidate(
     formula: &mut Formula,
     var: usize,
-    budget: &ProcessBudget,
     signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<Option<EliminationCandidate>> {
-    if budget.exhausted() {
-        return Ok(None);
-    }
 
     let positive_literal = Literal::new(var as i32);
     let negative_literal = Literal::new(-(var as i32));
@@ -98,9 +89,6 @@ fn elimination_candidate(
     let mut deleted_literals = 0usize;
 
     for &idx in &to_delete {
-        if budget.exhausted() {
-            return Ok(None);
-        }
 
         let clause = formula.get_clause_at_idx(idx);
         if clause.lock_count() > 0 || clause.lbd() == 0 {
@@ -110,14 +98,8 @@ fn elimination_candidate(
     }
 
     for &pos_idx in &pos {
-        if budget.exhausted() {
-            return Ok(None);
-        }
 
         for &neg_idx in &neg {
-            if budget.exhausted() {
-                return Ok(None);
-            }
 
             if let Some((py, steps)) = signal.as_mut() {
                 signal_checker(*py, *steps)?;
@@ -142,9 +124,6 @@ fn elimination_candidate(
 
     let mut added_literals = 0;
     for resolvent in &resolvents {
-        if budget.exhausted() {
-            return Ok(None);
-        }
         added_literals += resolvent.len();
     }
     let saving = deleted_literals as isize - added_literals as isize;
@@ -167,9 +146,8 @@ mod tests {
     fn bve_eliminates_when_it_saves_literals() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
         let mut logger = None;
-        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.live_clause_count(), 1);
         assert_eq!(formula.clause_slots_len(), 3);
@@ -187,9 +165,8 @@ mod tests {
     fn bve_preserves_unit_contradiction_as_empty_clause() {
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1]]);
         let mut logger = None;
-        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.live_clause_count(), 1);
         assert_eq!(formula.clause_slots_len(), 3);
@@ -200,26 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn bve_zero_budget_skips_elimination() {
-        let mut formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3]]);
-        let mut logger = None;
-        let budget = ProcessBudget::new(0.0);
-
-        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
-
-        assert_eq!(formula.live_clause_count(), 2);
-        assert_eq!(formula.stats.bve_eliminated_variables, 0);
-        assert_eq!(formula.stats.bve_resolvents, 0);
-        assert_eq!(formula.stats.clauses_deleted, 0);
-    }
-
-    #[test]
     fn bve_is_noop_when_resolution_would_grow_formula() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![1, 3], vec![-1, 4], vec![-1, 5]]);
         let mut logger = None;
-        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.live_clause_count(), 4);
         assert_eq!(formula.stats.bve_eliminated_variables, 0);
@@ -234,9 +196,8 @@ mod tests {
         let substitute = Literal::new(3);
         formula.extensions.add_substitution(&x, &y, &substitute);
         let mut logger = None;
-        let budget = ProcessBudget::new(60.0);
 
-        process::<std::io::Empty>(&mut formula, &budget, &mut logger, None, None).unwrap();
+        process::<std::io::Empty>(&mut formula, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.extensions.substitute(&x, &y), None);
         assert!(formula.extensions.definition(&substitute).is_some());

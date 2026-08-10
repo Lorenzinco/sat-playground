@@ -35,8 +35,7 @@ impl Sat {
         heuristics: Heuristics,
         drat_path: Option<String>,
         extension_guidance: Option<GuidanceSpec>,
-        extension_guidance_log_path: Option<String>,
-        preprocessing_budget: f32,
+        extension_guidance_log_path: Option<String>
     ) -> PyResult<(Option<Vec<bool>>, Stats)> {
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
@@ -68,7 +67,6 @@ impl Sat {
             heuristics,
             &mut logger,
             &mut guidance,
-            preprocessing_budget,
         );
 
         if let Some(tracker) = &mut guidance {

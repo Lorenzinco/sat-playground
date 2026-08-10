@@ -3,45 +3,6 @@ pub mod bve;
 pub mod subsumption;
 
 use pyo3::prelude::*;
-use std::time::{Duration, Instant};
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ProcessBudget {
-    Exhausted,
-    Unlimited,
-    Deadline(Instant),
-}
-
-impl ProcessBudget {
-    pub(crate) fn new(seconds: f32) -> Self {
-        if !seconds.is_finite() || seconds <= 0.0 {
-            return Self::Exhausted;
-        }
-
-        let now = Instant::now();
-        let mut duration = Duration::try_from_secs_f32(seconds).unwrap_or(Duration::MAX);
-        let deadline = loop {
-            if let Some(deadline) = now.checked_add(duration) {
-                break deadline;
-            }
-            duration /= 2;
-        };
-
-        Self::Deadline(deadline)
-    }
-
-    pub(crate) fn unlimited() -> Self {
-        Self::Unlimited
-    }
-
-    pub(crate) fn exhausted(&self) -> bool {
-        match self {
-            Self::Exhausted => true,
-            Self::Unlimited => false,
-            Self::Deadline(deadline) => Instant::now() >= *deadline,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Process {
@@ -67,27 +28,5 @@ impl FromPyObject<'_, '_> for Process {
                 preprocess
             ))),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ProcessBudget;
-
-    #[test]
-    fn invalid_or_nonpositive_budgets_are_immediately_exhausted() {
-        for seconds in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(ProcessBudget::new(seconds).exhausted());
-        }
-    }
-
-    #[test]
-    fn positive_budget_has_a_future_deadline() {
-        assert!(!ProcessBudget::new(60.0).exhausted());
-    }
-
-    #[test]
-    fn unlimited_budget_never_expires() {
-        assert!(!ProcessBudget::unlimited().exhausted());
     }
 }

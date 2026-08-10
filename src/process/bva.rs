@@ -5,7 +5,6 @@ use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
 use crate::history::History;
-use crate::process::ProcessBudget;
 use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
@@ -13,13 +12,11 @@ use std::io::Write;
 
 /// Attempts local BVA factorization around VSIDS-weighted literals.
 ///
-/// There is intentionally no internal time budget or formula-wide schedule:
-/// each attempt samples a variable proportionally to its VSIDS activity,
+/// Each attempt samples a variable proportionally to its VSIDS activity,
 /// chooses one of its live polarities, and atomically applies the better
 /// profitable gate candidate.
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
-    _budget: &ProcessBudget,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
@@ -99,9 +96,8 @@ mod tests {
     fn empty_formula_is_a_noop() {
         let mut formula = Formula::new(0);
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
-        let budget = ProcessBudget::new(60.0);
 
-        process(&mut formula, &budget, &mut logger, None, None).unwrap();
+        process(&mut formula, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.stats.bva_literals, 0);
         assert!(formula.extensions.is_empty());

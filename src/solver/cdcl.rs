@@ -398,7 +398,7 @@ fn restart<W: Write>(
 
     if run_inprocessing {
         let inprocessing_start = Instant::now();
-        formula.process_unbounded(
+        formula.process(
             inprocessing.to_vec(),
             logger,
             Some((py, steps)),

@@ -76,9 +76,8 @@ impl Sat {
             extension_guidance=None,
             extension_guidance_log_path=None,
             *,
-            preprocessing_budget=5.0,
         ),
-        text_signature = "(algorithm, implication_point, preprocess, inprocessing, heuristics, drat_path=None, extension_guidance=None, extension_guidance_log_path=None, *, preprocessing_budget=5.0)"
+        text_signature = "(algorithm, implication_point, preprocess, inprocessing, heuristics, drat_path=None, extension_guidance=None, extension_guidance_log_path=None, *)"
     )]
     pub fn solve(
         &mut self,
@@ -91,13 +90,7 @@ impl Sat {
         drat_path: Option<String>,
         extension_guidance: Option<GuidanceSpec>,
         extension_guidance_log_path: Option<String>,
-        preprocessing_budget: f32,
     ) -> PyResult<()> {
-        if !preprocessing_budget.is_finite() || preprocessing_budget < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "preprocessing_budget must be finite and non-negative",
-            ));
-        }
 
         let (result, stats) = self.solve_rs(
             py,
@@ -108,54 +101,11 @@ impl Sat {
             heuristics,
             drat_path,
             extension_guidance,
-            extension_guidance_log_path,
-            preprocessing_budget,
+            extension_guidance_log_path
         )?;
         self.stats = Some(stats);
         self.model = result;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn solve_with_preprocessing_budget(py: Python<'_>, preprocessing: f32) -> PyResult<()> {
-        Sat::new(Some(vec![vec![1]])).solve(
-            py,
-            Algorithm::DPLL,
-            ImplicationPoint::UIP,
-            Vec::new(),
-            Vec::new(),
-            Heuristics::None,
-            None,
-            None,
-            None,
-            preprocessing,
-        )
-    }
-
-    #[test]
-    fn solve_rejects_negative_and_nonfinite_preprocessing_budgets() {
-        Python::initialize();
-        Python::attach(|py| {
-            for invalid in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                let preprocessing_error = solve_with_preprocessing_budget(py, invalid).unwrap_err();
-                assert!(preprocessing_error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
-                assert!(
-                    preprocessing_error
-                        .to_string()
-                        .contains("preprocessing_budget")
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn solve_accepts_zero_preprocessing_budget() {
-        Python::initialize();
-        Python::attach(|py| solve_with_preprocessing_budget(py, 0.0).unwrap());
     }
 }
 

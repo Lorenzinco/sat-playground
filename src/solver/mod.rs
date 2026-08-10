@@ -51,7 +51,6 @@ pub fn solve<'py, W: Write>(
     heuristics: Heuristics,
     logger: &mut Option<DratLogger<W>>,
     guidance: &mut Option<GuidanceTracker>,
-    preprocessing_budget: f32,
 ) -> PyResult<Option<Vec<bool>>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
@@ -65,7 +64,6 @@ pub fn solve<'py, W: Write>(
     let mut preprocessing_steps = 0;
     formula.process(
         preprocess.clone(),
-        preprocessing_budget,
         logger,
         Some((py, &mut preprocessing_steps)),
         true,
