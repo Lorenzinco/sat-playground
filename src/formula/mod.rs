@@ -26,7 +26,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::Instant;
 
-const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 100_000;
+const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 25_000;
 const DB_REDUCTION_GARBAGE_RATIO: usize = 12;
 
 pub struct Formula {
@@ -455,6 +455,10 @@ impl Formula {
                             signal,
                             history.as_deref_mut(),
                         )?;
+                    }
+                    Process::GES => {
+                        let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
+                        process::ges::process(self, logger, signal)?;
                     }
                     Process::Subsumption => {}
                     _ => println!("Not yet implemented!"),
@@ -1003,7 +1007,6 @@ impl Formula {
         mut signal: Option<(Python<'_>, &mut u64)>,
     ) -> PyResult<()> {
         let mut candidates: Vec<(usize, i16, usize)> = Vec::new();
-        let conservative = signal.is_some();
         let garbage_pressure = !self.garbage.is_empty()
             && self
                 .garbage
@@ -1013,7 +1016,7 @@ impl Formula {
 
         // `clauses_kept` is an upper bound on removable learned clauses. Avoid a
         // full database scan every 2,000 conflicts when reduction cannot fire.
-        if conservative && self.stats.clauses_kept < DB_REDUCTION_MIN_REMOVABLE_CLAUSES as u64 {
+        if self.stats.clauses_kept < DB_REDUCTION_MIN_REMOVABLE_CLAUSES as u64 {
             if garbage_pressure {
                 self.collect_garbage(Some(history));
             }
@@ -1031,24 +1034,21 @@ impl Formula {
                 -1 => continue,
                 0 => continue,
                 _ if clause.lock_count() > 0 => continue,
-                _ if conservative && clause.len() <= 2 => continue,
-                _ if conservative && clause.lbd() <= 2 && clause.len() <= 8 => continue,
+                _ if clause.len() <= 2 => continue,
+                _ if clause.lbd() <= 2 && clause.len() <= 8 => continue,
                 lbd => candidates.push((idx, lbd, clause.len())),
             }
         }
 
-        if conservative && candidates.len() < DB_REDUCTION_MIN_REMOVABLE_CLAUSES {
+        if candidates.len() < DB_REDUCTION_MIN_REMOVABLE_CLAUSES {
             if garbage_pressure {
                 self.collect_garbage(Some(history));
             }
             return Ok(());
         }
 
-        let delete_count = if conservative {
-            candidates.len() / 4
-        } else {
-            candidates.len() / 2
-        };
+        let delete_count = candidates.len() / 2; // Delete the lesser half based on lbd
+
         if delete_count == 0 && self.garbage.is_empty() {
             return Ok(());
         }
@@ -1074,7 +1074,7 @@ impl Formula {
         }
 
         self.delete_clauses::<W>(&to_delete, logger);
-        if !to_delete.is_empty() || garbage_pressure || !conservative {
+        if !to_delete.is_empty() || garbage_pressure {
             self.collect_garbage(Some(history));
         }
 

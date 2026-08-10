@@ -47,6 +47,8 @@ pub struct Stats {
     pub bve_resolvents: u64,
     #[pyo3(get)]
     pub avg_clause_length: f64,
+    #[pyo3(get)]
+    pub global_extension_substitution: u64,
     pub learnt_clause_literals_kept: u64,
     pub preprocess_nanos: u128,
     pub solve_nanos: u128,
@@ -85,6 +87,7 @@ impl Stats {
             bve_eliminated_variables: 0,
             bve_resolvents: 0,
             avg_clause_length: 0.0,
+            global_extension_substitution: 0,
             learnt_clause_literals_kept: 0,
             preprocess_nanos: 0,
             solve_nanos: 0,
@@ -224,6 +227,10 @@ impl Stats {
         self.time_stop = None;
     }
 
+    pub fn add_global_substitution(&mut self) {
+        self.global_extension_substitution += 1;
+    }
+
     pub fn stop(&mut self) {
         self.time_stop = Some(Instant::now());
     }
@@ -351,10 +358,13 @@ impl Stats {
             Self::format_duration_with_percent(self.inprocessing_nanos, total_nanos)
         );
 
+        let global_extension_substitution_s = format!("{:>40}", self.global_extension_substitution);
+
         format!(
             "c +------------------------------------------------------------------------+\n\
                  c | {:^70} |\n\
                  c +------------------------------------------------------------------------+\n\
+                 c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
@@ -412,6 +422,8 @@ impl Stats {
             format!("{blue}{lits_s}{reset}"),
             "Extension literals",
             format!("{blue}{ext_lits_s}{reset}"),
+            "Global extension substitutions",
+            format!("{blue}{global_extension_substitution_s}{reset}"),
             "Guidance matches/checks",
             guidance_hits_s,
             "Guidance stages/depth",

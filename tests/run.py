@@ -41,6 +41,7 @@ COUNTER_FIELDS: Tuple[str, ...] = (
     "bva_literals",
     "bve_eliminated_variables",
     "bve_resolvents",
+    "global_extension_substitution",
     "avg_clause_length",
 )
 

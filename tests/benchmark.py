@@ -31,7 +31,7 @@ TESTS_ROOT = PROJECT_ROOT / "tests"
 DEFAULT_OUTPUT = PROJECT_ROOT / "benchmark_result"
 MAX_TOTAL_TIMEOUT_SECONDS = 5.0 * 60.0
 MAX_INSTANCE_TIMEOUT_SECONDS = 120.0
-PROCESS_CHOICES = ("bva", "bve", "subsumption")
+PROCESS_CHOICES = ("bva", "bve", "ges", "subsumption")
 STATUS_NAMES = ("completed", "incorrect", "timeout", "error", "skipped")
 
 

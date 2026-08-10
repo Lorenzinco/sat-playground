@@ -29,8 +29,8 @@ class Sat:
         self, 
         algorithm: Literal["dpll", "cdcl"], 
         implication_point: Literal["uip","dip"], 
-        preprocess: list[Literal["bva","bve","subsumption"]], 
-        inprocessing: list[Literal["bva","bve","subsumption"]],
+        preprocess: list[Literal["bva","bve","ges","subsumption"]],
+        inprocessing: list[Literal["bva","bve","ges","subsumption"]],
         heuristics: Literal["vsids","random"], 
         drat_path: str|None = None,
         extension_guidance: dict[str, object]|None = None,
@@ -143,6 +143,12 @@ class Stats:
     def bve_resolvents(self)->int: ...
     """
     The number of resolvents added by bounded variable elimination.
+    """
+
+    @property
+    def global_extension_substitution(self)->int: ...
+    """
+    The number of clauses compressed through exact global extension substitution.
     """
 
     @property
