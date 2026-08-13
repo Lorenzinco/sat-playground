@@ -1,5 +1,8 @@
+use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
+use crate::process::ClauseScope;
+use std::io::Write;
 use std::time::Instant;
 
 pub struct IncrementalSubsumption {
@@ -8,9 +11,13 @@ pub struct IncrementalSubsumption {
     pub subset_checks: usize,
 }
 
-pub fn preprocess(formula: &mut Formula) {
+pub fn preprocess<W: Write>(
+    formula: &mut Formula,
+    scope: &ClauseScope,
+    logger: &mut Option<DratLogger<W>>,
+) {
     let start = Instant::now();
-    let result = find_subsumed_clauses(formula);
+    let result = find_subsumed_clauses(formula, scope);
     formula
         .stats
         .add_subsumption_checks(result.subset_checks as u64);
@@ -19,7 +26,7 @@ pub fn preprocess(formula: &mut Formula) {
         .add_subsumed_clauses(result.to_delete.len() as u64);
 
     if !result.to_delete.is_empty() {
-        formula.delete_clauses::<std::io::Empty>(&result.to_delete, &mut None);
+        formula.delete_clauses(&result.to_delete, logger);
     }
 
     formula.stats.record_subsumption_time(start.elapsed());
@@ -84,13 +91,16 @@ struct SubsumptionResult {
     subset_checks: usize,
 }
 
-fn find_subsumed_clauses(formula: &mut Formula) -> SubsumptionResult {
+fn find_subsumed_clauses(formula: &mut Formula, scope: &ClauseScope) -> SubsumptionResult {
     let mut deleted = vec![false; formula.clause_slots_len()];
     let mut to_delete = Vec::new();
     let mut subset_checks = 0;
 
     for subsumer_idx in 0..formula.clause_slots_len() {
         if deleted[subsumer_idx] || formula.is_clause_garbage(subsumer_idx) {
+            continue;
+        }
+        if !scope.includes(subsumer_idx, formula.get_clause_at_idx(subsumer_idx)) {
             continue;
         }
 
@@ -116,7 +126,10 @@ fn find_subsumed_clauses(formula: &mut Formula) -> SubsumptionResult {
             }
 
             let candidate = formula.get_clause_at_idx(candidate_idx);
-            if candidate.lock_count > 0 || candidate.len() < subsumer_len {
+            if !scope.includes(candidate_idx, candidate) {
+                continue;
+            }
+            if candidate.lbd == 0 || candidate.lock_count > 0 || candidate.len() < subsumer_len {
                 continue;
             }
 
@@ -149,11 +162,16 @@ mod tests {
     use super::*;
     use crate::formula::literal::Literal;
 
+    fn full_scope(formula: &Formula) -> ClauseScope {
+        ClauseScope::range(0..formula.clause_slots_len())
+    }
+
     #[test]
     fn subsumption_deletes_strict_superset_clause() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![1, 2, 3], vec![2, 4]]);
+        let scope = full_scope(&formula);
 
-        preprocess(&mut formula);
+        preprocess::<std::io::Empty>(&mut formula, &scope, &mut None);
 
         assert_eq!(formula.live_clause_count(), 2);
         assert_eq!(formula.stats.clauses_subsumed, 1);
@@ -174,8 +192,9 @@ mod tests {
     #[test]
     fn subsumption_deletes_duplicate_with_higher_index() {
         let mut formula = Formula::from_vec(vec![vec![1, 2], vec![1, 2], vec![1, 2, 3]]);
+        let scope = full_scope(&formula);
 
-        preprocess(&mut formula);
+        preprocess::<std::io::Empty>(&mut formula, &scope, &mut None);
 
         assert_eq!(formula.live_clause_count(), 1);
         assert_eq!(formula.stats.clauses_subsumed, 2);
@@ -189,8 +208,9 @@ mod tests {
     fn subsumption_skips_locked_candidate_clause() {
         let mut formula = Formula::from_vec(vec![vec![1], vec![1, 2]]);
         formula.get_clause_at_idx_mut(1).increment_lock_count();
+        let scope = full_scope(&formula);
 
-        preprocess(&mut formula);
+        preprocess::<std::io::Empty>(&mut formula, &scope, &mut None);
 
         assert_eq!(formula.live_clause_count(), 2);
         assert_eq!(formula.stats.clauses_subsumed, 0);
@@ -199,9 +219,11 @@ mod tests {
     #[test]
     fn incremental_check_finds_existing_subsumer() {
         let mut formula = Formula::from_vec(vec![vec![1, 2]]);
+        let scope = full_scope(&formula);
         formula
             .process::<std::io::Empty>(
                 vec![crate::process::Process::Subsumption],
+                &scope,
                 &mut None,
                 None,
                 true,
@@ -223,9 +245,11 @@ mod tests {
     #[test]
     fn incremental_check_deletes_existing_subsumed_clause() {
         let mut formula = Formula::from_vec(vec![vec![1, 2, 3]]);
+        let scope = full_scope(&formula);
         formula
             .process::<std::io::Empty>(
                 vec![crate::process::Process::Subsumption],
+                &scope,
                 &mut None,
                 None,
                 true,

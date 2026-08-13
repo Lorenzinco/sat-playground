@@ -5,6 +5,7 @@ use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::literal::Literal;
 use crate::history::History;
+use crate::process::ClauseScope;
 use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
@@ -17,6 +18,7 @@ use std::io::Write;
 /// profitable gate candidate.
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
+    scope: &ClauseScope,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
@@ -33,20 +35,26 @@ pub(crate) fn process<W: Write>(
     else {
         return Ok(());
     };
-
-    factorize_literal(formula, logger, start);
+    factorize_literal(formula, scope, logger, start);
 
     Ok(())
 }
 
 fn factorize_literal<W: Write>(
     formula: &mut Formula,
+    scope: &ClauseScope,
     logger: &mut Option<DratLogger<W>>,
     start: i32,
 ) -> bool {
     let initial_clause_limit = formula.clause_slots_len();
     let mut pending_deleted = (0..initial_clause_limit)
-        .map(|clause_idx| formula.is_clause_garbage(clause_idx))
+        .map(|clause_idx| {
+            formula.is_clause_garbage(clause_idx)
+                || !scope.includes(
+                    clause_idx,
+                    formula.get_clause_and_garbage_at_idx(clause_idx),
+                )
+        })
         .collect::<Vec<_>>();
 
     let and_gate = AndGate::find(formula, start, &pending_deleted);
@@ -97,7 +105,8 @@ mod tests {
         let mut formula = Formula::new(0);
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
 
-        process(&mut formula, &mut logger, None, None).unwrap();
+        let scope = ClauseScope::range(0..formula.clause_slots_len());
+        process(&mut formula, &scope, &mut logger, None, None).unwrap();
 
         assert_eq!(formula.stats.bva_literals, 0);
         assert!(formula.extensions.is_empty());
@@ -116,8 +125,9 @@ mod tests {
             vec![2, 6],
         ]);
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let scope = ClauseScope::range(0..formula.clause_slots_len());
 
-        assert!(factorize_literal(&mut formula, &mut logger, 1));
+        assert!(factorize_literal(&mut formula, &scope, &mut logger, 1));
 
         assert_eq!(formula.live_clause_count(), 6);
         assert_eq!(formula.stats.bva_literals, 1);
@@ -149,8 +159,9 @@ mod tests {
             vec![-1, -3, 14],
         ]);
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let scope = ClauseScope::range(0..formula.clause_slots_len());
 
-        assert!(factorize_literal(&mut formula, &mut logger, 1));
+        assert!(factorize_literal(&mut formula, &scope, &mut logger, 1));
 
         assert_eq!(formula.live_clause_count(), 9);
         assert_eq!(formula.stats.clauses_deleted, 10);
@@ -170,8 +181,9 @@ mod tests {
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
         let initial_slots = formula.clause_slots_len();
         let initial_variables = formula.assignment.len();
+        let scope = ClauseScope::range(0..formula.clause_slots_len());
 
-        assert!(!factorize_literal(&mut formula, &mut logger, 1));
+        assert!(!factorize_literal(&mut formula, &scope, &mut logger, 1));
 
         assert_eq!(formula.clause_slots_len(), initial_slots);
         assert_eq!(formula.assignment.len(), initial_variables);

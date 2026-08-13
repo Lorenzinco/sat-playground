@@ -1,6 +1,7 @@
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
+use crate::process::ClauseScope;
 use crate::python::signal_checker;
 
 use pyo3::Python;
@@ -12,10 +13,11 @@ use std::io::Write;
 /// For every registered `z <-> (a & b)`, a clause containing `!a | !b`
 /// can replace that pair with `!z`. The replacement is added before the source
 /// clause is deleted, so it is RUP under the source clause and extension axioms.
-const MAX_CLAUSES_PER_PASS: usize = 100;
+const MAX_CLAUSES_PER_PASS: usize = 1000;
 
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
+    scope: &ClauseScope,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<()> {
@@ -30,10 +32,12 @@ pub(crate) fn process<W: Write>(
     }
     let start = rand::random_range(0..live_clause_count);
 
-    for (clause_idx, clause) in sequential_clause_window(formula, start, MAX_CLAUSES_PER_PASS) {
-        // Extension axioms and BVA clauses justify substitutions and must remain
-        // untouched. Locked clauses are active implication reasons.
-        if clause.lock_count != 0 {
+    for (clause_idx, clause) in
+        sequential_clause_window(formula, scope, start, MAX_CLAUSES_PER_PASS)
+    {
+        // Extension and inprocessing clauses provide structural context but are
+        // not rewrite targets. Locked clauses are active implication reasons.
+        if clause.lbd == 0 || clause.lock_count != 0 {
             continue;
         }
 
@@ -57,11 +61,12 @@ pub(crate) fn process<W: Write>(
     Ok(())
 }
 
-fn sequential_clause_window(
-    formula: &Formula,
+fn sequential_clause_window<'a>(
+    formula: &'a Formula,
+    scope: &'a ClauseScope,
     start: usize,
     limit: usize,
-) -> impl Iterator<Item = (usize, &Clause)> {
+) -> impl Iterator<Item = (usize, &'a Clause)> + 'a {
     let live_clause_count = formula.live_clause_count();
     let start = if live_clause_count == 0 {
         0
@@ -73,6 +78,7 @@ fn sequential_clause_window(
         .get_clauses()
         .skip(start)
         .chain(formula.get_clauses().take(start))
+        .filter(move |(clause_idx, clause)| scope.includes(*clause_idx, clause))
         .take(limit.min(live_clause_count))
 }
 
@@ -156,7 +162,11 @@ fn substitute_clause(formula: &Formula, clause: &Clause) -> Option<Clause> {
         changed = true;
     }
 
-    changed.then(|| Clause::from_literals(literals, clause.lbd))
+    changed.then(|| {
+        let mut replacement = Clause::from_literals(literals, clause.lbd);
+        replacement.activity = clause.activity;
+        replacement
+    })
 }
 
 #[cfg(test)]
@@ -164,6 +174,10 @@ mod tests {
     use super::*;
     use crate::formula::extension::extension_literal;
     use crate::formula::literal::Literal;
+
+    fn full_scope(formula: &Formula) -> ClauseScope {
+        ClauseScope::range(0..formula.clause_slots_len())
+    }
 
     #[test]
     fn sequential_clause_window_wraps_and_skips_garbage() {
@@ -173,7 +187,8 @@ mod tests {
         formula.delete_clause(1, &mut logger);
         formula.delete_clause(4, &mut logger);
 
-        let indices = sequential_clause_window(&formula, 2, 4)
+        let scope = full_scope(&formula);
+        let indices = sequential_clause_window(&formula, &scope, 2, 4)
             .map(|(clause_idx, _)| clause_idx)
             .collect::<Vec<_>>();
 
@@ -192,7 +207,8 @@ mod tests {
             &Literal::new(2),
         );
 
-        process(&mut formula, &mut logger, None).unwrap();
+        let scope = full_scope(&formula);
+        process(&mut formula, &scope, &mut logger, None).unwrap();
         drop(logger);
 
         assert!(formula.is_clause_garbage(0));
@@ -220,7 +236,8 @@ mod tests {
         );
         let second = extension_literal(&mut formula, &mut logger, &first, &Literal::new(3));
 
-        process(&mut formula, &mut logger, None).unwrap();
+        let scope = full_scope(&formula);
+        process(&mut formula, &scope, &mut logger, None).unwrap();
 
         assert_eq!(
             formula.get_clause_at_idx(7).get_literals(),
@@ -351,6 +368,35 @@ mod tests {
     }
 
     #[test]
+    fn only_rewrites_learned_clauses_selected_by_index_scope() {
+        let mut formula = Formula::from_vec(vec![vec![-1, -2, 4], vec![-1, -2, 5]]);
+        formula.get_clause_at_idx_mut(0).lbd = 1;
+        formula.get_clause_at_idx_mut(1).lbd = 1;
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let z = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let scope = ClauseScope::indices([1]);
+
+        process(&mut formula, &scope, &mut logger, None).unwrap();
+
+        assert!(!formula.is_clause_garbage(0));
+        assert!(formula.is_clause_garbage(1));
+        assert_eq!(
+            formula
+                .get_clauses()
+                .find(|(_, clause)| clause.get_literals().contains(&Literal::new(5)))
+                .unwrap()
+                .1
+                .get_literals(),
+            &[Literal::new(5), z.negated()]
+        );
+    }
+
+    #[test]
     fn does_not_substitute_positive_inputs_or_locked_clauses() {
         let mut formula = Formula::from_vec(vec![vec![1, 2, 4], vec![-1, -2, 5]]);
         let mut logger: Option<DratLogger<std::io::Empty>> = None;
@@ -362,7 +408,8 @@ mod tests {
         );
         formula.get_clause_at_idx_mut(1).increment_lock_count();
 
-        process(&mut formula, &mut logger, None).unwrap();
+        let scope = full_scope(&formula);
+        process(&mut formula, &scope, &mut logger, None).unwrap();
 
         assert!(!formula.is_clause_garbage(0));
         assert!(!formula.is_clause_garbage(1));

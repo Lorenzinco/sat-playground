@@ -20,6 +20,7 @@ pub struct Clause {
     // The first two literals are the watched literals, avoiding per-clause watch indices.
     literals: Box<[Literal]>,
     pub lbd: i16,
+    pub activity: u8,
     pub lock_count: u8,
     pub bva_generated: bool,
 }
@@ -58,6 +59,8 @@ impl fmt::Debug for Clause {
 }
 
 impl Clause {
+    pub const MAX_ACTIVITY: u8 = 31;
+
     pub fn new(literals: Vec<Literal>, lbd: i16, creation_type: CreationType) -> Self {
         let literals_box = literals.into_boxed_slice();
 
@@ -69,9 +72,14 @@ impl Clause {
 
         Self {
             literals: literals_box,
-            lbd: lbd,
+            lbd,
+            activity: if creation_type == CreationType::Learned {
+                Self::MAX_ACTIVITY
+            } else {
+                0
+            },
             lock_count: 0,
-            bva_generated: bva_generated,
+            bva_generated,
         }
     }
 
@@ -80,8 +88,9 @@ impl Clause {
         let literals_box = literals.into_boxed_slice();
         Self {
             literals: literals_box,
-            lock_count: 0,
             lbd,
+            activity: if lbd > 0 { Self::MAX_ACTIVITY } else { 0 },
+            lock_count: 0,
             bva_generated: false,
         }
     }
@@ -283,6 +292,16 @@ mod tests {
     fn clause_occupies_three_machine_words() {
         assert_eq!(size_of::<Clause>(), 24);
         assert_eq!(size_of::<Clause>(), 3 * size_of::<usize>());
+    }
+
+    #[test]
+    fn activity_uses_existing_padding_without_growing_clause() {
+        let learned = Clause::new(vec![Literal::new(1)], 1, CreationType::Learned);
+        let original = Clause::new(vec![Literal::new(1)], -1, CreationType::ProblemText);
+
+        assert_eq!(learned.activity, Clause::MAX_ACTIVITY);
+        assert_eq!(original.activity, 0);
+        assert_eq!(size_of::<Clause>(), 24);
     }
 
     #[test]

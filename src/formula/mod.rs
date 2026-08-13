@@ -10,6 +10,7 @@ use crate::formula::garbage::Garbage;
 use crate::heuristics::vsids::Vsids;
 use crate::history::History;
 use crate::process;
+use crate::process::ClauseScope;
 use crate::process::Process;
 use crate::python::signal_checker;
 use crate::python::stats::Stats;
@@ -417,11 +418,10 @@ impl Formula {
         clause_idx
     }
 
-
-
     pub fn process<W: Write>(
         &mut self,
         methods: Vec<Process>,
+        scope: &ClauseScope,
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
         replace_subsumption_setting: bool,
@@ -436,31 +436,20 @@ impl Formula {
 
         let result: PyResult<()> = (|| -> PyResult<()> {
             for method in methods {
-
                 match method {
                     Process::BVA => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::bva::process(
-                            self,
-                            logger,
-                            signal,
-                            history.as_deref_mut(),
-                        )?;
+                        process::bva::process(self, scope, logger, signal, history.as_deref_mut())?;
                     }
                     Process::BVE => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::bve::process(
-                            self,
-                            logger,
-                            signal,
-                            history.as_deref_mut(),
-                        )?;
+                        process::bve::process(self, scope, logger, signal, history.as_deref_mut())?;
                     }
                     Process::GES => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::ges::process(self, logger, signal)?;
+                        process::ges::process(self, scope, logger, signal)?;
                     }
-                    Process::Subsumption => {}
+                    Process::Subsumption => process::subsumption::preprocess(self, scope, logger),
                     _ => println!("Not yet implemented!"),
                 }
             }
@@ -498,8 +487,7 @@ impl Formula {
             assert!(idx < self.clauses.len());
             if !self.garbage.is_garbage(idx) {
                 assert_eq!(
-                    self.clauses[idx].lock_count,
-                    0,
+                    self.clauses[idx].lock_count, 0,
                     "cannot delete a clause that is locked as an active implication reason"
                 );
             }
@@ -528,32 +516,25 @@ impl Formula {
         to_delete.len()
     }
 
-    pub fn collect_garbage(
-        &mut self,
-        history: Option<&mut History>,
-    ) -> Vec<Option<usize>> {
+    pub fn collect_garbage(&mut self, history: Option<&mut History>) -> Vec<Option<usize>> {
         assert!(
-            history.is_some()
-                || self
-                    .clauses
-                    .iter()
-                    .all(|clause| clause.lock_count == 0),
+            history.is_some() || self.clauses.iter().all(|clause| clause.lock_count == 0),
             "cannot compact locked reason clauses without remapping history"
         );
-    
+
         let old_len = self.clauses.len();
         let mut old_to_new = vec![None; old_len];
-    
+
         if self.garbage.is_empty() {
             for (index, mapped) in old_to_new.iter_mut().enumerate() {
                 *mapped = Some(index);
             }
-    
+
             return old_to_new;
         }
-    
+
         let old_clauses = std::mem::take(&mut self.clauses);
-    
+
         let surviving = old_clauses
             .into_iter()
             .enumerate()
@@ -568,17 +549,17 @@ impl Formula {
                 clause
             })
             .collect();
-    
+
         self.garbage.reset(self.clauses.len());
         self.rebuild_clause_indices();
-    
+
         if let Some(history) = history {
             history.remap_clause_indices(&old_to_new);
         }
-    
+
         old_to_new
     }
-    
+
     fn rebuild_clause_indices(&mut self) {
         self.watch = Watch::new(self.assignment.len());
         self.occurrence = vec![Vec::new(); self.assignment.len() * 2];
@@ -796,32 +777,30 @@ impl Formula {
     ) -> Option<usize> {
         while let Some(lit) = queue.pop_front() {
             let false_lit = lit.negated();
-    
+
             // Take ownership of this literal's watchlist. We reuse this same
             // allocation and compact surviving entries in place.
             let garbage = &self.garbage;
             let mut watching_clauses = self
                 .watch
-                .take_live(&false_lit, |clause_idx| {
-                    !garbage.is_garbage(clause_idx)
-                });
-    
+                .take_live(&false_lit, |clause_idx| !garbage.is_garbage(clause_idx));
+
             let original_len = watching_clauses.len();
             let mut read_idx = 0;
             let mut write_idx = 0;
-    
+
             while read_idx < original_len {
                 let clause_idx = watching_clauses[read_idx];
                 let clause_usize = clause_idx as usize;
-    
+
                 // Unless we find a replacement watch, this clause remains in the
                 // current watchlist.
                 let mut keep_current_watch = true;
                 let mut conflict_found = false;
-    
+
                 {
                     let clause = &mut self.clauses[clause_usize];
-    
+
                     /*
                      * Clauses shorter than two literals cannot participate in the
                      * normal two-watched-literal procedure.
@@ -841,7 +820,7 @@ impl Formula {
                          */
                         let false_idx = {
                             let literals = clause.get_literals();
-    
+
                             if literals[0] == false_lit {
                                 0
                             } else {
@@ -849,11 +828,11 @@ impl Formula {
                                 1
                             }
                         };
-    
+
                         let other_idx = 1 - false_idx;
                         let other_lit = clause.get_literals()[other_idx].clone();
                         let other_value = other_lit.eval(&self.assignment);
-    
+
                         /*
                          * If the other watched literal is true, the clause is
                          * already satisfied and remains on this watchlist.
@@ -867,16 +846,16 @@ impl Formula {
                              * profiles.
                              */
                             let mut replacement = None;
-    
+
                             for candidate_idx in 2..clause.len() {
                                 let candidate = &clause.get_literals()[candidate_idx];
-    
+
                                 if candidate.eval(&self.assignment) != Some(false) {
                                     replacement = Some(candidate_idx);
                                     break;
                                 }
                             }
-    
+
                             if let Some(replacement_idx) = replacement {
                                 /*
                                  * Clone before modifying the clause because
@@ -884,17 +863,11 @@ impl Formula {
                                  */
                                 let replacement_lit =
                                     clause.get_literals()[replacement_idx].clone();
-    
-                                clause.replace_watched_literal(
-                                    false_idx,
-                                    replacement_idx,
-                                );
-    
-                                self.watch.add_to_watchlist(
-                                    clause_usize,
-                                    &replacement_lit,
-                                );
-    
+
+                                clause.replace_watched_literal(false_idx, replacement_idx);
+
+                                self.watch.add_to_watchlist(clause_usize, &replacement_lit);
+
                                 // The clause now watches replacement_lit instead
                                 // of false_lit, so remove it from this watchlist.
                                 keep_current_watch = false;
@@ -909,22 +882,19 @@ impl Formula {
                                     Some(false) => {
                                         conflict_found = true;
                                     }
-    
+
                                     None => {
                                         self.assignment.assign(
                                             other_lit.get_index().abs() as usize,
                                             !other_lit.is_negated(),
                                         );
-    
-                                        history.add_implication(
-                                            &other_lit,
-                                            Some(clause_usize),
-                                        );
-    
+
+                                        history.add_implication(&other_lit, Some(clause_usize));
+
                                         clause.increment_lock_count();
                                         queue.push_back(other_lit);
                                     }
-    
+
                                     Some(true) => {
                                         // Handled by the outer condition.
                                         unreachable!();
@@ -934,7 +904,7 @@ impl Formula {
                         }
                     }
                 }
-    
+
                 /*
                  * Compact retained entries toward the beginning of the same
                  * allocation.
@@ -943,12 +913,12 @@ impl Formula {
                     if write_idx != read_idx {
                         watching_clauses[write_idx] = clause_idx;
                     }
-    
+
                     write_idx += 1;
                 }
-    
+
                 read_idx += 1;
-    
+
                 if conflict_found {
                     /*
                      * All unprocessed clauses still watch false_lit. Preserve the
@@ -956,27 +926,24 @@ impl Formula {
                      * instead of pushing each entry individually.
                      */
                     let remaining = original_len - read_idx;
-    
+
                     if remaining != 0 && write_idx != read_idx {
-                        watching_clauses.copy_within(
-                            read_idx..original_len,
-                            write_idx,
-                        );
+                        watching_clauses.copy_within(read_idx..original_len, write_idx);
                     }
-    
+
                     write_idx += remaining;
                     watching_clauses.truncate(write_idx);
-    
+
                     self.watch.set(&false_lit, watching_clauses);
-    
+
                     return Some(clause_usize);
                 }
             }
-    
+
             watching_clauses.truncate(write_idx);
             self.watch.set(&false_lit, watching_clauses);
         }
-    
+
         None
     }
 
@@ -1023,21 +990,29 @@ impl Formula {
             return Ok(());
         }
 
-        for (idx, clause) in self.get_clauses().rev() {
+        for (idx, clause) in self.get_clauses_mut() {
             if let Some((py, steps)) = signal.as_mut() {
                 signal_checker(*py, *steps)?;
             }
 
-            match clause.lbd {
-                // Original clauses and inprocessing resolvents are permanent, but
-                // an inprocessing clause must not hide older learned clauses.
-                -1 => continue,
-                0 => continue,
-                _ if clause.lock_count > 0 => continue,
-                _ if clause.len() <= 2 => continue,
-                _ if clause.lbd <= 2 && clause.len() <= 8 => continue,
-                lbd => candidates.push((idx, lbd, clause.len())),
+            // Original, extension, and inprocessing clauses are permanent.
+            if clause.lbd <= 0 || clause.lock_count > 0 || clause.len() <= 2 {
+                continue;
             }
+
+            let activity = clause.activity;
+            clause.activity = clause.activity.saturating_sub(1);
+
+            // Recently analyzed tier-one clauses survive while active. Tier-two
+            // clauses get one additional reduction interval after being used.
+            if clause.lbd <= 2 && activity > 0 {
+                continue;
+            }
+            if clause.lbd <= 6 && activity >= Clause::MAX_ACTIVITY - 1 {
+                continue;
+            }
+
+            candidates.push((idx, clause.lbd, clause.len()));
         }
 
         if candidates.len() < DB_REDUCTION_MIN_REMOVABLE_CLAUSES {
@@ -1053,11 +1028,10 @@ impl Formula {
             return Ok(());
         }
 
-        candidates.sort_by(|(idx_a, lbd_a, len_a), (idx_b, lbd_b, len_b)| {
-            lbd_b
-                .cmp(lbd_a)
-                .then_with(|| len_b.cmp(len_a))
-                .then_with(|| idx_a.cmp(idx_b))
+        // `sort_by` is stable: exact quality ties retain physical insertion
+        // order, so older clauses are deleted before equally useful newer ones.
+        candidates.sort_by(|(_, lbd_a, len_a), (_, lbd_b, len_b)| {
+            lbd_b.cmp(lbd_a).then_with(|| len_b.cmp(len_a))
         });
 
         let mut to_delete: Vec<usize> = candidates
@@ -1115,7 +1089,7 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn from_vec_initial_clauses_have_unknown_lbd() {
         let formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3], vec![2]]);
@@ -1209,6 +1183,56 @@ mod tests {
 
         assert_eq!(formula.clause_slots_len(), 3);
         assert_eq!(formula.garbage_clause_count(), 0);
+    }
+
+    #[test]
+    fn reduction_ages_tier_two_and_stably_deletes_oldest_quality_ties() {
+        let count = DB_REDUCTION_MIN_REMOVABLE_CLAUSES;
+        let clauses = (0..count)
+            .map(|offset| {
+                Clause::from_literals(
+                    vec![
+                        Literal::new(1),
+                        Literal::new(2),
+                        Literal::new((offset + 3) as i32),
+                    ],
+                    4,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut formula = Formula::from_clauses(&clauses);
+        formula.stats.clauses_kept = count as u64;
+        let mut history = History::new();
+
+        formula
+            .reduce_db::<Empty>(&mut history, &mut None, None)
+            .unwrap();
+        assert_eq!(formula.live_clause_count(), count);
+        assert!(
+            formula
+                .get_clauses()
+                .all(|(_, clause)| clause.activity == Clause::MAX_ACTIVITY - 1)
+        );
+
+        formula
+            .reduce_db::<Empty>(&mut history, &mut None, None)
+            .unwrap();
+        assert_eq!(formula.live_clause_count(), count);
+        assert!(
+            formula
+                .get_clauses()
+                .all(|(_, clause)| clause.activity == Clause::MAX_ACTIVITY - 2)
+        );
+
+        formula
+            .reduce_db::<Empty>(&mut history, &mut None, None)
+            .unwrap();
+
+        assert_eq!(formula.live_clause_count(), count / 2);
+        assert_eq!(
+            formula.get_clause_at_idx(0).get_literals()[2],
+            Literal::new((count / 2 + 3) as i32)
+        );
     }
 
     #[test]

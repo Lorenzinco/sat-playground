@@ -171,7 +171,7 @@ mod tests {
         let conflict_idx = 7;
 
         let (dip_a, dip_b, post_clause_without_z) =
-            match history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP) {
+            match history.analyze_conflict(&mut formula, conflict_idx, ImplicationPoint::DIP) {
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
@@ -377,7 +377,7 @@ mod tests {
         let conflict_idx = 6;
 
         let (dip_a, dip_b, post_clause_without_z) =
-            match history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP) {
+            match history.analyze_conflict(&mut formula, conflict_idx, ImplicationPoint::DIP) {
                 ConflictLearnResult::Dip {
                     dip_a,
                     dip_b,
@@ -435,7 +435,7 @@ mod tests {
         history.add_implication(&z.negated(), None);
 
         assert!(matches!(
-            history.analyze_conflict(&formula, 2, ImplicationPoint::DIP),
+            history.analyze_conflict(&mut formula, 2, ImplicationPoint::DIP),
             ConflictLearnResult::Uip { .. }
         ));
     }
@@ -623,7 +623,7 @@ mod tests {
 
         let conflict_idx = 2;
 
-        let result = history.analyze_conflict(&formula, conflict_idx, ImplicationPoint::DIP);
+        let result = history.analyze_conflict(&mut formula, conflict_idx, ImplicationPoint::DIP);
 
         let (dip_a, dip_b, post_clause_without_z) = match result {
             ConflictLearnResult::Dip {

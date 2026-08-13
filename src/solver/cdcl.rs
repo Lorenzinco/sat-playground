@@ -8,7 +8,7 @@ use crate::heuristics::Heuristics;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
-use crate::process::Process;
+use crate::process::{DEFAULT_INPROCESSING_TIERS, Process, sample_tier_scope};
 
 use crate::formula::extension::extension_literal;
 
@@ -247,7 +247,11 @@ fn learn_dip_clauses<W: Write>(
         return Ok(None);
     };
 
-    let learned = Clause::new(post_clause.get_literals().into(),post_clause.lbd,crate::formula::clause::CreationType::Learned);
+    let learned = Clause::new(
+        post_clause.get_literals().into(),
+        post_clause.lbd,
+        crate::formula::clause::CreationType::Learned,
+    );
 
     let post_label = format!(
         "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={}",
@@ -395,8 +399,10 @@ fn restart<W: Write>(
 
     if run_inprocessing {
         let inprocessing_start = Instant::now();
+        let scope = sample_tier_scope(formula, DEFAULT_INPROCESSING_TIERS);
         formula.process(
             inprocessing.to_vec(),
+            &scope,
             logger,
             Some((py, steps)),
             false,

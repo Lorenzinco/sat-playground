@@ -1,6 +1,7 @@
 use fastbit::{BitRead, BitVec, BitWrite};
 
 use crate::formula::Formula;
+use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::history::dip;
 use crate::history::uip;
@@ -11,6 +12,7 @@ const NO_VERTEX: u32 = u32::MAX;
 pub(super) struct ConflictAnalysis {
     pub current_level: usize,
     pub uip_clause_literals: Vec<Literal>,
+    pub analyzed_clause_indices: Vec<usize>,
     /// Assigned literals for graph vertices. Vertex 0 is the synthetic conflict
     /// and therefore uses the otherwise-invalid literal value 0.
     pub graph_literals: Vec<i32>,
@@ -23,7 +25,7 @@ pub(super) struct ConflictAnalysis {
 
 pub(super) fn analyze_conflict(
     history: &History,
-    formula: &Formula,
+    formula: &mut Formula,
     conflict_clause_index: usize,
     implication_point: ImplicationPoint,
 ) -> ConflictLearnResult {
@@ -31,15 +33,33 @@ pub(super) fn analyze_conflict(
         return uip::empty_result();
     };
 
-    if matches!(implication_point, ImplicationPoint::DIP) {
-        if let Some(result) =
-            dip::learn_from_analysis(&analysis, history, formula, conflict_clause_index)
-        {
-            return result;
+    let result = if matches!(implication_point, ImplicationPoint::DIP) {
+        dip::learn_from_analysis(&analysis, history, formula, conflict_clause_index)
+            .unwrap_or_else(|| uip::learn_from_analysis(&analysis, history, formula))
+    } else {
+        uip::learn_from_analysis(&analysis, history, formula)
+    };
+
+    for clause_idx in analysis.analyzed_clause_indices {
+        let old_lbd = formula.get_clause_at_idx(clause_idx).lbd;
+        if old_lbd <= 0 {
+            continue;
+        }
+
+        let new_lbd = Clause::calculate_lbd(
+            formula
+                .get_clause_at_idx(clause_idx)
+                .iter()
+                .filter_map(|literal| history.get_literal_level(literal)),
+        );
+        let clause = formula.get_clause_at_idx_mut(clause_idx);
+        clause.activity = Clause::MAX_ACTIVITY;
+        if new_lbd > 0 && new_lbd < clause.lbd {
+            clause.lbd = new_lbd;
         }
     }
 
-    uip::learn_from_analysis(&analysis, history, formula)
+    result
 }
 
 pub(super) fn analyze_conflict_graph(
@@ -58,6 +78,7 @@ pub(super) fn analyze_conflict_graph(
     let mut predecessor_literals = Vec::<i32>::new();
     let mut pred_index = Vec::<u32>::new();
     let mut graph_literals = vec![0];
+    let mut analyzed_clause_indices = Vec::new();
 
     let mut path_count = 0usize;
     let mut current_clause = conflict_clause_index;
@@ -66,6 +87,7 @@ pub(super) fn analyze_conflict_graph(
 
     loop {
         pred_index.push(u32::try_from(predecessor_literals.len()).ok()?);
+        analyzed_clause_indices.push(current_clause);
 
         for literal in formula.get_clause_at_idx(current_clause).iter() {
             let var = literal.get_index().unsigned_abs() as usize;
@@ -140,6 +162,7 @@ pub(super) fn analyze_conflict_graph(
     Some(ConflictAnalysis {
         current_level,
         uip_clause_literals: learned_literals,
+        analyzed_clause_indices,
         graph_literals,
         predecessors,
         pred_index,

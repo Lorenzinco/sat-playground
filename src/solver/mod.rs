@@ -15,7 +15,7 @@ use crate::formula::Formula;
 use crate::guidance::GuidanceTracker;
 use crate::heuristics::Heuristics;
 use crate::history::ImplicationPoint;
-use crate::process::Process;
+use crate::process::{ClauseScope, Process};
 
 use pyo3::FromPyObject;
 use pyo3::prelude::*;
@@ -62,8 +62,10 @@ pub fn solve<'py, W: Write>(
 
     let preprocess_start = Instant::now();
     let mut preprocessing_steps = 0;
+    let preprocessing_scope = ClauseScope::range(0..formula.clause_slots_len());
     formula.process(
         preprocess.clone(),
+        &preprocessing_scope,
         logger,
         Some((py, &mut preprocessing_steps)),
         true,

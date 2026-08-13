@@ -196,7 +196,7 @@ impl History {
     /// Returns the learned minimized clause at 1UIP and the conflict level the clause was found at.
     pub fn analyze_conflict(
         &self,
-        formula: &Formula,
+        formula: &mut Formula,
         conflict_clause_index: usize,
         implication_point: ImplicationPoint,
     ) -> ConflictLearnResult {
@@ -297,6 +297,10 @@ mod history {
         ];
 
         let mut formula = Formula::from_vec(clauses);
+        for (_, clause) in formula.get_clauses_mut() {
+            clause.lbd = 7;
+            clause.activity = 0;
+        }
         let mut history = History::new();
 
         let x1 = Literal::new(1); // x1
@@ -322,7 +326,7 @@ mod history {
         history.add_implication(&x4, Some(2)); // Reason: C2 (-3, 4)
 
         let (learned, backtrack_level) =
-            match history.analyze_conflict(&formula, 3, ImplicationPoint::UIP) {
+            match history.analyze_conflict(&mut formula, 3, ImplicationPoint::UIP) {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
@@ -342,6 +346,11 @@ mod history {
 
         assert_eq!(learned.lbd, 1);
         assert_eq!(backtrack_level, 0);
+        assert!(
+            formula
+                .get_clauses()
+                .all(|(_, clause)| { clause.lbd == 1 && clause.activity == Clause::MAX_ACTIVITY })
+        );
     }
 
     #[test]
@@ -374,7 +383,7 @@ mod history {
         history.add_implication(&x4, Some(1));
 
         let (learned, backtrack_level) =
-            match history.analyze_conflict(&formula, 2, ImplicationPoint::UIP) {
+            match history.analyze_conflict(&mut formula, 2, ImplicationPoint::UIP) {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
@@ -396,9 +405,10 @@ mod history {
     fn conflict_analysis_unsat_uip() {
         let history = History::new();
         let clauses: Vec<Vec<i32>> = vec![vec![1], vec![-1]]; // Unsat immediately
-        let formula = Formula::from_vec(clauses);
+        let mut formula = Formula::from_vec(clauses);
 
-        let (clause, level) = match history.analyze_conflict(&formula, 0, ImplicationPoint::UIP) {
+        let (clause, level) = match history.analyze_conflict(&mut formula, 0, ImplicationPoint::UIP)
+        {
             ConflictLearnResult::Uip {
                 clause,
                 backtrack_level,
@@ -459,7 +469,7 @@ mod history {
         history.add_implication(&lit5_neg, Some(3));
 
         let (learned_clause, backtrack_level) =
-            match history.analyze_conflict(&formula, 4, ImplicationPoint::UIP) {
+            match history.analyze_conflict(&mut formula, 4, ImplicationPoint::UIP) {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
@@ -520,7 +530,7 @@ mod history {
         history.add_implication(&x4, Some(2));
 
         let (learned, backtrack_level) =
-            match history.analyze_conflict(&formula, 3, ImplicationPoint::DIP) {
+            match history.analyze_conflict(&mut formula, 3, ImplicationPoint::DIP) {
                 ConflictLearnResult::Uip {
                     clause,
                     backtrack_level,
@@ -583,7 +593,7 @@ mod history {
         history.add_implication(&lit5_neg, Some(3));
 
         // Conflict on C4 (-4 v 5)
-        let result = history.analyze_conflict(&formula, 4, ImplicationPoint::DIP);
+        let result = history.analyze_conflict(&mut formula, 4, ImplicationPoint::DIP);
 
         match result {
             ConflictLearnResult::Dip { .. } => {
