@@ -3,6 +3,7 @@ use crate::circuits::gate::Gate;
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
+use crate::formula::clause::CreationType;
 use crate::formula::literal::Literal;
 use std::io::Write;
 
@@ -59,15 +60,13 @@ pub(crate) fn live_factor_clause(
 }
 
 pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
-    clause.lock_count() == 0
+    clause.lock_count == 0
         && (2..=MAX_FACTOR_CLAUSE_SIZE).contains(&clause.len())
-        && (clause.lbd() != 0 || clause.is_bva_generated())
+        && (clause.lbd != 0 || clause.bva_generated)
 }
 
 pub(crate) fn generated_clause(literals: Vec<Literal>) -> Clause {
-    let mut clause = Clause::from_literals(literals, 0);
-    clause.mark_bva_generated();
-    clause
+    Clause::new(literals, 0,CreationType::BvaGenerated)
 }
 
 pub(crate) fn claim_clause(
@@ -123,8 +122,8 @@ mod tests {
     #[test]
     fn generated_clauses_are_marked_as_permanent_bva_clauses() {
         let clause = generated_clause(vec![Literal::new(1), Literal::new(-2)]);
-        assert_eq!(clause.lbd(), 0);
-        assert!(clause.is_bva_generated());
+        assert_eq!(clause.lbd, 0);
+        assert!(clause.bva_generated);
     }
 
     #[test]

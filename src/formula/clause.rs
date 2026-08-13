@@ -4,14 +4,24 @@ use crate::formula::Assignment;
 use std::collections::HashSet;
 use std::fmt;
 
+// Differ each creation of clause to get rid of stupid slop helpers
+#[derive(PartialEq, Eq)]
+pub enum CreationType {
+    BvaGenerated,
+    ExtensionAxiom,
+    Learned,
+    Resolvant,
+    ProblemText,
+}
+
 #[derive(Clone)]
 #[repr(C)]
 pub struct Clause {
     // The first two literals are the watched literals, avoiding per-clause watch indices.
     literals: Box<[Literal]>,
-    lbd: i16,
-    lock_count: u8,
-    bva_generated: bool,
+    pub lbd: i16,
+    pub lock_count: u8,
+    pub bva_generated: bool,
 }
 
 impl<'a> IntoIterator for &'a Clause {
@@ -48,19 +58,28 @@ impl fmt::Debug for Clause {
 }
 
 impl Clause {
-    pub fn new() -> Self {
+    pub fn new(literals: Vec<Literal>, lbd: i16, creation_type: CreationType) -> Self {
+        let literals_box = literals.into_boxed_slice();
+
+        let mut bva_generated = false;
+
+        if creation_type == CreationType::BvaGenerated {
+            bva_generated = true
+        }
+
         Self {
-            literals: Box::new([]),
+            literals: literals_box,
+            lbd: lbd,
             lock_count: 0,
-            lbd: -1,
-            bva_generated: false,
+            bva_generated: bva_generated,
         }
     }
 
     pub fn from_literals(literals: Vec<Literal>, lbd: i16) -> Self {
         assert!(lbd >= -1, "LBD must be -1 (unknown) or non-negative");
+        let literals_box = literals.into_boxed_slice();
         Self {
-            literals: literals.into_boxed_slice(),
+            literals: literals_box,
             lock_count: 0,
             lbd,
             bva_generated: false,
@@ -70,14 +89,6 @@ impl Clause {
     pub fn calculate_lbd(levels: impl IntoIterator<Item = usize>) -> i16 {
         let distinct_levels = levels.into_iter().collect::<HashSet<_>>().len();
         i16::try_from(distinct_levels).unwrap_or(i16::MAX)
-    }
-
-    pub fn lbd(&self) -> i16 {
-        self.lbd
-    }
-
-    pub fn lock_count(&self) -> usize {
-        self.lock_count as usize
     }
 
     pub fn increment_lock_count(&mut self) {
@@ -91,56 +102,12 @@ impl Clause {
         self.lock_count = self.lock_count.saturating_sub(1);
     }
 
-    pub fn is_bva_generated(&self) -> bool {
-        self.bva_generated
-    }
-
-    pub fn mark_bva_generated(&mut self) {
-        self.bva_generated = true;
-    }
-
     pub fn len(&self) -> usize {
         self.into_iter().len()
     }
 
-    // 	/// Assigns <value> to x_<index> if present and not already assigned, otherwhise returns an error
-    // 	/// To set the value regardless of already assigned values please use pub fn set_value(index: u64, value: bool).
-    // pub fn assign(&mut self, index: u64, value: bool)->Result<(),&str>{
-    // 	match self.literals.entry(index) {
-    // 		Entry::Occupied (mut entry) => {
-    // 			let lit = entry.get_mut();
-    // 			if lit.already_assigned(){
-    // 				return Err("Already assigned")
-    // 			}
-    // 			lit.assign(value);
-    // 			return Ok(());
-    // 		}
-    // 		Entry::Vacant(_)=>{
-    // 			return Err("Literal not found")
-    // 		}
-    // 	}
-    // }
-
-    // /// Sets the value <value> to literal x_<index> if present, otherwhise returns an error.
-    // pub fn set_value(&mut self, index: u64, value: bool)->Result<(),&str>{
-    // 	match self.literals.entry(index) {
-    // 		Entry::Occupied (mut entry) => {
-    // 			entry.get_mut().assign(value);
-    // 			return Ok(())
-    // 		}
-    // 		Entry::Vacant(_)=>{
-    // 			return Err("Literal not found")
-    // 		}
-    // 	}
-    // }
-
     pub fn iter(&self) -> std::slice::Iter<'_, Literal> {
         self.literals.iter()
-    }
-
-    /// Adds a literal to the clause, returns an Error if the literal is already present inside the clause
-    pub fn add_literal(&mut self, literal: &Literal) -> Result<(), &str> {
-        self.add_literals(std::slice::from_ref(literal))
     }
 
     /// Adds many literals in batch, returns an error if any literal is duplicated.
@@ -216,36 +183,31 @@ impl Clause {
     }
 
     pub fn resolve_on(&self, other: &Clause, var: i32) -> Option<Clause> {
-        let mut literals = Vec::new();
         let mut seen = HashSet::new();
+        let mut literals = Vec::new();
 
-        for lit in &self.literals {
-            let idx = lit.get_index();
-            if idx == var {
-                continue;
-            }
-            if seen.contains(&-idx) {
-                return None;
-            }
-            if seen.insert(idx) {
-                literals.push(Literal::new(idx));
-            }
-        }
+        self.literals
+            .iter()
+            .map(Literal::get_index)
+            .filter(|&idx| idx != var)
+            .chain(
+                other
+                    .literals
+                    .iter()
+                    .map(Literal::get_index)
+                    .filter(|&idx| idx != -var),
+            )
+            .try_for_each(|idx: i32| -> Option<()> {
+                if seen.contains(&-idx) {
+                    return None;
+                } //Tautology
+                if seen.insert(idx) {
+                    literals.push(Literal::new(idx))
+                }
+                Some(())
+            })?;
 
-        for lit in &other.literals {
-            let idx = lit.get_index();
-            if idx == -var {
-                continue;
-            }
-            if seen.contains(&-idx) {
-                return None;
-            }
-            if seen.insert(idx) {
-                literals.push(Literal::new(idx));
-            }
-        }
-
-        literals.sort_unstable_by_key(|lit| lit.get_index());
+        literals.sort_unstable_by_key(Literal::get_index);
         Some(Clause::from_literals(literals, -1))
     }
 
@@ -256,12 +218,6 @@ impl Clause {
             .filter(|lit| lit.eval(assignment).is_none())
             .collect()
     }
-
-    // ///  Removes from this clause all of the literals which value has already been assigned, this method in-place modifies this clause.
-    // pub fn simplify(&mut self){
-    // 	self.literals.retain(|_,lit|!lit.already_assigned());
-    // }
-    //
 
     /// Returns true if this clause contains a literal with index <index>, false otherwise.
     pub fn contains_literal(&self, index: i32) -> bool {
@@ -279,11 +235,6 @@ impl Clause {
     /// Returns true if this clause is a unit clause, false otherwise. A unit clause is a clause that contains exactly one unassigned literal.
     pub fn is_unit(&self, assignment: &Assignment) -> bool {
         self.get_unit_literal(assignment).is_some()
-    }
-
-    pub fn negate(&self) -> Self {
-        let negated_literals = self.literals.iter().map(|lit| lit.negated()).collect();
-        Self::from_literals(negated_literals, self.lbd())
     }
 
     pub fn get_unit_literal(&self, assignment: &Assignment) -> Option<&Literal> {
@@ -321,20 +272,6 @@ impl Clause {
 
         None
     }
-
-    // /// Resolve the clauses giving back another Clause which is the resolvant
-    // pub fn resolve(c1: &Clause, c2: &Clause, lit: &Literal)-> Option<Clause>{
-    //     let index = lit.get_index();
-    //     if !c1.contains_literal(index) && !c2.contains_literal(index){
-    //         return None
-    //     }
-
-    //     let mut lits: Vec<Literal> = c1.get_literals()
-    //         .into_iter()
-    //         .filter(|l| l.get_index() != index);
-
-    //     None
-    // }
 }
 
 #[cfg(test)]
@@ -352,7 +289,7 @@ mod tests {
     fn lbd_values_larger_than_i8_are_preserved() {
         let clause = Clause::from_literals(Vec::new(), 200);
 
-        assert_eq!(clause.lbd(), 200);
+        assert_eq!(clause.lbd, 200);
         assert_eq!(Clause::calculate_lbd(0..200), 200);
         assert_eq!(size_of::<Clause>(), 24);
     }
@@ -363,44 +300,47 @@ mod tests {
 
         clause.increment_lock_count();
         clause.increment_lock_count();
-        assert_eq!(clause.lbd(), 7);
-        assert_eq!(clause.lock_count(), 2);
-        assert!(!clause.is_bva_generated());
+        assert_eq!(clause.lbd, 7);
+        assert_eq!(clause.lock_count, 2);
+        assert!(!clause.bva_generated);
 
         clause.decrement_lock_count();
         clause.decrement_lock_count();
         clause.decrement_lock_count();
-        assert_eq!(clause.lbd(), 7);
-        assert_eq!(clause.lock_count(), 0);
+        assert_eq!(clause.lbd, 7);
+        assert_eq!(clause.lock_count, 0);
     }
 
     #[test]
     fn bva_and_lock_metadata_coexist_with_zero_lbd() {
-        let mut clause = Clause::from_literals(vec![Literal::new(1), Literal::new(2)], 0);
+        let mut clause = Clause::new(
+            vec![Literal::new(1), Literal::new(2)],
+            0,
+            CreationType::BvaGenerated,
+        );
 
-        clause.mark_bva_generated();
         clause.increment_lock_count();
-        assert_eq!(clause.lbd(), 0);
-        assert_eq!(clause.lock_count(), 1);
-        assert!(clause.is_bva_generated());
+        assert_eq!(clause.lbd, 0);
+        assert_eq!(clause.lock_count, 1);
+        assert!(clause.bva_generated);
 
         clause.decrement_lock_count();
-        assert_eq!(clause.lbd(), 0);
-        assert_eq!(clause.lock_count(), 0);
-        assert!(clause.is_bva_generated());
+        assert_eq!(clause.lbd, 0);
+        assert_eq!(clause.lock_count, 0);
+        assert!(clause.bva_generated);
     }
 
     #[test]
     fn unknown_lbd_survives_locking_and_returns_to_minus_one() {
-        let mut clause = Clause::new();
+        let mut clause = Clause::new(vec![], -1, CreationType::ProblemText);
 
         clause.increment_lock_count();
-        assert_eq!(clause.lbd(), -1);
-        assert_eq!(clause.lock_count(), 1);
+        assert_eq!(clause.lbd, -1);
+        assert_eq!(clause.lock_count, 1);
 
         clause.decrement_lock_count();
-        assert_eq!(clause.lbd(), -1);
-        assert_eq!(clause.lock_count(), 0);
+        assert_eq!(clause.lbd, -1);
+        assert_eq!(clause.lock_count, 0);
     }
 
     #[test]
@@ -439,10 +379,10 @@ mod tests {
 
     #[test]
     fn add_literal_uses_batch_duplicate_semantics() {
-        let mut clause = Clause::new();
+        let mut clause = Clause::new(vec![], 0, CreationType::ProblemText);
 
-        clause.add_literal(&Literal::new(1)).unwrap();
-        assert!(clause.add_literal(&Literal::new(1)).is_err());
+        clause.add_literals(&vec![Literal::new(1)]).unwrap();
+        assert!(clause.add_literals(&vec![Literal::new(1)]).is_err());
         assert_eq!(clause.get_literals(), &[Literal::new(1)]);
     }
 

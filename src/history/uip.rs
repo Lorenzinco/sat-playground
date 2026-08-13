@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
+use crate::formula::clause::CreationType;
 use crate::history::conflict_analysis::{ConflictAnalysis, analyze_conflict_graph};
 use crate::history::{ConflictLearnResult, History};
 
@@ -36,7 +37,7 @@ pub(super) fn learn_from_analysis(
 
 pub(super) fn empty_result() -> ConflictLearnResult {
     ConflictLearnResult::Uip {
-        clause: Clause::new(),
+        clause: Clause::new(vec![],0,CreationType::Learned),
         backtrack_level: 0,
         minimized_literals: 0,
         minimization_time: Duration::ZERO,

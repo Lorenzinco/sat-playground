@@ -26,7 +26,7 @@ pub(crate) fn process<W: Write>(
     let Some(var) = formula.vsids.sample_low_activity_variable(formula) else {
         return Ok(());
     };
-    let Some(candidate) = elimination_candidate(formula, var, &mut signal)? else {
+    let Some(candidate) = elimination_candidate(formula, var)? else {
         return Ok(());
     };
     let EliminationCandidate {
@@ -62,7 +62,6 @@ struct EliminationCandidate {
 fn elimination_candidate(
     formula: &mut Formula,
     var: usize,
-    signal: &mut Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<Option<EliminationCandidate>> {
 
     let positive_literal = Literal::new(var as i32);
@@ -91,7 +90,7 @@ fn elimination_candidate(
     for &idx in &to_delete {
 
         let clause = formula.get_clause_at_idx(idx);
-        if clause.lock_count() > 0 || clause.lbd() == 0 {
+        if clause.lock_count > 0 || clause.lbd == 0 {
             return Ok(None);
         }
         deleted_literals += clause.len();
@@ -100,10 +99,6 @@ fn elimination_candidate(
     for &pos_idx in &pos {
 
         for &neg_idx in &neg {
-
-            if let Some((py, steps)) = signal.as_mut() {
-                signal_checker(*py, *steps)?;
-            }
 
             let Some(resolvent) = formula
                 .get_clause_at_idx(pos_idx)

@@ -33,10 +33,10 @@ def solve_example() -> None:
     solver.solve(
         algorithm="cdcl",
         implication_point="dip",
-        preprocess=["bva"],
+        preprocess=[],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=["bva","ges"],
+        inprocessing=["ges"],
     )
 
     if solver.model is not None:

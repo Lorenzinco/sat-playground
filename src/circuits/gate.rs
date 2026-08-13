@@ -544,8 +544,8 @@ mod tests {
                 .get_clauses_and_garbage()
                 .filter(|(physical_index, clause)| {
                     *physical_index >= initial_clause_limit
-                        && clause.lbd() == 0
-                        && clause.is_bva_generated()
+                        && clause.lbd == 0
+                        && clause.bva_generated
                 })
                 .count(),
             9

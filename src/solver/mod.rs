@@ -91,26 +91,19 @@ pub fn solve<'py, W: Write>(
             let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
 
             print!(
-                "\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | Restarts: {} | \x1b[34mLearnt: {}\x1b[0m | Min: {} | Deleted: {} | Subsumed: {} | Kept: {} | Lits: {} (ext {}, bva {}) | BVE: {}/{} | GES: {} | AvgLen: {:.2}",
+                "\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | Restarts: {} | \x1b[34mLearnt: {}\x1b[0m | Deleted: {} | Lits: (ext {}, bva {}) | GES: {}",
                 time_str,
                 stats.conflicts,
                 stats.restarts,
                 stats.clauses_learnt,
-                stats.minimized_literals,
                 stats.clauses_deleted,
-                stats.clauses_subsumed,
-                stats.clauses_kept,
-                stats.literals_learnt,
                 stats.extension_literals,
                 stats.bva_literals,
-                stats.bve_eliminated_variables,
-                stats.bve_resolvents,
                 stats.global_extension_substitution,
-                stats.avg_clause_length
             );
             io::stdout().flush().ok();
 
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(1000));
         }
 
         print!("\r\x1b[2K");

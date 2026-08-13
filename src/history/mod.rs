@@ -340,7 +340,7 @@ mod history {
         assert_eq!(lit.get_index(), -1);
         assert!(lit.is_negated()); // -x1
 
-        assert_eq!(learned.lbd(), 1);
+        assert_eq!(learned.lbd, 1);
         assert_eq!(backtrack_level, 0);
     }
 
@@ -388,7 +388,7 @@ mod history {
         println!("Learned: {}", learned);
 
         assert_eq!(learned.len(), 2);
-        assert_eq!(learned.lbd(), 2);
+        assert_eq!(learned.lbd, 2);
         assert_eq!(backtrack_level, 1);
     }
 

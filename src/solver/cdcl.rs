@@ -247,10 +247,7 @@ fn learn_dip_clauses<W: Write>(
         return Ok(None);
     };
 
-    let mut learned = Clause::new();
-    learned
-        .add_literals(post_clause.get_literals())
-        .expect("post clause literals are unique");
+    let learned = Clause::new(post_clause.get_literals().into(),post_clause.lbd,crate::formula::clause::CreationType::Learned);
 
     let post_label = format!(
         "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={}",
@@ -450,7 +447,7 @@ mod tests {
             formula.assign_implication(implied, &mut history, Some(1)),
             AssignResult::Assigned(_)
         ));
-        assert_eq!(formula.get_clause_at_idx(1).lock_count(), 1);
+        assert_eq!(formula.get_clause_at_idx(1).lock_count, 1);
 
         Python::attach(|py| {
             let mut steps = 0;
@@ -472,7 +469,7 @@ mod tests {
         assert_eq!(history.get_decision_level(), 0);
         assert_eq!(formula.assignment.get_value(1), None);
         assert_eq!(formula.assignment.get_value(2), None);
-        assert_eq!(formula.get_clause_at_idx(1).lock_count(), 0);
+        assert_eq!(formula.get_clause_at_idx(1).lock_count, 0);
     }
 
     #[test]
@@ -510,7 +507,7 @@ mod tests {
             .get_clauses()
             .rev()
             .take(3)
-            .map(|(_, clause)| clause.lbd())
+            .map(|(_, clause)| clause.lbd)
             .collect::<Vec<_>>();
         assert_eq!(extension_lbds, vec![0, 0, 0]);
     }

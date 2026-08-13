@@ -34,7 +34,7 @@ pub fn check_new_clause(formula: &mut Formula, new_clause: &Clause) -> Increment
 
     for idx in existing_subsumers {
         let existing = formula.get_clause_at_idx(idx);
-        if existing.lock_count() > 0 || existing.len() > new_clause.len() {
+        if existing.lock_count > 0 || existing.len() > new_clause.len() {
             continue;
         }
 
@@ -59,7 +59,7 @@ pub fn check_new_clause(formula: &mut Formula, new_clause: &Clause) -> Increment
 
     for idx in formula.occurrence_intersection(watch_a, watch_b) {
         let existing = formula.get_clause_at_idx(idx);
-        if existing.lock_count() > 0 || existing.len() < new_clause.len() {
+        if existing.lock_count > 0 || existing.len() < new_clause.len() {
             continue;
         }
 
@@ -103,7 +103,7 @@ fn find_subsumed_clauses(formula: &mut Formula) -> SubsumptionResult {
                 watch_a.clone(),
                 watch_b.cloned(),
                 subsumer.len(),
-                subsumer.lock_count() > 0,
+                subsumer.lock_count > 0,
             )
         };
         if subsumer_locked {
@@ -116,7 +116,7 @@ fn find_subsumed_clauses(formula: &mut Formula) -> SubsumptionResult {
             }
 
             let candidate = formula.get_clause_at_idx(candidate_idx);
-            if candidate.lock_count() > 0 || candidate.len() < subsumer_len {
+            if candidate.lock_count > 0 || candidate.len() < subsumer_len {
                 continue;
             }
 

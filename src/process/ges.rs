@@ -3,7 +3,6 @@ use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::python::signal_checker;
 
-use itertools::Itertools;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
 use std::io::Write;
@@ -13,13 +12,17 @@ use std::io::Write;
 /// For every registered `z <-> (a & b)`, a clause containing `!a | !b`
 /// can replace that pair with `!z`. The replacement is added before the source
 /// clause is deleted, so it is RUP under the source clause and extension axioms.
-const MAX_CLAUSES_PER_PASS: usize = 500;
+const MAX_CLAUSES_PER_PASS: usize = 100;
 
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
 ) -> PyResult<()> {
+    if let Some((py, steps)) = signal.as_mut() {
+        signal_checker(*py, *steps)?;
+    }
+
     let mut replacements = Vec::new();
     let live_clause_count = formula.live_clause_count();
     if live_clause_count == 0 {
@@ -28,15 +31,9 @@ pub(crate) fn process<W: Write>(
     let start = rand::random_range(0..live_clause_count);
 
     for (clause_idx, clause) in sequential_clause_window(formula, start, MAX_CLAUSES_PER_PASS) {
-        check_signal(&mut signal)?;
-
         // Extension axioms and BVA clauses justify substitutions and must remain
         // untouched. Locked clauses are active implication reasons.
-        if clause.len() < 2
-            || clause.lbd() == 0
-            || clause.lock_count() != 0
-            || clause.is_bva_generated()
-        {
+        if clause.lock_count != 0 {
             continue;
         }
 
@@ -46,11 +43,9 @@ pub(crate) fn process<W: Write>(
     }
 
     for (clause_idx, replacement) in replacements {
-        check_signal(&mut signal)?;
-
         // Keep proof order: the source clause is needed to RUP-check the
         // replacement, so add the replacement before logging its deletion.
-        if replacement.lbd() > 0 {
+        if replacement.lbd > 0 {
             formula.stats.add_learnt_clause(&replacement);
         }
         formula.add_clause_unchecked(replacement, logger);
@@ -81,43 +76,75 @@ fn sequential_clause_window(
         .take(limit.min(live_clause_count))
 }
 
-fn check_signal(signal: &mut Option<(Python<'_>, &mut u64)>) -> PyResult<()> {
-    if let Some((py, steps)) = signal.as_mut() {
-        signal_checker(*py, *steps)?;
-    }
-    Ok(())
-}
-
 fn substitute_clause(formula: &Formula, clause: &Clause) -> Option<Clause> {
     let mut literals = clause.get_literals().to_vec();
     let mut changed = false;
 
     while literals.len() >= 2 {
-        let substitution = literals
-            .iter()
-            .enumerate()
-            .array_combinations::<2>()
-            .find_map(|[(left_idx, left), (right_idx, right)]| {
+        //let mut candidate_count = 0usize;
+        let mut highest = None;
+        let mut lowest = None;
+
+        for left_idx in 0..literals.len() - 1 {
+            let left = literals[left_idx];
+            for right_idx in left_idx + 1..literals.len() {
+                let right = literals[right_idx];
+
                 // The map stores z <-> (a & b), while clauses contain the
                 // De Morgan dual !a | !b that is replaced by !z.
-                let left_input = left.negated();
-                let right_input = right.negated();
-                let replacement = formula
+                let Some(replacement) = formula
                     .extensions
-                    .substitute(&left_input, &right_input)?
-                    .negated();
+                    .substitute(&left.negated(), &right.negated())
+                    .map(|literal| literal.negated())
+                else {
+                    continue;
+                };
 
                 // Replacing the pair would make the clause tautological. Such a
                 // clause is redundant, but retaining it avoids special deletion
                 // handling and never removes a defining axiom accidentally.
                 if literals.contains(&replacement.negated()) {
-                    return None;
+                    continue;
                 }
 
-                Some((left_idx, right_idx, replacement))
-            });
+                //candidate_count += 1;
+                let score = formula.vsids.literal_activity(&replacement);
+                let candidate = (left_idx, right_idx, left, right, replacement, score);
 
-        let Some((left_idx, right_idx, replacement)) = substitution else {
+                if highest
+                    .as_ref()
+                    .is_none_or(|(_, _, _, _, _, best_score)| score > *best_score)
+                {
+                    highest = Some(candidate);
+                }
+                if lowest
+                    .as_ref()
+                    .is_none_or(|(_, _, _, _, _, best_score)| score < *best_score)
+                {
+                    lowest = Some(candidate);
+                }
+            }
+        }
+
+        /*if candidate_count > 1 {
+            let (_, _, high_left, high_right, high_replacement, high_score) =
+                highest.as_ref().unwrap();
+            let (_, _, low_left, low_right, low_replacement, low_score) = lowest.as_ref().unwrap();
+                /*println!(
+                "c GES found {} substitution pairs in {:?}",
+                candidate_count, literals
+            );
+            println!(
+                "c   highest replacement: ({:?}, {:?}) -> {:?} VSIDS={:.6}",
+                high_left, high_right, high_replacement, high_score
+            );
+            println!(
+                "c   lowest replacement:  ({:?}, {:?}) -> {:?} VSIDS={:.6}",
+                low_left, low_right, low_replacement, low_score
+            );*/
+        }*/
+
+        let Some((left_idx, right_idx, _, _, replacement, _)) = highest else {
             break;
         };
 
@@ -129,7 +156,7 @@ fn substitute_clause(formula: &Formula, clause: &Clause) -> Option<Clause> {
         changed = true;
     }
 
-    changed.then(|| Clause::from_literals(literals, clause.lbd()))
+    changed.then(|| Clause::from_literals(literals, clause.lbd))
 }
 
 #[cfg(test)]
@@ -198,6 +225,128 @@ mod tests {
         assert_eq!(
             formula.get_clause_at_idx(7).get_literals(),
             &[Literal::new(4), second.negated()]
+        );
+    }
+
+    #[test]
+    fn substitutes_all_five_disjoint_pairs() {
+        let mut formula =
+            Formula::from_vec(vec![vec![-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, 11]]);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let first = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let second = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(3),
+            &Literal::new(4),
+        );
+        let third = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(5),
+            &Literal::new(6),
+        );
+        let fourth = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(7),
+            &Literal::new(8),
+        );
+        let fifth = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(9),
+            &Literal::new(10),
+        );
+
+        let replacement = substitute_clause(&formula, formula.get_clause_at_idx(0)).unwrap();
+
+        assert_eq!(replacement.len(), 6);
+        assert!(replacement.get_literals().contains(&Literal::new(11)));
+        for extension in [first, second, third, fourth, fifth] {
+            assert!(replacement.get_literals().contains(&extension.negated()));
+        }
+    }
+
+    #[test]
+    fn selects_the_highest_replacement_vsids_without_collecting_pairs() {
+        let mut formula = Formula::from_vec(vec![vec![-1, -2, -3, 4]]);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let lower = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let higher = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(3),
+        );
+        // Operand activity favors the first pair, while replacement activity
+        // favors the second. GES must rank what it introduces into the clause.
+        formula.vsids.activity[1] = 100.0;
+        formula.vsids.activity[2] = 100.0;
+        formula.vsids.activity[3] = 1.0;
+        formula.vsids.activity[lower.get_index().unsigned_abs() as usize] = 2.0;
+        formula.vsids.activity[higher.get_index().unsigned_abs() as usize] = 8.0;
+
+        let replacement = substitute_clause(&formula, formula.get_clause_at_idx(0)).unwrap();
+
+        assert_eq!(
+            replacement.get_literals(),
+            &[Literal::new(-2), Literal::new(4), higher.negated()]
+        );
+        assert!(!replacement.get_literals().contains(&lower.negated()));
+    }
+
+    #[test]
+    fn keeps_disjoint_substitutions_when_overlapping_pairs_compete() {
+        let mut formula = Formula::from_vec(vec![vec![-1, -2, -3, -4, -5, 6]]);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let lower_overlap = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let higher_overlap = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(3),
+        );
+        let disjoint = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(4),
+            &Literal::new(5),
+        );
+        formula.vsids.activity[lower_overlap.get_index().unsigned_abs() as usize] = 2.0;
+        formula.vsids.activity[higher_overlap.get_index().unsigned_abs() as usize] = 8.0;
+        formula.vsids.activity[disjoint.get_index().unsigned_abs() as usize] = 4.0;
+
+        let replacement = substitute_clause(&formula, formula.get_clause_at_idx(0)).unwrap();
+
+        assert_eq!(replacement.len(), 4);
+        assert!(replacement.get_literals().contains(&Literal::new(-2)));
+        assert!(replacement.get_literals().contains(&Literal::new(6)));
+        assert!(
+            replacement
+                .get_literals()
+                .contains(&higher_overlap.negated())
+        );
+        assert!(replacement.get_literals().contains(&disjoint.negated()));
+        assert!(
+            !replacement
+                .get_literals()
+                .contains(&lower_overlap.negated())
         );
     }
 

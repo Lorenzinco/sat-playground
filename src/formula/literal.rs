@@ -1,8 +1,8 @@
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use crate::formula::assignment::Assignment;
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd)]
 pub struct Literal {
     literal: i32,
 }
@@ -20,6 +20,15 @@ impl fmt::Debug for Literal {
         let sign = if self.literal.is_negative() { "¬" } else { "" };
 
         write!(f, "{}x{}", sign, self.to_subscript())
+    }
+}
+
+impl Ord for Literal {
+    fn cmp(&self, other: &Literal)-> std::cmp::Ordering {
+        if self.literal.abs() > other.literal.abs() { return Ordering::Greater }
+        else if self.literal.abs() < other.literal.abs() { return Ordering::Less }
+
+        Ordering::Equal
     }
 }
 

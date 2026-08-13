@@ -3,9 +3,9 @@ use crate::formula::literal::Literal;
 
 #[derive(Clone)]
 pub struct Vsids {
-    activity: Vec<f32>,
-    var_increment: f32,
-    decay: f32,
+    pub activity: Vec<f64>,
+    var_increment: f64,
+    decay: f64,
     saved_phases: Vec<bool>,
 }
 
@@ -25,25 +25,47 @@ impl Vsids {
     }
 
     pub fn bump(&mut self, lit: &Literal) {
+        const EVSIDS_LIMIT: f64 = 1e150;
+
         let var = lit.get_index().unsigned_abs() as usize;
         if var >= self.activity.len() {
             self.activity.resize(var + 1, 0.0);
             self.saved_phases.resize(var + 1, false);
         }
+        if self.activity[var] + self.var_increment > EVSIDS_LIMIT {
+            self.rescale();
+        }
         self.activity[var] += self.var_increment;
         self.saved_phases[var] = !lit.is_negated();
-
-        // Rescale since now everything bumps up to the ceiling, 1e30 is just a random high number
-        if self.activity[var] > 1e30 {
-            for score in &mut self.activity {
-                *score *= 1e-100;
-            }
-            self.var_increment *= 1e-100;
-        }
     }
 
     pub fn decay_all(&mut self) {
-        self.var_increment /= self.decay
+        const EVSIDS_LIMIT: f64 = 1e150;
+
+        if self.var_increment / self.decay > EVSIDS_LIMIT {
+            self.rescale();
+        }
+        self.var_increment /= self.decay;
+    }
+
+    fn rescale(&mut self) {
+        let divider = self
+            .activity
+            .iter()
+            .copied()
+            .fold(self.var_increment, f64::max);
+        let factor = 1.0 / divider;
+        for score in &mut self.activity {
+            *score *= factor;
+        }
+        self.var_increment *= factor;
+    }
+
+    pub(crate) fn literal_activity(&self, literal: &Literal) -> f64 {
+        self.activity
+            .get(literal.get_index().unsigned_abs() as usize)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     pub fn from_formula(formula: &Formula) -> Self {
@@ -55,7 +77,7 @@ impl Vsids {
             let weight = if clause.len() == 0 {
                 1.0
             } else {
-                2f32.powi(-(clause.len() as i32))
+                2f64.powi(-(clause.len() as i32))
             };
 
             for lit in clause.get_literals() {
@@ -83,9 +105,9 @@ impl Vsids {
         vsids
     }
 
-    pub(crate) fn sample_literal(&self, formula: &Formula) -> Option<Literal> {
+    pub(crate) fn sample_literal(&self, formula: &Formula, order: bool) -> Option<Literal> {
         let (variable, positive_occurs, negative_occurs) =
-            self.sample_variable(formula, rand::random::<f64>())?;
+            self.sample_variable(formula, rand::random::<f64>(), order)?;
         let positive = match (positive_occurs, negative_occurs) {
             (true, true) => rand::random::<bool>(),
             (true, false) => true,
@@ -99,7 +121,12 @@ impl Vsids {
         }))
     }
 
-    fn sample_variable(&self, formula: &Formula, unit_sample: f64) -> Option<(usize, bool, bool)> {
+    fn sample_variable(
+        &self,
+        formula: &Formula,
+        unit_sample: f64,
+        order: bool,
+    ) -> Option<(usize, bool, bool)> {
         let candidates = (1..formula.assignment.len())
             .filter_map(|variable| {
                 let positive = Literal::new(variable as i32);
@@ -110,7 +137,7 @@ impl Vsids {
                     variable,
                     positive_occurs,
                     negative_occurs,
-                    self.activity.get(variable).copied().unwrap_or(0.0).max(0.0) as f64,
+                    self.activity.get(variable).copied().unwrap_or(0.0).max(0.0),
                 ))
             })
             .collect::<Vec<_>>();
@@ -118,17 +145,24 @@ impl Vsids {
             return None;
         }
 
-        let total_activity = candidates
+        let weights = candidates
             .iter()
-            .map(|(_, _, _, activity)| activity)
-            .sum::<f64>();
-        if total_activity.is_finite() && total_activity > 0.0 {
-            let mut target = unit_sample.clamp(0.0, 1.0 - f64::EPSILON) * total_activity;
-            for &(variable, positive, negative, activity) in &candidates {
-                if target < activity {
+            .map(|(_, _, _, activity)| {
+                if order {
+                    *activity
+                } else {
+                    1.0 / (1.0 + *activity)
+                }
+            })
+            .collect::<Vec<_>>();
+        let total_weight = weights.iter().sum::<f64>();
+        if total_weight.is_finite() && total_weight > 0.0 {
+            let mut target = unit_sample.clamp(0.0, 1.0 - f64::EPSILON) * total_weight;
+            for (&(variable, positive, negative, _), &weight) in candidates.iter().zip(&weights) {
+                if target < weight {
                     return Some((variable, positive, negative));
                 }
-                target -= activity;
+                target -= weight;
             }
             let &(variable, positive, negative, _) = candidates.last().unwrap();
             return Some((variable, positive, negative));
@@ -167,7 +201,7 @@ impl Vsids {
         let weights = candidates
             .iter()
             .map(|&variable| {
-                let activity = self.activity.get(variable).copied().unwrap_or(0.0).max(0.0) as f64;
+                let activity = self.activity.get(variable).copied().unwrap_or(0.0).max(0.0);
                 1.0 / (1.0 + activity)
             })
             .collect::<Vec<_>>();
@@ -215,6 +249,23 @@ mod tests {
     use crate::formula::Formula;
 
     #[test]
+    fn rescaling_preserves_activity_and_future_bumps() {
+        let mut vsids = Vsids::new(3);
+        vsids.activity[1] = 1.0e150;
+        vsids.activity[2] = 5.0e149;
+        vsids.var_increment = 1.0e150;
+
+        vsids.bump(&crate::formula::literal::Literal::new(1));
+
+        assert_eq!(vsids.activity[1], 2.0);
+        assert_eq!(vsids.activity[2], 0.5);
+        assert_eq!(vsids.var_increment, 1.0);
+
+        vsids.bump(&crate::formula::literal::Literal::new(1));
+        assert_eq!(vsids.activity[1], 3.0);
+    }
+
+    #[test]
     fn weighted_sampling_uses_activity_and_ignores_absent_variables() {
         let formula = Formula::from_vec(vec![vec![1, -2], vec![-1, 2], vec![4]]);
         let mut vsids = Vsids::new(formula.assignment.len());
@@ -224,15 +275,49 @@ mod tests {
         vsids.activity[4] = 6.0;
 
         assert_eq!(
-            vsids.sample_variable(&formula, 0.0).map(|sample| sample.0),
+            vsids
+                .sample_variable(&formula, 0.0, true)
+                .map(|sample| sample.0),
             Some(1)
         );
         assert_eq!(
-            vsids.sample_variable(&formula, 0.2).map(|sample| sample.0),
+            vsids
+                .sample_variable(&formula, 0.2, true)
+                .map(|sample| sample.0),
             Some(2)
         );
         assert_eq!(
-            vsids.sample_variable(&formula, 0.99).map(|sample| sample.0),
+            vsids
+                .sample_variable(&formula, 0.99, true)
+                .map(|sample| sample.0),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reverse_order_sampling_prefers_lower_activity_variables() {
+        let formula = Formula::from_vec(vec![vec![1, -2], vec![-1, 2], vec![4]]);
+        let mut vsids = Vsids::new(formula.assignment.len());
+        vsids.activity[1] = 1.0;
+        vsids.activity[2] = 3.0;
+        vsids.activity[4] = 6.0;
+
+        assert_eq!(
+            vsids
+                .sample_variable(&formula, 0.55, false)
+                .map(|sample| sample.0),
+            Some(1)
+        );
+        assert_eq!(
+            vsids
+                .sample_variable(&formula, 0.57, false)
+                .map(|sample| sample.0),
+            Some(2)
+        );
+        assert_eq!(
+            vsids
+                .sample_variable(&formula, 0.99, false)
+                .map(|sample| sample.0),
             Some(4)
         );
     }
@@ -243,11 +328,15 @@ mod tests {
         let vsids = Vsids::new(formula.assignment.len());
 
         assert_eq!(
-            vsids.sample_variable(&formula, 0.0).map(|sample| sample.0),
+            vsids
+                .sample_variable(&formula, 0.0, true)
+                .map(|sample| sample.0),
             Some(1)
         );
         assert_eq!(
-            vsids.sample_variable(&formula, 0.99).map(|sample| sample.0),
+            vsids
+                .sample_variable(&formula, 0.99, true)
+                .map(|sample| sample.0),
             Some(3)
         );
     }

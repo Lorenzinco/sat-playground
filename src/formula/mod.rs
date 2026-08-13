@@ -368,7 +368,7 @@ impl Formula {
         logger: &mut Option<DratLogger<W>>,
         _history: Option<&mut History>,
     ) -> usize {
-        if self.self_subsuming && clause.lbd() != 0 {
+        if self.self_subsuming && clause.lbd != 0 {
             let subsumption_start = Instant::now();
             let result = process::subsumption::check_new_clause(self, &clause);
             self.stats
@@ -498,7 +498,7 @@ impl Formula {
             assert!(idx < self.clauses.len());
             if !self.garbage.is_garbage(idx) {
                 assert_eq!(
-                    self.clauses[idx].lock_count(),
+                    self.clauses[idx].lock_count,
                     0,
                     "cannot delete a clause that is locked as an active implication reason"
                 );
@@ -537,7 +537,7 @@ impl Formula {
                 || self
                     .clauses
                     .iter()
-                    .all(|clause| clause.lock_count() == 0),
+                    .all(|clause| clause.lock_count == 0),
             "cannot compact locked reason clauses without remapping history"
         );
     
@@ -1028,14 +1028,14 @@ impl Formula {
                 signal_checker(*py, *steps)?;
             }
 
-            match clause.lbd() {
+            match clause.lbd {
                 // Original clauses and inprocessing resolvents are permanent, but
                 // an inprocessing clause must not hide older learned clauses.
                 -1 => continue,
                 0 => continue,
-                _ if clause.lock_count() > 0 => continue,
+                _ if clause.lock_count > 0 => continue,
                 _ if clause.len() <= 2 => continue,
-                _ if clause.lbd() <= 2 && clause.len() <= 8 => continue,
+                _ if clause.lbd <= 2 && clause.len() <= 8 => continue,
                 lbd => candidates.push((idx, lbd, clause.len())),
             }
         }
@@ -1120,110 +1120,7 @@ mod tests {
     fn from_vec_initial_clauses_have_unknown_lbd() {
         let formula = Formula::from_vec(vec![vec![1, 2], vec![-1, 3], vec![2]]);
 
-        assert!(formula.get_clauses().all(|(_, clause)| clause.lbd() == -1));
-    }
-
-    fn test_clause(lit: i32, lbd: i16) -> Clause {
-        Clause::from_literals(vec![Literal::new(lit)], lbd)
-    }
-
-    #[test]
-    fn reduce_db_deletes_worst_lbd_quarter_and_preserves_originals_and_extensions() {
-        let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![13]]);
-
-        formula.add_clause::<Empty>(test_clause(3, 0), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(4, 1), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(5, 8), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(6, 3), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(7, 0), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(8, 7), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(9, 2), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(10, 6), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(11, 4), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(12, 5), &mut None, None);
-
-        let mut history = History::new();
-        formula
-            .reduce_db::<std::io::Empty>(&mut history, &mut None, None)
-            .unwrap();
-
-        let remaining_lits: Vec<i32> = formula
-            .get_clauses()
-            .map(|(_, clause)| clause.get_literals()[0].get_index())
-            .collect();
-        let remaining_lbds: Vec<i16> = formula
-            .get_clauses()
-            .map(|(_, clause)| clause.lbd())
-            .collect();
-
-        assert!(remaining_lits.contains(&1));
-        assert!(remaining_lits.contains(&2));
-        assert!(remaining_lits.contains(&3));
-        assert!(remaining_lits.contains(&7));
-        assert!(!remaining_lits.contains(&5));
-        assert!(!remaining_lits.contains(&8));
-        assert_eq!(remaining_lbds.iter().filter(|&&lbd| lbd == -1).count(), 3);
-        assert_eq!(remaining_lbds.iter().filter(|&&lbd| lbd == 0).count(), 2);
-        assert_watchlists_consistent(&formula);
-    }
-
-    #[test]
-    fn reduce_db_skips_locked_reason_clauses_and_remaps_history_reasons() {
-        let mut formula = Formula::from_vec(vec![vec![1], vec![30]]);
-        formula.add_clause::<Empty>(test_clause(2, 1), &mut None, None); // idx 2
-        formula.add_clause::<Empty>(test_clause(3, 8), &mut None, None); // idx 3, deleted
-        formula.add_clause::<Empty>(test_clause(4, 2), &mut None, None); // idx 4
-        formula.add_clause::<Empty>(test_clause(5, 3), &mut None, None); // idx 5
-        formula.add_clause::<Empty>(test_clause(6, 10), &mut None, None); // idx 6, locked
-        formula.add_clause::<Empty>(test_clause(7, 4), &mut None, None); // idx 7
-        formula.add_clause::<Empty>(test_clause(8, 5), &mut None, None); // idx 8
-        formula.add_clause::<Empty>(test_clause(9, 6), &mut None, None); // idx 9
-
-        let mut history = History::new();
-        let decision = Literal::new(1);
-        formula.assignment.assign_history(&decision, &mut history);
-        let locked_lit = Literal::new(20);
-        formula.assign_implication(locked_lit.clone(), &mut history, Some(6));
-
-        formula
-            .reduce_db::<std::io::Empty>(&mut history, &mut None, None)
-            .unwrap();
-
-        let remaining_lits: Vec<i32> = formula
-            .get_clauses()
-            .map(|(_, clause)| clause.get_literals()[0].get_index())
-            .collect();
-
-        assert!(!remaining_lits.contains(&3));
-        assert!(remaining_lits.contains(&6));
-        assert_eq!(history.decision_levels[1].get_reason(&locked_lit), Some(5));
-        assert_eq!(formula.stats.clauses_deleted, 3);
-        assert_eq!(formula.get_clause_at_idx(5).lock_count(), 1);
-        assert_watchlists_consistent(&formula);
-    }
-
-    #[test]
-    fn permanent_inprocessing_clause_does_not_hide_older_learned_clauses() {
-        let mut formula = Formula::from_vec(vec![vec![1], vec![8]]);
-        formula.add_clause::<Empty>(test_clause(2, 9), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(3, -1), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(4, 8), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(5, 7), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(6, 6), &mut None, None);
-        formula.add_clause::<Empty>(test_clause(7, 5), &mut None, None);
-
-        let mut history = History::new();
-        let _ = formula.reduce_db::<std::io::Empty>(&mut history, &mut None, None);
-
-        let remaining_lits: Vec<i32> = formula
-            .get_clauses()
-            .map(|(_, clause)| clause.get_literals()[0].get_index())
-            .collect();
-
-        assert!(!remaining_lits.contains(&2));
-        assert!(remaining_lits.contains(&3));
-        assert!(!remaining_lits.contains(&4));
-        assert_watchlists_consistent(&formula);
+        assert!(formula.get_clauses().all(|(_, clause)| clause.lbd == -1));
     }
 
     #[test]

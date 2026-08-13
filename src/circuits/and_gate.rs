@@ -400,7 +400,7 @@ mod tests {
             formula
                 .get_clauses_and_garbage()
                 .filter(|(physical_index, _)| *physical_index >= initial_clause_limit)
-                .all(|(_, clause)| clause.is_bva_generated())
+                .all(|(_, clause)| clause.bva_generated)
         );
     }
 

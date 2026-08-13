@@ -12,7 +12,7 @@ use std::io::Write;
 
 /// Attempts local BVA factorization around VSIDS-weighted literals.
 ///
-/// Each attempt samples a variable proportionally to its VSIDS activity,
+/// Each attempt samples a variable with inverse VSIDS-activity weighting,
 /// chooses one of its live polarities, and atomically applies the better
 /// profitable gate candidate.
 pub(crate) fn process<W: Write>(
@@ -21,17 +21,17 @@ pub(crate) fn process<W: Write>(
     mut signal: Option<(Python<'_>, &mut u64)>,
     _history: Option<&mut History>,
 ) -> PyResult<()> {
-    // Try BVA around variables sampled proportionally to their VSIDS activity.
+    // Try BVA around lower-activity variables first.
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
     }
 
     let Some(start) = formula
         .vsids
-        .sample_literal(formula)
+        .sample_literal(formula, true)
         .map(|literal| literal.get_index())
     else {
-        return Ok(())
+        return Ok(());
     };
 
     factorize_literal(formula, logger, start);
