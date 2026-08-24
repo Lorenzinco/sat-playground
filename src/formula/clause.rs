@@ -23,6 +23,8 @@ pub struct Clause {
     pub activity: u8,
     pub lock_count: u8,
     pub bva_generated: bool,
+    pub ges_generated: bool,
+    pub ges_used: bool,
 }
 
 impl<'a> IntoIterator for &'a Clause {
@@ -80,6 +82,8 @@ impl Clause {
             },
             lock_count: 0,
             bva_generated,
+            ges_generated: false,
+            ges_used: false,
         }
     }
 
@@ -92,6 +96,8 @@ impl Clause {
             activity: if lbd > 0 { Self::MAX_ACTIVITY } else { 0 },
             lock_count: 0,
             bva_generated: false,
+            ges_generated: false,
+            ges_used: false,
         }
     }
 
@@ -301,6 +307,29 @@ mod tests {
 
         assert_eq!(learned.activity, Clause::MAX_ACTIVITY);
         assert_eq!(original.activity, 0);
+        assert_eq!(size_of::<Clause>(), 24);
+    }
+
+    #[test]
+    fn ges_metadata_defaults_fit_existing_padding() {
+        for creation in [
+            CreationType::BvaGenerated,
+            CreationType::ExtensionAxiom,
+            CreationType::Learned,
+            CreationType::Resolvant,
+            CreationType::ProblemText,
+        ] {
+            let clause = Clause::new(vec![Literal::new(1)], 1, creation);
+            assert!(!clause.ges_generated);
+            assert!(!clause.ges_used);
+        }
+        let mut clause = Clause::from_literals(vec![Literal::new(1)], 1);
+        assert!(!clause.ges_generated);
+        assert!(!clause.ges_used);
+        clause.ges_generated = true;
+        clause.ges_used = true;
+        let cloned = clause.clone();
+        assert!(cloned.ges_generated && cloned.ges_used);
         assert_eq!(size_of::<Clause>(), 24);
     }
 

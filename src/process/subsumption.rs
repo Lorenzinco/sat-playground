@@ -228,6 +228,7 @@ mod tests {
                 None,
                 true,
                 None,
+                None,
             )
             .unwrap();
 
@@ -253,6 +254,7 @@ mod tests {
                 &mut None,
                 None,
                 true,
+                None,
                 None,
             )
             .unwrap();

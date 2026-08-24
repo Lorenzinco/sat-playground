@@ -85,6 +85,20 @@ impl DecisionLevel {
             .filter_map(|(_, reason_idx)| *reason_idx)
     }
 
+    pub fn replace_reason_clause(&mut self, old_index: usize, new_index: usize) {
+        for reason_idx in &mut self.reason_by_unsigned {
+            if *reason_idx == Some(old_index) {
+                *reason_idx = Some(new_index);
+            }
+        }
+
+        for (_, reason_idx) in &mut self.implied_literals {
+            if *reason_idx == Some(old_index) {
+                *reason_idx = Some(new_index);
+            }
+        }
+    }
+
     pub fn remap_clause_indices(&mut self, old_to_new: &[Option<usize>]) {
         let remap = |reason_idx: &mut Option<usize>| {
             if let Some(idx) = *reason_idx {

@@ -91,7 +91,6 @@ impl Sat {
         extension_guidance: Option<GuidanceSpec>,
         extension_guidance_log_path: Option<String>,
     ) -> PyResult<()> {
-
         let (result, stats) = self.solve_rs(
             py,
             algorithm,
@@ -101,7 +100,7 @@ impl Sat {
             heuristics,
             drat_path,
             extension_guidance,
-            extension_guidance_log_path
+            extension_guidance_log_path,
         )?;
         self.stats = Some(stats);
         self.model = result;

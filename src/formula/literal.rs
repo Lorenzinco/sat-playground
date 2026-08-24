@@ -24,9 +24,12 @@ impl fmt::Debug for Literal {
 }
 
 impl Ord for Literal {
-    fn cmp(&self, other: &Literal)-> std::cmp::Ordering {
-        if self.literal.abs() > other.literal.abs() { return Ordering::Greater }
-        else if self.literal.abs() < other.literal.abs() { return Ordering::Less }
+    fn cmp(&self, other: &Literal) -> std::cmp::Ordering {
+        if self.literal.abs() > other.literal.abs() {
+            return Ordering::Greater;
+        } else if self.literal.abs() < other.literal.abs() {
+            return Ordering::Less;
+        }
 
         Ordering::Equal
     }

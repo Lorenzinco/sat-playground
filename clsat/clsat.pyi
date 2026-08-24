@@ -29,8 +29,8 @@ class Sat:
         self, 
         algorithm: Literal["dpll", "cdcl"], 
         implication_point: Literal["uip","dip"], 
-        preprocess: list[Literal["bva","bve","ges","subsumption"]],
-        inprocessing: list[Literal["bva","bve","ges","subsumption"]],
+        preprocess: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","subsumption"]],
+        inprocessing: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","subsumption"]],
         heuristics: Literal["vsids","random"], 
         drat_path: str|None = None,
         extension_guidance: dict[str, object]|None = None,
@@ -150,6 +150,28 @@ class Stats:
     """
     The number of clauses compressed through exact global extension substitution.
     """
+
+    @property
+    def ges_clauses_inspected(self)->int: ...
+    @property
+    def ges_noop_rewrites(self)->int: ...
+    @property
+    def ges_rewrites_rejected(self)->int: ...
+    @property
+    def ges_lbd_improvements(self)->int: ...
+    @property
+    def ges_vsids_improvements(self)->int: ...
+    @property
+    def ges_literals_removed(self)->int: ...
+    @property
+    def ges_replacement_reason_uses(self)->int: ...
+    """Successful implications and active reason transfers, counted per use."""
+    @property
+    def ges_replacement_analysis_uses(self)->int: ...
+    """Source-clause occurrences in conflict analysis, including the conflict clause."""
+    @property
+    def ges_replacements_deleted_unused(self)->int: ...
+    """GES replacements deleted without any reason or analysis use; excludes GC."""
 
     @property
     def avg_clause_length(self)->float:...

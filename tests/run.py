@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +42,15 @@ COUNTER_FIELDS: Tuple[str, ...] = (
     "bve_eliminated_variables",
     "bve_resolvents",
     "global_extension_substitution",
+    "ges_clauses_inspected",
+    "ges_noop_rewrites",
+    "ges_rewrites_rejected",
+    "ges_lbd_improvements",
+    "ges_vsids_improvements",
+    "ges_literals_removed",
+    "ges_replacement_reason_uses",
+    "ges_replacement_analysis_uses",
+    "ges_replacements_deleted_unused",
     "avg_clause_length",
 )
 
@@ -159,8 +168,12 @@ def run_worker(
         model = solver.model
         actual = "sat" if model is not None else "unsat"
         model_valid = model is None or validate_model(model, clauses)
-        classification_matches = actual == base["expected"]
-        status = "completed" if model_valid and classification_matches else "incorrect"
+        classification_matches = (
+            actual == base["expected"] if base["expected"] in ("sat", "unsat") else None
+        )
+        status = (
+            "completed" if model_valid and classification_matches is not False else "incorrect"
+        )
         stats = solver.stats
         if stats is None:
             raise RuntimeError("solver completed without exposing statistics")
@@ -219,10 +232,14 @@ def run_problem_subprocess(
     worker_output: Path,
     config: Mapping[str, Any],
     metadata: Mapping[str, Any],
-    instance_timeout: float,
-    global_deadline: float,
+    family_deadline: float,
+    progress_callback: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
-    """Run one isolated worker bounded by per-instance and global deadlines."""
+    """Run a worker under an absolute deadline, optionally reporting budget every ~1s.
+
+    The callback runs synchronously in the parent and should return promptly.
+    Without it, communicate retains its single full-budget wait.
+    """
     command = [
         sys.executable,
         "-m",
@@ -238,7 +255,17 @@ def run_problem_subprocess(
         json.dumps(metadata, separators=(",", ":")),
     ]
     started = time.perf_counter()
-    instance_deadline = min(started + instance_timeout, global_deadline)
+    remaining = max(0.0, family_deadline - started)
+    if remaining <= 0:
+        return {
+            **result_base(metadata, config),
+            "status": "timeout",
+            "wall_seconds": time.perf_counter() - started,
+            "timeout_seconds": remaining,
+            "reason": "family deadline exhausted before worker launch",
+            "stderr": "",
+        }
+
     process = subprocess.Popen(
         command,
         cwd=str(PROJECT_ROOT),
@@ -248,7 +275,7 @@ def run_problem_subprocess(
         start_new_session=(os.name == "posix"),
     )
 
-    allowed = instance_deadline - time.perf_counter()
+    allowed = family_deadline - time.perf_counter()
     if allowed <= 0:
         terminate_process(process)
         _, stderr = process.communicate()
@@ -256,12 +283,29 @@ def run_problem_subprocess(
             **result_base(metadata, config),
             "status": "timeout",
             "wall_seconds": time.perf_counter() - started,
-            "timeout_seconds": instance_timeout,
+            "timeout_seconds": remaining,
+            "reason": "family deadline exhausted during worker launch",
             "stderr": stderr.strip(),
         }
 
     try:
-        _, stderr = process.communicate(timeout=allowed)
+        while True:
+            try:
+                _, stderr = process.communicate(
+                    timeout=min(1.0, allowed) if progress_callback is not None else allowed
+                )
+                break
+            except subprocess.TimeoutExpired:
+                if progress_callback is None:
+                    raise
+                allowed = family_deadline - time.perf_counter()
+                if allowed <= 0:
+                    raise
+                progress_callback(allowed)
+                # UI work consumes the same budget; never restart or extend the deadline.
+                allowed = family_deadline - time.perf_counter()
+                if allowed <= 0:
+                    raise
     except subprocess.TimeoutExpired:
         terminate_process(process)
         _, stderr = process.communicate()
@@ -269,9 +313,14 @@ def run_problem_subprocess(
             **result_base(metadata, config),
             "status": "timeout",
             "wall_seconds": time.perf_counter() - started,
-            "timeout_seconds": instance_timeout,
+            "timeout_seconds": remaining,
+            "reason": "family deadline exhausted while waiting for worker",
             "stderr": stderr.strip(),
         }
+    except BaseException:
+        terminate_process(process)
+        process.communicate()
+        raise
 
     if worker_output.exists():
         with worker_output.open("r", encoding="utf-8") as result_file:

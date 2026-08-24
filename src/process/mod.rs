@@ -1,9 +1,13 @@
 pub mod bva;
 pub mod bve;
 pub mod ges;
+pub mod ges_always;
+pub mod ges_lbd;
+pub mod ges_par;
+pub mod ges_random;
+pub mod ges_vsids;
 pub mod subsumption;
 
-use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use pyo3::prelude::*;
 use std::collections::HashSet;
@@ -14,6 +18,11 @@ pub enum Process {
     BVA,
     BVE,
     GES,
+    GESAlways,
+    GESLBD,
+    GESPar,
+    GESRandom,
+    GESVSIDS,
     Subsumption,
     Others,
 }
@@ -44,91 +53,12 @@ impl ClauseScope {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct TierProbabilities {
-    pub tier1: f64,
-    pub tier2: f64,
-    pub tier3: f64,
-}
-
-impl TierProbabilities {
-    pub const fn new(tier1: f64, tier2: f64, tier3: f64) -> Self {
-        Self {
-            tier1,
-            tier2,
-            tier3,
-        }
-    }
-
-    fn for_lbd(self, lbd: i16) -> f64 {
-        if lbd <= 2 {
-            self.tier1
-        } else if lbd <= 6 {
-            self.tier2
-        } else {
-            self.tier3
-        }
-    }
-}
-
-pub const DEFAULT_INPROCESSING_TIERS: TierProbabilities = TierProbabilities::new(0.5, 1.0, 0.5);
-
-pub fn sample_tier_scope(formula: &Formula, probabilities: TierProbabilities) -> ClauseScope {
-    let scope = sample_tier_scope_with(formula, probabilities, rand::random::<f64>);
-    let mut total = [0usize; 3];
-    let mut selected = [0usize; 3];
-
-    for (index, clause) in formula.get_clauses() {
-        if clause.lbd <= 0 {
-            continue;
-        }
-        let tier = if clause.lbd <= 2 {
-            0
-        } else if clause.lbd <= 6 {
-            1
-        } else {
-            2
-        };
-        total[tier] += 1;
-        if scope.includes(index, clause) {
-            selected[tier] += 1;
-        }
-    }
-
-    println!(
-        "c inprocessing clause tiers: tier1={}/{} tier2={}/{} tier3={}/{} (selected/total)",
-        selected[0], total[0], selected[1], total[1], selected[2], total[2]
-    );
-
-    scope
-}
-
-fn sample_tier_scope_with(
-    formula: &Formula,
-    probabilities: TierProbabilities,
-    mut sample: impl FnMut() -> f64,
-) -> ClauseScope {
-    for probability in [
-        probabilities.tier1,
-        probabilities.tier2,
-        probabilities.tier3,
-    ] {
-        assert!(
-            probability.is_finite() && (0.0..=1.0).contains(&probability),
-            "tier probabilities must be finite values between zero and one"
-        );
-    }
-
-    ClauseScope::indices(formula.get_clauses().filter_map(|(index, clause)| {
-        (clause.lbd > 0 && sample() < probabilities.for_lbd(clause.lbd)).then_some(index)
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formula::Formula;
 
-    fn tiered_formula() -> Formula {
+    fn scoped_formula() -> Formula {
         let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4]]);
         formula.get_clause_at_idx_mut(1).lbd = 2;
         formula.get_clause_at_idx_mut(2).lbd = 4;
@@ -138,7 +68,7 @@ mod tests {
 
     #[test]
     fn range_and_index_scopes_always_include_permanent_clauses() {
-        let formula = tiered_formula();
+        let formula = scoped_formula();
         let range = ClauseScope::range(2..4);
         let indices = ClauseScope::indices([3]);
 
@@ -148,27 +78,6 @@ mod tests {
         assert!(indices.includes(0, formula.get_clause_at_idx(0)));
         assert!(!indices.includes(2, formula.get_clause_at_idx(2)));
         assert!(indices.includes(3, formula.get_clause_at_idx(3)));
-    }
-
-    #[test]
-    fn tier_sampling_is_per_clause_and_probabilities_are_exchangeable() {
-        let formula = tiered_formula();
-        let mut samples = [0.99, 0.60, 0.20].into_iter();
-        let default_scope = sample_tier_scope_with(&formula, DEFAULT_INPROCESSING_TIERS, || {
-            samples.next().unwrap()
-        });
-
-        assert!(default_scope.includes(0, formula.get_clause_at_idx(0)));
-        assert!(default_scope.includes(1, formula.get_clause_at_idx(1)));
-        assert!(!default_scope.includes(2, formula.get_clause_at_idx(2)));
-        assert!(default_scope.includes(3, formula.get_clause_at_idx(3)));
-
-        let tier3_only =
-            sample_tier_scope_with(&formula, TierProbabilities::new(0.0, 0.0, 1.0), || 0.5);
-        assert!(tier3_only.includes(0, formula.get_clause_at_idx(0)));
-        assert!(!tier3_only.includes(1, formula.get_clause_at_idx(1)));
-        assert!(!tier3_only.includes(2, formula.get_clause_at_idx(2)));
-        assert!(tier3_only.includes(3, formula.get_clause_at_idx(3)));
     }
 }
 
@@ -181,9 +90,14 @@ impl FromPyObject<'_, '_> for Process {
             "bva" => Ok(Process::BVA),
             "bve" => Ok(Process::BVE),
             "ges" => Ok(Process::GES),
+            "ges_always" => Ok(Process::GESAlways),
+            "ges_lbd" => Ok(Process::GESLBD),
+            "ges_par" => Ok(Process::GESPar),
+            "ges_random" => Ok(Process::GESRandom),
+            "ges_vsids" => Ok(Process::GESVSIDS),
             "subsumption" => Ok(Process::Subsumption),
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, subsumption",
+                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, subsumption",
                 preprocess
             ))),
         }

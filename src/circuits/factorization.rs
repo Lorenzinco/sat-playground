@@ -66,7 +66,7 @@ pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
 }
 
 pub(crate) fn generated_clause(literals: Vec<Literal>) -> Clause {
-    Clause::new(literals, 0,CreationType::BvaGenerated)
+    Clause::new(literals, 0, CreationType::BvaGenerated)
 }
 
 pub(crate) fn claim_clause(

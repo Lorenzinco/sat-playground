@@ -3,9 +3,8 @@ pub mod dpll;
 
 use std::io;
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -19,6 +18,55 @@ use crate::process::{ClauseScope, Process};
 
 use pyo3::FromPyObject;
 use pyo3::prelude::*;
+
+fn spawn_stats_printer(stats_ptr: usize) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let timer = thread::spawn(move || {
+        let start = Instant::now();
+        let mut printed = false;
+
+        loop {
+            match stop_receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+
+            let elapsed = start.elapsed().as_secs();
+            let time_str = if elapsed >= 60 {
+                let minutes = elapsed / 60;
+                let seconds = elapsed % 60;
+                format!(" {}m {}s", minutes, seconds)
+            } else {
+                format!(" {}s", elapsed)
+            };
+
+            // We cast the pointer back to read the struct properties.
+            // Technically a data race for printing purposes, but entirely benign.
+            let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
+
+            print!(
+                "\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | Restarts: {} | \x1b[34mLearnt: {}\x1b[0m | Deleted: {} | Lits: (ext {}, bva {}) | GES: {}",
+                time_str,
+                stats.conflicts,
+                stats.restarts,
+                stats.clauses_learnt,
+                stats.clauses_deleted,
+                stats.extension_literals,
+                stats.bva_literals,
+                stats.global_extension_substitution,
+            );
+            io::stdout().flush().ok();
+            printed = true;
+        }
+
+        if printed {
+            print!("\r\x1b[2K");
+            io::stdout().flush().ok();
+        }
+    });
+
+    (stop_sender, timer)
+}
 
 pub enum Algorithm {
     DPLL,
@@ -52,8 +100,6 @@ pub fn solve<'py, W: Write>(
     logger: &mut Option<DratLogger<W>>,
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = Arc::clone(&stop);
     let stats_ptr = &formula.stats as *const _ as usize;
 
     let requested_heuristics = heuristics;
@@ -70,47 +116,13 @@ pub fn solve<'py, W: Write>(
         Some((py, &mut preprocessing_steps)),
         true,
         None,
+        None,
     )?;
     formula
         .stats
         .record_preprocess_time(preprocess_start.elapsed());
 
-    let timer = thread::spawn(move || {
-        let start = Instant::now();
-
-        while !stop_for_thread.load(Ordering::Relaxed) {
-            let elapsed = start.elapsed().as_secs();
-            let time_str = if elapsed >= 60 {
-                let minutes = elapsed / 60;
-                let seconds = elapsed % 60;
-                format!(" {}m {}s", minutes, seconds)
-            } else {
-                format!(" {}s", elapsed)
-            };
-
-            // We cast the pointer back to read the struct properties.
-            // Technically a data race for printing purposes, but entirely benign.
-            let stats = unsafe { &*(stats_ptr as *const crate::python::stats::Stats) };
-
-            print!(
-                "\r\x1b[2Kc \x1b[31mTime: {}\x1b[0m | \x1b[31mConflicts: {}\x1b[0m | Restarts: {} | \x1b[34mLearnt: {}\x1b[0m | Deleted: {} | Lits: (ext {}, bva {}) | GES: {}",
-                time_str,
-                stats.conflicts,
-                stats.restarts,
-                stats.clauses_learnt,
-                stats.clauses_deleted,
-                stats.extension_literals,
-                stats.bva_literals,
-                stats.global_extension_substitution,
-            );
-            io::stdout().flush().ok();
-
-            thread::sleep(Duration::from_millis(1000));
-        }
-
-        print!("\r\x1b[2K");
-        io::stdout().flush().ok();
-    });
+    let (stop_stats, timer) = spawn_stats_printer(stats_ptr);
 
     // Refresh the formula-owned activity after preprocessing so auxiliary
     // variables receive meaningful initial scores.
@@ -134,11 +146,32 @@ pub fn solve<'py, W: Write>(
         ),
     };
 
-    stop.store(true, Ordering::Relaxed);
+    let solve_duration = solve_start.elapsed();
+    let _ = stop_stats.send(());
     let _ = timer.join();
 
-    formula.stats.record_solve_time(solve_start.elapsed());
+    formula.stats.record_solve_time(solve_duration);
     formula.stats.stop();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::python::stats::Stats;
+
+    #[test]
+    fn stats_printer_shutdown_interrupts_the_reporting_wait() {
+        let stats = Stats::new();
+        let stats_ptr = &stats as *const _ as usize;
+        let (stop, timer) = spawn_stats_printer(stats_ptr);
+        thread::sleep(Duration::from_millis(20));
+
+        let shutdown_start = Instant::now();
+        stop.send(()).unwrap();
+        timer.join().unwrap();
+
+        assert!(shutdown_start.elapsed() < Duration::from_millis(500));
+    }
 }

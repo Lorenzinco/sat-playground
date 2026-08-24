@@ -49,6 +49,24 @@ pub struct Stats {
     pub avg_clause_length: f64,
     #[pyo3(get)]
     pub global_extension_substitution: u64,
+    #[pyo3(get)]
+    pub ges_clauses_inspected: u64,
+    #[pyo3(get)]
+    pub ges_noop_rewrites: u64,
+    #[pyo3(get)]
+    pub ges_rewrites_rejected: u64,
+    #[pyo3(get)]
+    pub ges_lbd_improvements: u64,
+    #[pyo3(get)]
+    pub ges_vsids_improvements: u64,
+    #[pyo3(get)]
+    pub ges_literals_removed: u64,
+    #[pyo3(get)]
+    pub ges_replacement_reason_uses: u64,
+    #[pyo3(get)]
+    pub ges_replacement_analysis_uses: u64,
+    #[pyo3(get)]
+    pub ges_replacements_deleted_unused: u64,
     pub learnt_clause_literals_kept: u64,
     pub preprocess_nanos: u128,
     pub solve_nanos: u128,
@@ -88,6 +106,15 @@ impl Stats {
             bve_resolvents: 0,
             avg_clause_length: 0.0,
             global_extension_substitution: 0,
+            ges_clauses_inspected: 0,
+            ges_noop_rewrites: 0,
+            ges_rewrites_rejected: 0,
+            ges_lbd_improvements: 0,
+            ges_vsids_improvements: 0,
+            ges_literals_removed: 0,
+            ges_replacement_reason_uses: 0,
+            ges_replacement_analysis_uses: 0,
+            ges_replacements_deleted_unused: 0,
             learnt_clause_literals_kept: 0,
             preprocess_nanos: 0,
             solve_nanos: 0,
@@ -101,6 +128,24 @@ impl Stats {
             inprocessing_nanos: 0,
             time_start: None,
             time_stop: None,
+        }
+    }
+
+    /// Count each successful implication, including each active reason transferred
+    /// to a GES replacement. Repeated uses count even after `ges_used` is set.
+    pub fn record_ges_reason_use(&mut self, clause: &mut Clause) {
+        if clause.ges_generated {
+            clause.ges_used = true;
+            self.ges_replacement_reason_uses += 1;
+        }
+    }
+
+    /// Count each source-clause occurrence in the shared conflict-analysis walk
+    /// (including the conflict clause), not subsequent minimization/DIP rereads.
+    pub fn record_ges_analysis_use(&mut self, clause: &mut Clause) {
+        if clause.ges_generated {
+            clause.ges_used = true;
+            self.ges_replacement_analysis_uses += 1;
         }
     }
 
@@ -359,6 +404,20 @@ impl Stats {
         );
 
         let global_extension_substitution_s = format!("{:>40}", self.global_extension_substitution);
+        let ges_rows = [
+            ("GES clauses inspected", self.ges_clauses_inspected),
+            ("GES noop rewrites", self.ges_noop_rewrites),
+            ("GES rewrites rejected", self.ges_rewrites_rejected),
+            ("GES LBD improvements", self.ges_lbd_improvements),
+            ("GES VSIDS improvements", self.ges_vsids_improvements),
+            ("GES literals removed", self.ges_literals_removed),
+            ("GES reason uses", self.ges_replacement_reason_uses),
+            ("GES analysis uses", self.ges_replacement_analysis_uses),
+            ("GES deleted unused", self.ges_replacements_deleted_unused),
+        ]
+        .into_iter()
+        .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
+        .collect::<String>();
 
         format!(
             "c +------------------------------------------------------------------------+\n\
@@ -383,6 +442,7 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
+                 {ges_rows}\
                  c +------------------------------------------------------------------------+\n\
                  c | {:^70} |\n\
                  c +------------------------------------------------------------------------+\n\
@@ -522,5 +582,68 @@ impl Stats {
 
     pub fn inprocessing_millis(&self) -> f64 {
         self.inprocessing_nanos as f64 / 1_000_000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formula::literal::Literal;
+
+    #[test]
+    fn ges_counters_have_zero_readonly_python_getters_and_display_rows() {
+        let fields = [
+            ("ges_clauses_inspected", "GES clauses inspected"),
+            ("ges_noop_rewrites", "GES noop rewrites"),
+            ("ges_rewrites_rejected", "GES rewrites rejected"),
+            ("ges_lbd_improvements", "GES LBD improvements"),
+            ("ges_vsids_improvements", "GES VSIDS improvements"),
+            ("ges_literals_removed", "GES literals removed"),
+            ("ges_replacement_reason_uses", "GES reason uses"),
+            ("ges_replacement_analysis_uses", "GES analysis uses"),
+            ("ges_replacements_deleted_unused", "GES deleted unused"),
+        ];
+        Python::initialize();
+        Python::attach(|py| {
+            let stats = Py::new(py, Stats::new()).unwrap();
+            let bound = stats.bind(py);
+            let display = stats.borrow(py).__str__();
+            for (field, label) in fields {
+                assert_eq!(bound.getattr(field).unwrap().extract::<u64>().unwrap(), 0);
+                assert!(bound.setattr(field, 1).is_err());
+                assert!(display.contains(label));
+                assert!(include_str!("../../tests/run.py").contains(field));
+                assert!(include_str!("../../clsat/clsat.pyi").contains(field));
+            }
+            stats.borrow_mut(py).ges_replacement_reason_uses = u64::MAX;
+            assert_eq!(
+                bound
+                    .getattr("ges_replacement_reason_uses")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                u64::MAX
+            );
+        });
+    }
+
+    #[test]
+    fn ges_use_helpers_ignore_original_clauses_and_count_each_transfer() {
+        let mut stats = Stats::new();
+        let mut clause = Clause::from_literals(vec![Literal::new(1)], 1);
+        stats.record_ges_reason_use(&mut clause);
+        stats.record_ges_analysis_use(&mut clause);
+        assert!(!clause.ges_used);
+        assert_eq!(stats.ges_replacement_reason_uses, 0);
+        assert_eq!(stats.ges_replacement_analysis_uses, 0);
+        clause.ges_generated = true;
+        for _ in 0..2 {
+            clause.increment_lock_count();
+            stats.record_ges_reason_use(&mut clause);
+        }
+        assert!(clause.ges_used);
+        assert_eq!(stats.ges_replacement_reason_uses, 2);
+        stats.record_ges_analysis_use(&mut clause);
+        assert_eq!(stats.ges_replacement_analysis_uses, 1);
     }
 }

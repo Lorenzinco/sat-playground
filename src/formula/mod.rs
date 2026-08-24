@@ -41,6 +41,7 @@ pub struct Formula {
     pub extensions: ExtensionMap,
     pub(crate) vsids: Vsids,
     self_subsuming: bool,
+    pub(crate) ges_cursor: usize,
 }
 
 impl Clone for Formula {
@@ -56,6 +57,7 @@ impl Clone for Formula {
             extensions: self.extensions.clone(),
             vsids: self.vsids.clone(),
             self_subsuming: self.self_subsuming,
+            ges_cursor: self.ges_cursor,
         }
     }
 }
@@ -119,6 +121,7 @@ impl Formula {
             extensions: ExtensionMap::new(),
             vsids: Vsids::new(storage),
             self_subsuming: false,
+            ges_cursor: 0,
         }
     }
 
@@ -141,6 +144,7 @@ impl Formula {
             extensions: ExtensionMap::new(),
             vsids: Vsids::new(max_index as usize + 1),
             self_subsuming: false,
+            ges_cursor: 0,
         };
 
         formula.rebuild_clause_indices();
@@ -184,6 +188,8 @@ impl Formula {
         self.clauses.iter().enumerate()
     }
 
+    /// Mutable access is for clause metadata. Change attached literals via
+    /// add/delete so occurrence lists, watches, and cached blockers stay valid.
     pub fn get_clauses_mut(
         &mut self,
     ) -> impl DoubleEndedIterator<Item = (usize, &mut Clause)> + '_ {
@@ -216,6 +222,8 @@ impl Formula {
         self.clauses.get(index).expect("Clause not present")
     }
 
+    /// Mutable access is for metadata; replace literals by adding a new clause
+    /// and deleting the old clause, preserving proof and reason bookkeeping.
     #[inline]
     pub fn get_clause_at_idx_mut(&mut self, index: usize) -> &mut Clause {
         debug_assert!(!self.garbage.is_garbage(index), "Clause is garbage");
@@ -403,9 +411,10 @@ impl Formula {
         }
 
         if let Some((first, second)) = clause.watched_literals() {
-            self.watch.add_to_watchlist(clause_idx, first);
+            self.watch
+                .add_to_watchlist(clause_idx, first, *second.unwrap_or(first));
             if let Some(second) = second {
-                self.watch.add_to_watchlist(clause_idx, second);
+                self.watch.add_to_watchlist(clause_idx, second, *first);
             }
         }
 
@@ -426,6 +435,7 @@ impl Formula {
         signal: Option<(Python<'_>, &mut u64)>,
         replace_subsumption_setting: bool,
         mut history: Option<&mut History>,
+        reasoning_levels: Option<&[Option<usize>]>,
     ) -> PyResult<()> {
         if replace_subsumption_setting {
             self.self_subsuming = methods.contains(&Process::Subsumption);
@@ -445,9 +455,29 @@ impl Formula {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
                         process::bve::process(self, scope, logger, signal, history.as_deref_mut())?;
                     }
-                    Process::GES => {
+                    Process::GES
+                    | Process::GESAlways
+                    | Process::GESLBD
+                    | Process::GESPar
+                    | Process::GESRandom
+                    | Process::GESVSIDS => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::ges::process(self, scope, logger, signal)?;
+                        let process_ges = match method {
+                            Process::GESAlways => process::ges_always::process,
+                            Process::GESLBD => process::ges_lbd::process,
+                            Process::GESPar => process::ges_par::process,
+                            Process::GESRandom => process::ges_random::process,
+                            Process::GESVSIDS => process::ges_vsids::process,
+                            _ => process::ges::process,
+                        };
+                        process_ges(
+                            self,
+                            scope,
+                            logger,
+                            signal,
+                            history.as_deref_mut(),
+                            reasoning_levels,
+                        )?;
                     }
                     Process::Subsumption => process::subsumption::preprocess(self, scope, logger),
                     _ => println!("Not yet implemented!"),
@@ -502,6 +532,9 @@ impl Formula {
 
         for &idx in &to_delete {
             let clause = &self.clauses[idx];
+            if clause.ges_generated && !clause.ges_used {
+                self.stats.ges_replacements_deleted_unused += 1;
+            }
             for lit in clause.get_literals() {
                 self.occurrence_stale[lit.get_unsigned_index() as usize] += 1;
             }
@@ -550,6 +583,14 @@ impl Formula {
             })
             .collect();
 
+        // Resume at the first surviving slot at or after the old cursor,
+        // wrapping if the cursor's suffix was entirely deleted.
+        self.ges_cursor = old_to_new
+            .iter()
+            .skip(self.ges_cursor)
+            .chain(old_to_new.iter().take(self.ges_cursor))
+            .find_map(|&index| index)
+            .unwrap_or(0);
         self.garbage.reset(self.clauses.len());
         self.rebuild_clause_indices();
 
@@ -574,9 +615,9 @@ impl Formula {
             }
 
             if let Some((first, second)) = clause.watched_literals() {
-                watch.add_to_watchlist(clause_idx, first);
+                watch.add_to_watchlist(clause_idx, first, *second.unwrap_or(first));
                 if let Some(second) = second {
-                    watch.add_to_watchlist(clause_idx, second);
+                    watch.add_to_watchlist(clause_idx, second, *first);
                 }
             }
         }
@@ -613,6 +654,11 @@ impl Formula {
         history.add_decision(literal);
     }
 
+    pub(crate) fn record_ges_analysis_use(&mut self, clause_idx: usize) {
+        self.stats
+            .record_ges_analysis_use(&mut self.clauses[clause_idx]);
+    }
+
     pub fn assign_implication(
         &mut self,
         literal: Literal,
@@ -625,6 +671,7 @@ impl Formula {
         if matches!(result, AssignResult::Assigned(_)) {
             if let Some(idx) = reason_clause_idx {
                 self.clauses[idx].increment_lock_count();
+                self.stats.record_ges_reason_use(&mut self.clauses[idx]);
             }
         }
         result
@@ -790,8 +837,17 @@ impl Formula {
             let mut write_idx = 0;
 
             while read_idx < original_len {
-                let clause_idx = watching_clauses[read_idx];
-                let clause_usize = clause_idx as usize;
+                let mut entry = watching_clauses[read_idx];
+                let clause_usize = entry.clause_idx;
+
+                // take_live has removed garbage before this clause-body-free check.
+                // A former watch is still a valid blocker after literal swaps.
+                if entry.blocker.eval(&self.assignment) == Some(true) {
+                    watching_clauses[write_idx] = entry;
+                    write_idx += 1;
+                    read_idx += 1;
+                    continue;
+                }
 
                 // Unless we find a replacement watch, this clause remains in the
                 // current watchlist.
@@ -832,6 +888,7 @@ impl Formula {
                         let other_idx = 1 - false_idx;
                         let other_lit = clause.get_literals()[other_idx].clone();
                         let other_value = other_lit.eval(&self.assignment);
+                        entry.blocker = other_lit;
 
                         /*
                          * If the other watched literal is true, the clause is
@@ -866,7 +923,11 @@ impl Formula {
 
                                 clause.replace_watched_literal(false_idx, replacement_idx);
 
-                                self.watch.add_to_watchlist(clause_usize, &replacement_lit);
+                                self.watch.add_to_watchlist(
+                                    clause_usize,
+                                    &replacement_lit,
+                                    other_lit,
+                                );
 
                                 // The clause now watches replacement_lit instead
                                 // of false_lit, so remove it from this watchlist.
@@ -892,6 +953,7 @@ impl Formula {
                                         history.add_implication(&other_lit, Some(clause_usize));
 
                                         clause.increment_lock_count();
+                                        self.stats.record_ges_reason_use(clause);
                                         queue.push_back(other_lit);
                                     }
 
@@ -910,9 +972,7 @@ impl Formula {
                  * allocation.
                  */
                 if keep_current_watch {
-                    if write_idx != read_idx {
-                        watching_clauses[write_idx] = clause_idx;
-                    }
+                    watching_clauses[write_idx] = entry;
 
                     write_idx += 1;
                 }
@@ -990,11 +1050,11 @@ impl Formula {
             return Ok(());
         }
 
-        for (idx, clause) in self.get_clauses_mut() {
-            if let Some((py, steps)) = signal.as_mut() {
-                signal_checker(*py, *steps)?;
-            }
+        if let Some((py, steps)) = signal.as_mut() {
+            signal_checker(*py, *steps)?;
+        }
 
+        for (idx, clause) in self.get_clauses_mut() {
             // Original, extension, and inprocessing clauses are permanent.
             if clause.lbd <= 0 || clause.lock_count > 0 || clause.len() <= 2 {
                 continue;
@@ -1081,13 +1141,261 @@ mod tests {
         for var_idx in 1..formula.assignment.len() {
             let var = var_idx as i32;
             for lit in [Literal::new(var), Literal::new(-var)] {
-                let mut actual = formula.watch.get_watched(&lit).clone();
+                let mut actual = formula
+                    .watch
+                    .get_watched(&lit)
+                    .iter()
+                    .map(|entry| {
+                        assert!(
+                            formula
+                                .get_clause_at_idx(entry.clause_idx)
+                                .get_literals()
+                                .contains(&entry.blocker)
+                        );
+                        entry.clause_idx
+                    })
+                    .collect::<Vec<_>>();
                 let mut expected_list = expected[lit.get_unsigned_index() as usize].clone();
                 actual.sort_unstable();
                 expected_list.sort_unstable();
                 assert_eq!(actual, expected_list, "watchlist mismatch for {:?}", lit);
             }
         }
+    }
+
+    #[test]
+    fn blocker_survives_watch_movement_and_backtracking() {
+        let mut formula = Formula::from_vec(vec![vec![1, 2, 3]]);
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(-2), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(-2)])),
+            None
+        );
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(1))[0].blocker,
+            Literal::new(2)
+        );
+        assert_eq!(
+            formula.get_clause_at_idx(0).get_literals(),
+            &[Literal::new(1), Literal::new(3), Literal::new(2)]
+        );
+        assert_watchlists_consistent(&formula);
+        formula.revert_last_decision(&mut history);
+
+        // The cached blocker is true but is no longer one of the two watches.
+        formula.add_decision(&Literal::new(2), &mut history);
+        formula.add_decision(&Literal::new(-1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(-1)])),
+            None
+        );
+        assert_eq!(
+            formula.get_clause_at_idx(0).get_literals(),
+            &[Literal::new(1), Literal::new(3), Literal::new(2)]
+        );
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 0);
+        formula.revert_decision(1, &mut history);
+
+        // Once the blocker becomes false, normal propagation must resume.
+        formula.add_decision(&Literal::new(-2), &mut history);
+        formula.add_decision(&Literal::new(-1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(
+                &mut history,
+                &mut VecDeque::from([Literal::new(-2), Literal::new(-1)])
+            ),
+            None
+        );
+        assert_eq!(formula.assignment.get_value(3), Some(true));
+        assert_eq!(
+            history.decision_levels[2].get_reason(&Literal::new(3)),
+            Some(0)
+        );
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 1);
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(1))[0].blocker,
+            Literal::new(3)
+        );
+        assert_watchlists_consistent(&formula);
+        formula.revert_decision(1, &mut history);
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 0);
+    }
+
+    #[test]
+    fn true_blocker_does_not_keep_deleted_clause_or_hide_replacement() {
+        let mut formula = Formula::from_vec(vec![vec![-1, 2, 3]]);
+        let replacement = formula.add_clause_unchecked::<Empty>(
+            Clause::from_literals(vec![Literal::new(-1), Literal::new(3)], -1),
+            &mut None,
+        );
+        formula.delete_clause::<Empty>(0, &mut None);
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(2), &mut history);
+        formula.add_decision(&Literal::new(1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(1)])),
+            None
+        );
+        assert_eq!(formula.assignment.get_value(3), Some(true));
+        assert_eq!(formula.watch.get_watched(&Literal::new(-1)).len(), 1);
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(-1))[0].clause_idx,
+            replacement
+        );
+        assert_eq!(
+            formula.collect_garbage(Some(&mut history)),
+            vec![None, Some(0)]
+        );
+        assert_watchlists_consistent(&formula);
+        assert_eq!(
+            history.decision_levels[2].get_reason(&Literal::new(3)),
+            Some(0)
+        );
+        formula.revert_decision(1, &mut history);
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 0);
+    }
+
+    #[test]
+    fn conflict_preserves_updated_entry_and_unprocessed_blockers_after_move() {
+        let mut formula = Formula::from_vec(vec![vec![-1, 2, 3], vec![-1, 4], vec![-1, 5]]);
+        let tail = formula.watch.get_watched(&Literal::new(-1))[2];
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(-4), &mut history);
+        formula.add_decision(&Literal::new(1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(1)])),
+            Some(1)
+        );
+        let entries = formula.watch.get_watched(&Literal::new(-1));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].clause_idx, 1);
+        assert_eq!(entries[0].blocker, Literal::new(4));
+        assert_eq!(entries[1], tail);
+        assert_watchlists_consistent(&formula);
+        formula.revert_decision(1, &mut history);
+        formula.add_decision(&Literal::new(1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(1)])),
+            None
+        );
+        assert_eq!(formula.assignment.get_value(4), Some(true));
+        assert_eq!(formula.assignment.get_value(5), Some(true));
+        assert_watchlists_consistent(&formula);
+    }
+
+    #[test]
+    fn attachment_initializes_unit_and_opposite_watch_blockers() {
+        let mut formula = Formula::new(3);
+        for literals in [vec![], vec![1], vec![-1, 2, 3]] {
+            formula.add_clause_unchecked::<Empty>(
+                Clause::from_literals(literals.into_iter().map(Literal::new).collect(), -1),
+                &mut None,
+            );
+        }
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(1))[0].blocker,
+            Literal::new(1)
+        );
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(-1))[0].blocker,
+            Literal::new(2)
+        );
+        assert_eq!(
+            formula.watch.get_watched(&Literal::new(2))[0].blocker,
+            Literal::new(-1)
+        );
+        assert_watchlists_consistent(&formula);
+        assert_watchlists_consistent(&formula.clone());
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(-1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(-1)])),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ges_reason_uses_count_only_successful_implications_and_survive_backtracking() {
+        let mut formula = Formula::from_vec(vec![vec![-1, 2]]);
+        formula.get_clause_at_idx_mut(0).ges_generated = true;
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(1), &mut history);
+        assert!(matches!(
+            formula.assign_implication(Literal::new(2), &mut history, Some(0)),
+            AssignResult::Assigned(_)
+        ));
+        assert!(matches!(
+            formula.assign_implication(Literal::new(2), &mut history, Some(0)),
+            AssignResult::AlreadyAssigned
+        ));
+        assert!(matches!(
+            formula.assign_implication(Literal::new(-2), &mut history, Some(0)),
+            AssignResult::Conflict
+        ));
+        assert_eq!(formula.stats.ges_replacement_reason_uses, 1);
+        assert!(formula.get_clause_at_idx(0).ges_used);
+        formula.revert_last_decision(&mut history);
+        assert!(formula.get_clause_at_idx(0).ges_used);
+        formula.add_decision(&Literal::new(1), &mut history);
+        let mut queue = VecDeque::from([Literal::new(1)]);
+        assert_eq!(formula.propagate_twl(&mut history, &mut queue), None);
+        assert_eq!(formula.stats.ges_replacement_reason_uses, 2);
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 1);
+        formula.revert_last_decision(&mut history);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        formula.delete_clause(0, &mut logger);
+        assert_eq!(formula.stats.ges_replacements_deleted_unused, 0);
+    }
+
+    #[test]
+    fn ges_unused_deletions_count_once_and_metadata_survives_compaction() {
+        let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4]]);
+        for idx in 0..3 {
+            formula.get_clause_at_idx_mut(idx).ges_generated = true;
+        }
+        formula.record_ges_analysis_use(1);
+        formula.record_ges_analysis_use(1);
+        assert_eq!(formula.stats.ges_replacement_analysis_uses, 2);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        formula.record_clause_removal(0);
+        assert_eq!(formula.stats.ges_replacements_deleted_unused, 0);
+        assert_eq!(formula.delete_clauses(&[0, 0, 3], &mut logger), 2);
+        formula.delete_clause(0, &mut logger);
+        assert_eq!(formula.stats.ges_replacements_deleted_unused, 1);
+        formula.collect_garbage(None);
+        assert_eq!(formula.stats.ges_replacements_deleted_unused, 1);
+        let cloned = formula.clone();
+        assert!(cloned.get_clause_at_idx(0).ges_generated);
+        assert!(cloned.get_clause_at_idx(0).ges_used);
+        assert!(cloned.get_clause_at_idx(1).ges_generated);
+        assert!(!cloned.get_clause_at_idx(1).ges_used);
+        formula.delete_clauses(&[0, 1], &mut logger);
+        formula.collect_garbage(None);
+        assert_eq!(formula.stats.ges_replacements_deleted_unused, 2);
+    }
+
+    #[test]
+    fn ges_cursor_clones_and_remaps_to_next_live_slot() {
+        let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4], vec![5]]);
+        assert_eq!(formula.ges_cursor, 0);
+        formula.ges_cursor = 2;
+        assert_eq!(formula.clone().ges_cursor, 2);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        formula.delete_clauses(&[0, 2], &mut logger);
+        formula.collect_garbage(None);
+        assert_eq!(formula.ges_cursor, 1);
+        assert_eq!(
+            formula.get_clause_at_idx(formula.ges_cursor).get_literals(),
+            &[Literal::new(4)]
+        );
+        formula.ges_cursor = 2;
+        formula.delete_clause(2, &mut logger);
+        formula.collect_garbage(None);
+        assert_eq!(formula.ges_cursor, 0);
+        formula.delete_clauses(&[0, 1], &mut logger);
+        formula.collect_garbage(None);
+        assert_eq!(formula.ges_cursor, 0);
     }
 
     #[test]
@@ -1295,7 +1603,12 @@ mod tests {
         assert_watchlists_consistent(&formula);
 
         // Explicitly verify reindexing for x2 watchlist
-        let mut watched_x2 = formula.watch.get_watched(&Literal::new(2)).clone();
+        let mut watched_x2 = formula
+            .watch
+            .get_watched(&Literal::new(2))
+            .iter()
+            .map(|entry| entry.clause_idx)
+            .collect::<Vec<_>>();
         watched_x2.sort_unstable();
         assert_eq!(watched_x2, vec![0, 1]);
 

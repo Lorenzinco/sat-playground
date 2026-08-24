@@ -5,10 +5,12 @@ pub mod decision_level;
 pub mod dip;
 mod dip_clause;
 pub mod implication_level;
+mod lbd;
 pub mod two_vertex_bottlenecks;
 pub mod uip;
 
 use pyo3::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -60,6 +62,8 @@ impl FromPyObject<'_, '_> for ImplicationPoint {
 pub struct History {
     pub decision_levels: Vec<DecisionLevel>,
     pub implication_levels_indexes: implication_level::ImplicationLevels,
+    // Each LBD operation borrows only this scratch, leaving level lookups shared.
+    lbd_scratch: RefCell<lbd::LevelCounter>,
 }
 
 impl History {
@@ -70,6 +74,7 @@ impl History {
         Self {
             decision_levels: decision_levels,
             implication_levels_indexes: ImplicationLevels::new(),
+            lbd_scratch: RefCell::new(lbd::LevelCounter::default()),
         }
     }
 
@@ -173,6 +178,16 @@ impl History {
         self.implication_levels_indexes.get_level(lit)
     }
 
+    pub(crate) fn snapshot_literal_levels(&self, variable_count: usize) -> Vec<Option<usize>> {
+        (0..variable_count)
+            .map(|variable| {
+                (variable != 0)
+                    .then(|| Literal::new(variable as i32))
+                    .and_then(|literal| self.get_literal_level(&literal))
+            })
+            .collect()
+    }
+
     pub fn last_decision_literal(&self) -> Option<&Literal> {
         self.decision_levels
             .last()
@@ -185,6 +200,12 @@ impl History {
             .iter()
             .flat_map(|level| level.reason_indices())
             .collect()
+    }
+
+    pub fn replace_reason_clause(&mut self, old_index: usize, new_index: usize) {
+        for level in &mut self.decision_levels {
+            level.replace_reason_clause(old_index, new_index);
+        }
     }
 
     pub fn remap_clause_indices(&mut self, old_to_new: &[Option<usize>]) {

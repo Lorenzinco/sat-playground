@@ -35,7 +35,7 @@ impl Sat {
         heuristics: Heuristics,
         drat_path: Option<String>,
         extension_guidance: Option<GuidanceSpec>,
-        extension_guidance_log_path: Option<String>
+        extension_guidance_log_path: Option<String>,
     ) -> PyResult<(Option<Vec<bool>>, Stats)> {
         let raw_clauses = self.clauses.clone();
         let mut formula = Formula::from_vec(raw_clauses);
@@ -51,7 +51,7 @@ impl Sat {
         let mut logger = match drat_path {
             Some(path) => {
                 let file = File::create(path)?;
-                let writer = BufWriter::with_capacity(1 << 25, file); //32MB buffer
+                let writer = BufWriter::with_capacity(1 << 27, file); //128MB buffer
                 Some(DratLogger::new(writer))
             }
             None => None,

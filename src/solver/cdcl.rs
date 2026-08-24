@@ -8,7 +8,7 @@ use crate::heuristics::Heuristics;
 use crate::history::ConflictLearnResult;
 use crate::history::History;
 use crate::history::ImplicationPoint;
-use crate::process::{DEFAULT_INPROCESSING_TIERS, Process, sample_tier_scope};
+use crate::process::{ClauseScope, Process};
 
 use crate::formula::extension::extension_literal;
 
@@ -384,6 +384,30 @@ fn luby(index: u64) -> u64 {
     }
 }
 
+fn global_inprocessing_scope(formula: &Formula) -> ClauseScope {
+    ClauseScope::range(0..formula.clause_slots_len())
+}
+
+fn is_ges(process: &Process) -> bool {
+    matches!(
+        process,
+        Process::GES
+            | Process::GESAlways
+            | Process::GESLBD
+            | Process::GESRandom
+            | Process::GESPar
+            | Process::GESVSIDS
+    )
+}
+
+fn scheduled_inprocessing(inprocessing: &[Process], run_inprocessing: bool) -> Vec<Process> {
+    inprocessing
+        .iter()
+        .copied()
+        .filter(|process| run_inprocessing || is_ges(process))
+        .collect()
+}
+
 fn restart<W: Write>(
     py: Python<'_>,
     steps: &mut u64,
@@ -395,18 +419,24 @@ fn restart<W: Write>(
 ) -> PyResult<()> {
     let restart_start = Instant::now();
     formula.stats.add_restart();
+    let methods = scheduled_inprocessing(inprocessing, run_inprocessing);
+    let reasoning_levels = methods
+        .iter()
+        .any(is_ges)
+        .then(|| history.snapshot_literal_levels(formula.assignment.len()));
     formula.revert_decision(1, history);
 
-    if run_inprocessing {
+    if !methods.is_empty() {
         let inprocessing_start = Instant::now();
-        let scope = sample_tier_scope(formula, DEFAULT_INPROCESSING_TIERS);
+        let scope = global_inprocessing_scope(formula);
         formula.process(
-            inprocessing.to_vec(),
+            methods,
             &scope,
             logger,
             Some((py, steps)),
             false,
             Some(history),
+            reasoning_levels.as_deref(),
         )?;
         formula
             .stats
@@ -439,6 +469,125 @@ mod tests {
     fn luby_sequence_matches_expected_prefix() {
         let got: Vec<u64> = (1..=15).map(luby).collect();
         assert_eq!(got, vec![1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn inprocessing_scope_includes_the_global_clause_database() {
+        let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4]]);
+        formula.get_clause_at_idx_mut(1).lbd = 2;
+        formula.get_clause_at_idx_mut(2).lbd = 4;
+        formula.get_clause_at_idx_mut(3).lbd = 7;
+
+        let scope = global_inprocessing_scope(&formula);
+
+        assert!(
+            formula
+                .get_clauses()
+                .all(|(index, clause)| scope.includes(index, clause))
+        );
+    }
+
+    #[test]
+    fn scheduled_inprocessing_preserves_order_without_duplicating_ges() {
+        let selected = [
+            Process::BVE,
+            Process::GESRandom,
+            Process::Subsumption,
+            Process::GES,
+            Process::GESAlways,
+            Process::BVA,
+            Process::GESPar,
+            Process::Others,
+            Process::GESVSIDS,
+            Process::GESLBD,
+        ];
+        assert_eq!(
+            scheduled_inprocessing(&selected, false),
+            vec![
+                Process::GESRandom,
+                Process::GES,
+                Process::GESAlways,
+                Process::GESPar,
+                Process::GESVSIDS,
+                Process::GESLBD
+            ]
+        );
+        assert_eq!(scheduled_inprocessing(&selected, true), selected);
+        let others = [
+            Process::BVA,
+            Process::BVE,
+            Process::Subsumption,
+            Process::Others,
+        ];
+        assert!(scheduled_inprocessing(&others, false).is_empty());
+        assert_eq!(scheduled_inprocessing(&others, true), others);
+        for run_inprocessing in [false, true] {
+            assert!(scheduled_inprocessing(&[], run_inprocessing).is_empty());
+        }
+    }
+
+    #[test]
+    fn restart_runs_each_ges_once_with_pre_backtrack_reasoning() {
+        Python::attach(|py| {
+            for process in [
+                Process::GES,
+                Process::GESAlways,
+                Process::GESLBD,
+                Process::GESRandom,
+                Process::GESPar,
+            ] {
+                for run_inprocessing in [false, true] {
+                    let mut formula = Formula::from_vec(vec![vec![-1, -2, 3]]);
+                    formula.get_clause_at_idx_mut(0).lbd = 3;
+                    let mut logger: Option<DratLogger<Empty>> = None;
+                    let extension = extension_literal(
+                        &mut formula,
+                        &mut logger,
+                        &Literal::new(1),
+                        &Literal::new(2),
+                    );
+                    let mut history = History::new();
+                    formula.add_decision(&Literal::new(1), &mut history);
+                    for literal in [Literal::new(2), Literal::new(3), extension] {
+                        assert!(matches!(
+                            formula.assign_implication(literal, &mut history, None),
+                            AssignResult::Assigned(_)
+                        ));
+                    }
+
+                    let mut steps = 0;
+                    restart(
+                        py,
+                        &mut steps,
+                        &mut formula,
+                        &mut history,
+                        &[Process::Subsumption, process],
+                        run_inprocessing,
+                        &mut logger,
+                    )
+                    .unwrap();
+
+                    assert_eq!(history.get_decision_level(), 0);
+                    assert_eq!(formula.assignment.get_value(1), None);
+                    assert_eq!(formula.stats.restarts, 1);
+                    assert_eq!(formula.stats.ges_clauses_inspected, 1);
+                    // All literals shared one level in the pre-backtrack snapshot,
+                    // so shortening ties rather than improves LBD. Only the
+                    // isolated unconditional variant installs that rewrite.
+                    let always = process == Process::GESAlways;
+                    assert_eq!(formula.stats.ges_rewrites_rejected, u64::from(!always));
+                    assert_eq!(formula.stats.ges_lbd_improvements, 0);
+                    assert_eq!(formula.stats.ges_literals_removed, u64::from(always));
+                    assert_eq!(formula.is_clause_garbage(0), always);
+                    if always {
+                        assert_eq!(formula.get_clause_at_idx(4).len(), 2);
+                        assert_eq!(formula.get_clause_at_idx(4).lbd, 2);
+                    } else {
+                        assert_eq!(formula.get_clause_at_idx(0).len(), 3);
+                    }
+                }
+            }
+        });
     }
 
     #[test]

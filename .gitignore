@@ -10,3 +10,5 @@ clsat/libclsat.dylib.dSYM
 *.dimacs
 *.trace
 /benchmark_result
+tests/benchmark
+benchmark_results

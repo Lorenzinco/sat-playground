@@ -5,7 +5,7 @@ subprocess management, aggregation, or result persistence.
 """
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence, Tuple
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from .run import COUNTER_FIELDS, RUNTIME_METHODS
 
@@ -113,6 +113,90 @@ def plot_problem(plt, result: Mapping[str, Any], destination: Path) -> None:
     plt.close(figure)
 
 
+def cactus_coordinates(
+    results: Sequence[Mapping[str, Any]],
+) -> Tuple[List[float], List[int]]:
+    """Return sorted individual wall runtimes (not cumulative) and completed counts."""
+    completed_times = sorted(
+        float(result.get("wall_seconds", 0.0))
+        for result in results
+        if result.get("status") == "completed"
+    )
+    return [0.0] + completed_times, list(range(len(completed_times) + 1))
+
+
+def _plot_cactus(
+    axis,
+    method_results: Mapping[str, Sequence[Mapping[str, Any]]],
+    timeout_seconds: Optional[float] = None,
+) -> None:
+    maximum_runtime = max(
+        (
+            float(result.get("wall_seconds", 0.0))
+            for results in method_results.values()
+            for result in results
+        ),
+        default=0.0,
+    )
+    endpoint = maximum_runtime if timeout_seconds is None else float(timeout_seconds)
+    coordinates = [
+        (label, *cactus_coordinates(results))
+        for label, results in method_results.items()
+    ]
+    # Never truncate a completed run, even if it slightly exceeded the deadline.
+    endpoint = max([endpoint, 0.0] + [times[-1] for _, times, _ in coordinates])
+    if endpoint == 0.0:
+        endpoint = 1.0
+    colors = (
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    )
+    styles = ("-", "--", "-.", ":")
+    maximum_completed = 0
+    for index, (label, times, counts) in enumerate(coordinates):
+        maximum_completed = max(maximum_completed, counts[-1])
+        axis.step(
+            times + [endpoint],
+            counts + [counts[-1]],
+            where="post",
+            label=label,
+            color=colors[index % len(colors)],
+            linestyle=styles[(index + index // len(colors)) % len(styles)],
+        )
+    axis.set_xlabel("individual wall runtime (seconds)")
+    axis.set_ylabel("number of completed problems")
+    axis.set_xlim(0.0, endpoint)
+    tick_step = max(1, (maximum_completed + 9) // 10)
+    axis.set_yticks(list(range(0, maximum_completed + 1, tick_step)))
+    axis.set_ylim(0.0, max(1.0, maximum_completed * 1.12))
+    axis.grid(alpha=0.25)
+    if coordinates:
+        axis.legend()
+
+
+def plot_comparison_cactus(
+    plt,
+    name: str,
+    method_results: Mapping[str, Sequence[Mapping[str, Any]]],
+    destination: Path,
+    timeout_seconds: Optional[float] = None,
+) -> None:
+    """Compare methods (e.g. baseline and 4GES) using individual wall runtimes.
+
+    Runtimes are sorted, not summed: y counts completed problems whose runtime
+    is at most x. Other statuses never increase the count. All curves plateau
+    to the timeout, or the maximum observed runtime when no timeout is given;
+    completed runs beyond the timeout remain visible.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure, axis = plt.subplots(figsize=(10, 7))
+    _plot_cactus(axis, method_results, timeout_seconds)
+    axis.set_title("{} — Cactus runtime comparison".format(name))
+    figure.tight_layout()
+    figure.savefig(destination, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+
+
 def plot_aggregate(
     plt,
     aggregate: Mapping[str, Any],
@@ -158,24 +242,8 @@ def plot_aggregate(
     annotate_horizontal_bars(axes[1], bars, counter_values, digits=2)
     axes[1].grid(axis="x", alpha=0.25)
 
-    completed_times = sorted(
-        float(result.get("wall_seconds", 0.0))
-        for result in results
-        if result.get("status") == "completed"
-    )
-    if completed_times:
-        axes[2].step(
-            range(1, len(completed_times) + 1),
-            completed_times,
-            where="post",
-            label="completed",
-            color=STATUS_COLORS["completed"],
-        )
-        axes[2].legend()
-    axes[2].set_xlabel("number of solved problems")
-    axes[2].set_ylabel("wall seconds")
+    _plot_cactus(axes[2], {"completed": results})
     axes[2].set_title("Cactus runtime plot")
-    axes[2].grid(alpha=0.25)
 
     figure.tight_layout(rect=(0, 0.02, 1, 0.94))
     figure.savefig(destination, dpi=150, bbox_inches="tight")

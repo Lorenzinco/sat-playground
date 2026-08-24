@@ -3,21 +3,28 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::formula::Formula;
-use crate::formula::clause::Clause;
 use crate::formula::literal::Literal;
 use crate::history::History;
 
 impl History {
     pub fn clause_levels(&self, literals: &[Literal]) -> (usize, i16) {
-        let levels = literals
+        let mut counter = self.lbd_scratch.borrow_mut();
+        counter.begin();
+        let mut first_available = true;
+        let mut backtrack_level = 0;
+        for level in literals
             .iter()
             .filter_map(|lit| self.get_literal_level(lit))
-            .collect::<Vec<_>>();
-
-        (
-            levels.iter().skip(1).copied().max().unwrap_or(0),
-            Clause::calculate_lbd(levels),
-        )
+        {
+            counter.insert(level);
+            // Skip the first assigned literal, not necessarily literals[0].
+            if first_available {
+                first_available = false;
+            } else {
+                backtrack_level = backtrack_level.max(level);
+            }
+        }
+        (backtrack_level, counter.lbd())
     }
 
     pub fn minimize_clause_literals(
@@ -108,6 +115,65 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clause_levels_matches_previous_algorithm_for_filtered_and_repeated_levels() {
+        let mut history = History::new();
+        history.add_implication(&Literal::new(1), None);
+        history.add_decision(&Literal::new(2));
+        history.add_decision(&Literal::new(3));
+        history.add_implication(&Literal::new(4), None);
+        let pool = [5, 1, -2, 3, -4, -5].map(Literal::new);
+        assert_eq!(history.clause_levels(&[]), (0, 0));
+        assert_eq!(history.clause_levels(&[pool[0], pool[3], pool[2]]), (1, 2));
+        for encoded in 0..6usize.pow(4) {
+            let mut value = encoded;
+            let literals: Vec<_> = (0..4)
+                .map(|_| {
+                    let literal = pool[value % pool.len()].clone();
+                    value /= pool.len();
+                    literal
+                })
+                .collect();
+            let levels: Vec<_> = literals
+                .iter()
+                .filter_map(|literal| history.get_literal_level(literal))
+                .collect();
+            let expected = (
+                levels.iter().skip(1).copied().max().unwrap_or(0),
+                crate::formula::clause::Clause::calculate_lbd(levels.iter().copied()),
+            );
+            assert_eq!(history.clause_levels(&literals), expected);
+            for limit in [1, 2, 3, i16::MAX] {
+                assert_eq!(
+                    history.clause_lbd_bounded(&literals, limit),
+                    expected.1.min(limit)
+                );
+            }
+            // A bounded operation must not leave marks for the next full operation.
+            assert_eq!(history.clause_levels(&literals), expected);
+        }
+        history
+            .implication_levels_indexes
+            .unset_level(&Literal::new(3));
+        history
+            .implication_levels_indexes
+            .set_level(&Literal::new(4), 1);
+        assert_eq!(history.clause_levels(&[pool[3], pool[4], pool[2]]), (1, 1));
+    }
+
+    #[test]
+    fn clause_levels_keeps_scanning_for_backtrack_after_lbd_saturates() {
+        let mut history = History::new();
+        let literals: Vec<_> = (1..=i16::MAX as i32 + 2).map(Literal::new).collect();
+        for (level, literal) in literals.iter().enumerate() {
+            history.implication_levels_indexes.set_level(literal, level);
+        }
+        assert_eq!(
+            history.clause_levels(&literals),
+            (literals.len() - 1, i16::MAX)
+        );
+    }
 
     #[test]
     fn clause_levels_ignores_first_literal_for_backtrack_level() {

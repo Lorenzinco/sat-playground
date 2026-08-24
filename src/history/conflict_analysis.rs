@@ -33,6 +33,12 @@ pub(super) fn analyze_conflict(
         return uip::empty_result();
     };
 
+    // Preserve occurrences rather than deduplicating: a source can be visited
+    // repeatedly. Read-only graph inspection helpers do not record solver uses.
+    for &clause_idx in &analysis.analyzed_clause_indices {
+        formula.record_ges_analysis_use(clause_idx);
+    }
+
     let result = if matches!(implication_point, ImplicationPoint::DIP) {
         dip::learn_from_analysis(&analysis, history, formula, conflict_clause_index)
             .unwrap_or_else(|| uip::learn_from_analysis(&analysis, history, formula))
@@ -46,11 +52,9 @@ pub(super) fn analyze_conflict(
             continue;
         }
 
-        let new_lbd = Clause::calculate_lbd(
-            formula
-                .get_clause_at_idx(clause_idx)
-                .iter()
-                .filter_map(|literal| history.get_literal_level(literal)),
+        let new_lbd = history.clause_lbd_bounded(
+            formula.get_clause_at_idx(clause_idx).get_literals(),
+            old_lbd,
         );
         let clause = formula.get_clause_at_idx_mut(clause_idx);
         clause.activity = Clause::MAX_ACTIVITY;
@@ -167,4 +171,67 @@ pub(super) fn analyze_conflict_graph(
         predecessors,
         pred_index,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyzed_lbd_only_improves_and_activity_refreshes_even_at_threshold() {
+        for point in [ImplicationPoint::UIP, ImplicationPoint::DIP] {
+            for old_lbd in [-1, 0, 1, 2, 3, i16::MAX] {
+                let mut formula = Formula::from_vec(vec![vec![-1, 2], vec![-1, -2, -3]]);
+                let mut history = History::new();
+                formula.assign_implication(Literal::new(3), &mut history, None);
+                formula.add_decision(&Literal::new(1), &mut history);
+                formula.assign_implication(Literal::new(2), &mut history, Some(0));
+                for idx in 0..2 {
+                    let clause = formula.get_clause_at_idx_mut(idx);
+                    clause.lbd = old_lbd;
+                    clause.activity = 0;
+                }
+                history.analyze_conflict(&mut formula, 1, point);
+                for (idx, exact_lbd) in [(0, 1), (1, 2)] {
+                    let clause = formula.get_clause_at_idx(idx);
+                    assert_eq!(
+                        clause.lbd,
+                        if old_lbd > 0 {
+                            old_lbd.min(exact_lbd)
+                        } else {
+                            old_lbd
+                        }
+                    );
+                    assert_eq!(
+                        clause.activity,
+                        if old_lbd > 0 { Clause::MAX_ACTIVITY } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ges_analysis_counts_conflict_and_source_occurrences_for_uip_and_dip() {
+        for point in [ImplicationPoint::UIP, ImplicationPoint::DIP] {
+            let mut formula = Formula::from_vec(vec![vec![-1, 2], vec![-1, -2]]);
+            let mut history = History::new();
+            formula.add_decision(&Literal::new(1), &mut history);
+            formula.assign_implication(Literal::new(2), &mut history, Some(0));
+            // Mark after setup to isolate analysis from implication-use accounting.
+            for idx in 0..2 {
+                formula.get_clause_at_idx_mut(idx).ges_generated = true;
+            }
+            history.analyze_conflict(&mut formula, 1, point);
+            assert_eq!(formula.stats.ges_replacement_analysis_uses, 2);
+            assert_eq!(formula.stats.ges_replacement_reason_uses, 0);
+            assert!(formula.get_clause_at_idx(0).ges_used);
+            assert!(formula.get_clause_at_idx(1).ges_used);
+            history.analyze_conflict(&mut formula, 1, point);
+            assert_eq!(formula.stats.ges_replacement_analysis_uses, 4);
+            formula.revert_last_decision(&mut history);
+            formula.delete_clauses::<std::io::Empty>(&[0, 1], &mut None);
+            assert_eq!(formula.stats.ges_replacements_deleted_unused, 0);
+        }
+    }
 }
