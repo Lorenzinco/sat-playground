@@ -11,6 +11,35 @@ use std::io::Write;
 pub(crate) const FACTOR_BOUND: usize = 1;
 pub(crate) const MAX_FACTOR_CLAUSE_SIZE: usize = 20;
 
+pub(crate) struct BvaBudget {
+    limit: usize,
+    visits: usize,
+}
+
+impl BvaBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { limit, visits: 0 }
+    }
+
+    pub(crate) fn visit_clause(&mut self) -> bool {
+        if self.visits >= self.limit {
+            return false;
+        }
+        self.visits += 1;
+        true
+    }
+
+    pub(crate) fn visits(&self) -> usize {
+        self.visits
+    }
+}
+
+pub(crate) enum FactorSearch<T> {
+    Found(T),
+    NotFound,
+    BudgetExhausted,
+}
+
 pub(crate) enum Factorization {
     And(AndGate),
     Gate(Gate),
@@ -29,6 +58,20 @@ impl Factorization {
             (Some(and_gate), None) => Some(Self::And(and_gate)),
             (None, Some(gate)) => Some(Self::Gate(gate)),
             (None, None) => None,
+        }
+    }
+
+    pub(crate) fn clause_saving(&self) -> isize {
+        match self {
+            Self::And(gate) => gate.clause_saving(),
+            Self::Gate(gate) => gate.clause_saving(),
+        }
+    }
+
+    pub(crate) fn source_clause_count(&self) -> usize {
+        match self {
+            Self::And(gate) => gate.source_clause_count(),
+            Self::Gate(gate) => gate.source_clause_count(),
         }
     }
 
@@ -124,6 +167,15 @@ mod tests {
         let clause = generated_clause(vec![Literal::new(1), Literal::new(-2)]);
         assert_eq!(clause.lbd, 0);
         assert!(clause.bva_generated);
+    }
+
+    #[test]
+    fn budget_never_exceeds_its_limit() {
+        let mut budget = BvaBudget::new(2);
+        assert!(budget.visit_clause());
+        assert!(budget.visit_clause());
+        assert!(!budget.visit_clause());
+        assert_eq!(budget.visits(), 2);
     }
 
     #[test]

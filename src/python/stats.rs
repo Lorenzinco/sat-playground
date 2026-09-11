@@ -42,6 +42,16 @@ pub struct Stats {
     #[pyo3(get)]
     pub bva_literals: u64,
     #[pyo3(get)]
+    pub bva_candidates_attempted: u64,
+    #[pyo3(get)]
+    pub bva_clause_visits: u64,
+    #[pyo3(get)]
+    pub bva_clauses_saved: u64,
+    #[pyo3(get)]
+    pub bva_source_clauses_replaced: u64,
+    #[pyo3(get)]
+    pub bva_budget_exhaustions: u64,
+    #[pyo3(get)]
     pub bve_eliminated_variables: u64,
     #[pyo3(get)]
     pub bve_resolvents: u64,
@@ -102,6 +112,11 @@ impl Stats {
             guidance_deepest_level: 0,
             guidance_best_progress: 0,
             bva_literals: 0,
+            bva_candidates_attempted: 0,
+            bva_clause_visits: 0,
+            bva_clauses_saved: 0,
+            bva_source_clauses_replaced: 0,
+            bva_budget_exhaustions: 0,
             bve_eliminated_variables: 0,
             bve_resolvents: 0,
             avg_clause_length: 0.0,
@@ -360,6 +375,16 @@ impl Stats {
         );
         let guidance_progress_s = format!("{:>40}", self.guidance_best_progress);
         let bva_lits_s = format!("{:>40}", self.bva_literals);
+        let bva_rows = [
+            ("BVA candidates attempted", self.bva_candidates_attempted),
+            ("BVA clause visits", self.bva_clause_visits),
+            ("BVA clauses saved", self.bva_clauses_saved),
+            ("BVA sources replaced", self.bva_source_clauses_replaced),
+            ("BVA budget exhaustions", self.bva_budget_exhaustions),
+        ]
+        .into_iter()
+        .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
+        .collect::<String>();
         let bve_vars_s = format!("{:>40}", self.bve_eliminated_variables);
         let bve_resolvents_s = format!("{:>40}", self.bve_resolvents);
         let preprocess_s = format!(
@@ -440,6 +465,7 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
+                 {bva_rows}\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  {ges_rows}\
@@ -589,6 +615,30 @@ impl Stats {
 mod tests {
     use super::*;
     use crate::formula::literal::Literal;
+
+    #[test]
+    fn bva_counters_have_zero_readonly_python_getters_and_display_rows() {
+        let fields = [
+            ("bva_candidates_attempted", "BVA candidates attempted"),
+            ("bva_clause_visits", "BVA clause visits"),
+            ("bva_clauses_saved", "BVA clauses saved"),
+            ("bva_source_clauses_replaced", "BVA sources replaced"),
+            ("bva_budget_exhaustions", "BVA budget exhaustions"),
+        ];
+        Python::initialize();
+        Python::attach(|py| {
+            let stats = Py::new(py, Stats::new()).unwrap();
+            let bound = stats.bind(py);
+            let display = stats.borrow(py).__str__();
+            for (field, label) in fields {
+                assert_eq!(bound.getattr(field).unwrap().extract::<u64>().unwrap(), 0);
+                assert!(bound.setattr(field, 1).is_err());
+                assert!(display.contains(label));
+                assert!(include_str!("../../tests/run.py").contains(field));
+                assert!(include_str!("../../clsat/clsat.pyi").contains(field));
+            }
+        });
+    }
 
     #[test]
     fn ges_counters_have_zero_readonly_python_getters_and_display_rows() {

@@ -1,6 +1,6 @@
 use crate::circuits::factorization::{
-    FACTOR_BOUND, claim_clause, generated_clause, is_tautological, literal_tie_key,
-    live_factor_clause, stable_signature_hash,
+    BvaBudget, FACTOR_BOUND, FactorSearch, claim_clause, generated_clause, is_tautological,
+    literal_tie_key, live_factor_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
@@ -17,7 +17,12 @@ pub(crate) struct AndGate {
 }
 
 impl AndGate {
-    pub(crate) fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
+    pub(crate) fn find(
+        formula: &Formula,
+        start: i32,
+        pending_deleted: &[bool],
+        budget: &mut BvaBudget,
+    ) -> FactorSearch<AndGate> {
         let mut partials = Vec::<AndPartial>::new();
         let mut partial_hash_buckets = HashMap::<u64, Vec<usize>>::new();
         let mut sorted_clause = Vec::new();
@@ -26,6 +31,9 @@ impl AndGate {
         // Equal partials are interned, while duplicate physical clauses remain in
         // the cells discovered below and therefore contribute to the savings.
         for clause_idx in formula.occurrence_of(&Literal::new(start)) {
+            if !budget.visit_clause() {
+                return FactorSearch::BudgetExhausted;
+            }
             if !live_factor_clause(formula, clause_idx, pending_deleted) {
                 continue;
             }
@@ -47,28 +55,30 @@ impl AndGate {
             intern_partial(&mut partials, &mut partial_hash_buckets, hash, &literals);
         }
         if partials.is_empty() {
-            return None;
+            return FactorSearch::NotFound;
         }
 
         // Discover each row through its shortest occurrence list. A candidate
         // clause belongs to a cell exactly when it is the partial plus one literal.
         for partial in &mut partials {
-            let anchor = *partial
-                .literals
-                .iter()
-                .min_by_key(|&&literal| {
-                    (
-                        formula
-                            .live_occurrences(&Literal::new(literal))
-                            .filter(|&idx| live_factor_clause(formula, idx, pending_deleted))
-                            .count(),
-                        literal_tie_key(literal),
-                    )
-                })
-                .expect("eligible factor clauses have non-empty partials");
+            let anchor = match shortest_live_occurrence_literal(
+                formula,
+                &partial.literals,
+                pending_deleted,
+                budget,
+            ) {
+                FactorSearch::Found(anchor) => anchor,
+                FactorSearch::BudgetExhausted => return FactorSearch::BudgetExhausted,
+                FactorSearch::NotFound => {
+                    unreachable!("eligible factor clauses have non-empty partials")
+                }
+            };
             let mut cells = BTreeMap::<i32, Vec<usize>>::new();
 
             for clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
+                if !budget.visit_clause() {
+                    return FactorSearch::BudgetExhausted;
+                }
                 if !live_factor_clause(formula, clause_idx, pending_deleted) {
                     continue;
                 }
@@ -160,11 +170,18 @@ impl AndGate {
             }
         }
 
-        best.filter(|gate| gate.clause_saving >= FACTOR_BOUND as isize)
+        match best.filter(|gate| gate.clause_saving >= FACTOR_BOUND as isize) {
+            Some(gate) => FactorSearch::Found(gate),
+            None => FactorSearch::NotFound,
+        }
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
         self.clause_saving
+    }
+
+    pub(crate) fn source_clause_count(&self) -> usize {
+        self.source_indices.len()
     }
 
     pub(crate) fn apply<W: Write>(
@@ -214,6 +231,37 @@ impl AndPartial {
 struct AndCell {
     literal: i32,
     source_indices: Vec<usize>,
+}
+
+fn shortest_live_occurrence_literal(
+    formula: &Formula,
+    literals: &[i32],
+    pending_deleted: &[bool],
+    budget: &mut BvaBudget,
+) -> FactorSearch<i32> {
+    let mut best = None;
+    for &literal in literals {
+        let mut count = 0;
+        for clause_idx in formula.occurrence_of(&Literal::new(literal)) {
+            if !budget.visit_clause() {
+                return FactorSearch::BudgetExhausted;
+            }
+            if live_factor_clause(formula, clause_idx, pending_deleted) {
+                count += 1;
+            }
+        }
+
+        if best.is_none_or(|(best_literal, best_count)| {
+            (count, literal_tie_key(literal)) < (best_count, literal_tie_key(best_literal))
+        }) {
+            best = Some((literal, count));
+        }
+    }
+
+    match best {
+        Some((literal, _)) => FactorSearch::Found(literal),
+        None => FactorSearch::NotFound,
+    }
 }
 
 fn choose_next_literal(counts: &BTreeMap<i32, usize>) -> Option<(i32, usize)> {
@@ -303,7 +351,12 @@ mod tests {
     use crate::formula::extension::ExtensionDefinition;
 
     fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
-        AndGate::find(formula, start, pending_deleted)
+        let mut budget = BvaBudget::new(usize::MAX);
+        match AndGate::find(formula, start, pending_deleted, &mut budget) {
+            FactorSearch::Found(gate) => Some(gate),
+            FactorSearch::NotFound => None,
+            FactorSearch::BudgetExhausted => unreachable!("unlimited test budget exhausted"),
+        }
     }
 
     fn sorted_generated_clauses(formula: &Formula, initial_clause_limit: usize) -> Vec<Vec<i32>> {

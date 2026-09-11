@@ -1,6 +1,6 @@
 use crate::circuits::factorization::{
-    FACTOR_BOUND, MAX_FACTOR_CLAUSE_SIZE, claim_clause, generated_clause, is_tautological,
-    literal_tie_key, live_factor_clause, stable_signature_hash,
+    BvaBudget, FACTOR_BOUND, FactorSearch, MAX_FACTOR_CLAUSE_SIZE, claim_clause, generated_clause,
+    is_tautological, literal_tie_key, live_factor_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
@@ -21,13 +21,29 @@ pub(crate) struct Gate {
 }
 
 impl Gate {
-    pub(crate) fn find(formula: &Formula, pending_deleted: &[bool], target: i32) -> Option<Self> {
-        let pairs = extract_signature_pairs(formula, pending_deleted, target);
-        group_pairs(&pairs, target, pending_deleted.len())
+    pub(crate) fn find(
+        formula: &Formula,
+        pending_deleted: &[bool],
+        target: i32,
+        budget: &mut BvaBudget,
+    ) -> FactorSearch<Self> {
+        let pairs = match extract_signature_pairs(formula, pending_deleted, target, budget) {
+            FactorSearch::Found(pairs) => pairs,
+            FactorSearch::NotFound => return FactorSearch::NotFound,
+            FactorSearch::BudgetExhausted => return FactorSearch::BudgetExhausted,
+        };
+        match group_pairs(&pairs, target, pending_deleted.len()) {
+            Some(gate) => FactorSearch::Found(gate),
+            None => FactorSearch::NotFound,
+        }
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
         self.clause_saving
+    }
+
+    pub(crate) fn source_clause_count(&self) -> usize {
+        self.matches.len() * 2
     }
 
     pub(crate) fn apply<W: Write>(
@@ -161,23 +177,39 @@ fn extract_signature_pairs(
     formula: &Formula,
     pending_deleted: &[bool],
     target: i32,
-) -> Vec<ExtractedPair> {
+    budget: &mut BvaBudget,
+) -> FactorSearch<Vec<ExtractedPair>> {
     let mut first_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
     let mut second_by_size: [Vec<usize>; MAX_FACTOR_CLAUSE_SIZE + 1] =
         std::array::from_fn(|_| Vec::new());
 
+    // A gate needs both target polarities. Scan the opposite side first so a
+    // pure target is rejected without rescanning its potentially long live side.
+    for clause_idx in formula.occurrence_of(&Literal::new(-target)) {
+        if !budget.visit_clause() {
+            return FactorSearch::BudgetExhausted;
+        }
+        if live_gate_clause(formula, clause_idx, pending_deleted) {
+            let size = formula.get_clause_at_idx(clause_idx).len();
+            second_by_size[size].push(clause_idx);
+        }
+    }
+    if second_by_size.iter().all(Vec::is_empty) {
+        return FactorSearch::NotFound;
+    }
+
     for clause_idx in formula.occurrence_of(&Literal::new(target)) {
+        if !budget.visit_clause() {
+            return FactorSearch::BudgetExhausted;
+        }
         if live_gate_clause(formula, clause_idx, pending_deleted) {
             let size = formula.get_clause_at_idx(clause_idx).len();
             first_by_size[size].push(clause_idx);
         }
     }
-    for clause_idx in formula.occurrence_of(&Literal::new(-target)) {
-        if live_gate_clause(formula, clause_idx, pending_deleted) {
-            let size = formula.get_clause_at_idx(clause_idx).len();
-            second_by_size[size].push(clause_idx);
-        }
+    if first_by_size.iter().all(Vec::is_empty) {
+        return FactorSearch::NotFound;
     }
 
     let mut pairs = Vec::new();
@@ -192,6 +224,9 @@ fn extract_signature_pairs(
         let mut hash_buckets = HashMap::<u64, Vec<usize>>::new();
 
         for &clause_idx in &first_by_size[size] {
+            if !budget.visit_clause() {
+                return FactorSearch::BudgetExhausted;
+            }
             sorted_clause.clear();
             sorted_clause.extend(
                 formula
@@ -221,6 +256,9 @@ fn extract_signature_pairs(
         }
 
         for &clause_idx in &second_by_size[size] {
+            if !budget.visit_clause() {
+                return FactorSearch::BudgetExhausted;
+            }
             sorted_clause.clear();
             sorted_clause.extend(
                 formula
@@ -266,7 +304,11 @@ fn extract_signature_pairs(
         }
     }
 
-    pairs
+    if pairs.is_empty() {
+        FactorSearch::NotFound
+    } else {
+        FactorSearch::Found(pairs)
+    }
 }
 
 fn live_gate_clause(formula: &Formula, clause_idx: usize, pending_deleted: &[bool]) -> bool {
@@ -446,12 +488,22 @@ mod tests {
 
     fn find_gate(formula: &Formula, target: i32) -> Gate {
         let pending_deleted = vec![false; formula.clause_slots_len()];
-        Gate::find(formula, &pending_deleted, target).expect("expected gate")
+        let mut budget = BvaBudget::new(usize::MAX);
+        match Gate::find(formula, &pending_deleted, target, &mut budget) {
+            FactorSearch::Found(gate) => gate,
+            FactorSearch::NotFound => panic!("expected gate"),
+            FactorSearch::BudgetExhausted => unreachable!("unlimited test budget exhausted"),
+        }
     }
 
     fn extracted_pairs(formula: &Formula, target: i32) -> Vec<ExtractedPair> {
         let pending_deleted = vec![false; formula.clause_slots_len()];
-        extract_signature_pairs(formula, &pending_deleted, target)
+        let mut budget = BvaBudget::new(usize::MAX);
+        match extract_signature_pairs(formula, &pending_deleted, target, &mut budget) {
+            FactorSearch::Found(pairs) => pairs,
+            FactorSearch::NotFound => Vec::new(),
+            FactorSearch::BudgetExhausted => unreachable!("unlimited test budget exhausted"),
+        }
     }
 
     fn sorted_clauses(formula: &Formula) -> Vec<Vec<i32>> {
