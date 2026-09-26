@@ -109,7 +109,7 @@ pub fn solve<'py, W: Write>(
     let preprocess_start = Instant::now();
     let mut preprocessing_steps = 0;
     let preprocessing_scope = ClauseScope::range(0..formula.clause_slots_len());
-    formula.process(
+    formula.process_in_phase(
         preprocess.clone(),
         &preprocessing_scope,
         logger,
@@ -117,6 +117,7 @@ pub fn solve<'py, W: Write>(
         true,
         None,
         None,
+        crate::process::ProcessPhase::Preprocessing,
     )?;
     formula
         .stats

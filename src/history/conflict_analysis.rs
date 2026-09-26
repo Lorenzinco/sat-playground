@@ -30,8 +30,20 @@ pub(super) fn analyze_conflict(
     implication_point: ImplicationPoint,
 ) -> ConflictLearnResult {
     let Some(analysis) = analyze_conflict_graph(history, formula, conflict_clause_index) else {
+        formula.record_conflict_literal_utilities(std::iter::empty());
+        if matches!(implication_point, ImplicationPoint::DIP) {
+            formula.stats.dip_uip_fallbacks += 1;
+        }
         return uip::empty_result();
     };
+    let conflict_literals = analysis
+        .graph_literals
+        .iter()
+        .copied()
+        .skip(1)
+        .map(|literal| Literal::new(literal).negated())
+        .chain(analysis.uip_clause_literals.iter().copied());
+    formula.record_conflict_literal_utilities(conflict_literals);
 
     // Preserve occurrences rather than deduplicating: a source can be visited
     // repeatedly. Read-only graph inspection helpers do not record solver uses.
@@ -40,8 +52,13 @@ pub(super) fn analyze_conflict(
     }
 
     let result = if matches!(implication_point, ImplicationPoint::DIP) {
-        dip::learn_from_analysis(&analysis, history, formula, conflict_clause_index)
-            .unwrap_or_else(|| uip::learn_from_analysis(&analysis, history, formula))
+        match dip::learn_from_analysis(&analysis, history, formula, conflict_clause_index) {
+            Some(result) => result,
+            None => {
+                formula.stats.dip_uip_fallbacks += 1;
+                uip::learn_from_analysis(&analysis, history, formula)
+            }
+        }
     } else {
         uip::learn_from_analysis(&analysis, history, formula)
     };
@@ -225,6 +242,10 @@ mod tests {
             history.analyze_conflict(&mut formula, 1, point);
             assert_eq!(formula.stats.ges_replacement_analysis_uses, 2);
             assert_eq!(formula.stats.ges_replacement_reason_uses, 0);
+            assert_eq!(formula.extensions.literal_utility(&Literal::new(-1)), 1.0);
+            assert_eq!(formula.extensions.literal_utility(&Literal::new(-2)), 1.0);
+            assert_eq!(formula.extensions.literal_utility(&Literal::new(2)), 1.0);
+            assert_eq!(formula.extensions.literal_utility(&Literal::new(1)), 0.0);
             assert!(formula.get_clause_at_idx(0).ges_used);
             assert!(formula.get_clause_at_idx(1).ges_used);
             history.analyze_conflict(&mut formula, 1, point);

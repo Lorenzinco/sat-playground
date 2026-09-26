@@ -4,29 +4,69 @@ use crate::formula::Formula;
 use crate::history::History;
 use crate::process::ClauseScope;
 use crate::process::ges::{
-    MAX_CLAUSES_PER_PASS, PassWorkspace, commit_replacements, select_cursor_clause_indices,
+    GesOptions, PassWorkspace, Policy, adaptive_parallel_clause_budget,
+    adaptive_serial_clause_budget, commit_replacements, select_cursor_clause_indices,
+    select_trail_then_cursor_clause_indices, update_adaptive_clause_budget,
 };
 use pyo3::{PyResult, Python};
 use rayon::prelude::*;
 use std::io::Write;
 
+#[cfg(test)]
 pub(crate) fn process<W: Write>(
+    formula: &mut Formula,
+    scope: &ClauseScope,
+    logger: &mut Option<DratLogger<W>>,
+    signal: Option<(Python<'_>, &mut u64)>,
+    history: Option<&mut History>,
+    reasoning_levels: Option<&[Option<usize>]>,
+) -> PyResult<()> {
+    process_with_options(
+        formula,
+        scope,
+        logger,
+        signal,
+        history,
+        reasoning_levels,
+        GesOptions::default(),
+    )
+}
+
+pub(crate) fn process_with_options<W: Write>(
     formula: &mut Formula,
     scope: &ClauseScope,
     logger: &mut Option<DratLogger<W>>,
     mut signal: Option<(Python<'_>, &mut u64)>,
     history: Option<&mut History>,
     reasoning_levels: Option<&[Option<usize>]>,
+    options: GesOptions,
 ) -> PyResult<()> {
     check_signal(&mut signal)?;
-    let slot = MAX_CLAUSES_PER_PASS;
-    let limit = slot.saturating_mul(rayon::current_num_threads());
-    let indices = select_cursor_clause_indices(formula, scope, limit);
+    let has_history = history.is_some();
+    let live_clauses = formula.live_clause_count();
+    let slot = adaptive_serial_clause_budget(formula);
+    let limit = adaptive_parallel_clause_budget(live_clauses, slot, rayon::current_num_threads());
+    formula.stats.ges_current_budget = limit as u64;
+    formula.stats.ges_peak_budget = formula.stats.ges_peak_budget.max(limit as u64);
+    if limit == 0 {
+        return Ok(());
+    }
+    let indices = if options.trail_first {
+        select_trail_then_cursor_clause_indices(
+            formula,
+            scope,
+            Policy::Cursor,
+            options,
+            has_history,
+            limit,
+        )
+    } else {
+        select_cursor_clause_indices(formula, scope, Policy::Cursor, options, has_history, limit)
+    };
     // Formula itself is not Sync (its assignment contains a fastbit BitVec).
     // Borrow only the immutable, Sync data needed by substitution analysis.
     let extensions = &formula.extensions;
     let vsids = &formula.vsids;
-    let has_history = history.is_some();
     let mut replacements = Vec::new();
     let mut reports = Vec::new();
     let clauses: Vec<_> = indices
@@ -40,7 +80,7 @@ pub(crate) fn process<W: Write>(
     let blocks: Vec<Vec<_>> = clauses
         .par_chunks(slot)
         .map(|block| {
-            let mut workspace = PassWorkspace::new(extensions);
+            let mut workspace = PassWorkspace::with_options(extensions, options);
             block
                 .iter()
                 .map(|&(idx, clause)| {
@@ -62,9 +102,16 @@ pub(crate) fn process<W: Write>(
         }
     }
     check_signal(&mut signal)?;
+    let inspected = reports.iter().map(|report| report.inspected).sum();
+    let unsuccessful = reports
+        .iter()
+        .map(|report| report.noop.saturating_add(report.rejected))
+        .sum();
+    let accepted = replacements.len() as u64;
     for report in reports {
         report.merge_into(formula);
     }
+    update_adaptive_clause_budget(formula, inspected, accepted, unsuccessful);
     commit_replacements(formula, replacements, logger, history);
     Ok(())
 }
@@ -81,10 +128,10 @@ fn check_signal(signal: &mut Option<(Python<'_>, &mut u64)>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::ges::evaluate_clause;
 
     use crate::formula::extension::extension_literal;
     use crate::formula::literal::Literal;
+    use crate::process::ges::{MIN_CLAUSES_PER_PASS, parallel_clause_budget};
 
     fn fixture(count: usize) -> Formula {
         let mut formula = Formula::from_vec(vec![vec![-1, -2, 3]; count]);
@@ -104,22 +151,29 @@ mod tests {
         logger: &mut Option<DratLogger<&mut Vec<u8>>>,
         history: Option<&mut History>,
         levels: Option<&[Option<usize>]>,
+        options: GesOptions,
     ) {
+        let has_history = history.is_some();
+        let limit =
+            parallel_clause_budget(formula.live_clause_count(), rayon::current_num_threads());
         let indices = select_cursor_clause_indices(
             formula,
             scope,
-            MAX_CLAUSES_PER_PASS.saturating_mul(rayon::current_num_threads()),
+            Policy::Cursor,
+            options,
+            has_history,
+            limit,
         );
+        let mut workspace = PassWorkspace::with_options(&formula.extensions, options);
         let evaluations: Vec<_> = indices
             .into_iter()
             .map(|idx| {
                 (
                     idx,
-                    evaluate_clause(
-                        &formula.extensions,
+                    workspace.evaluate(
                         &formula.vsids,
                         formula.get_clause_at_idx(idx),
-                        history.is_some(),
+                        has_history,
                         levels,
                     ),
                 )
@@ -142,7 +196,23 @@ mod tests {
             rejected: formula.stats.ges_rewrites_rejected,
             lbd_improvements: formula.stats.ges_lbd_improvements,
             vsids_improvements: formula.stats.ges_vsids_improvements,
+            utility_improvements: formula.stats.ges_utility_improvements,
             literals_removed: formula.stats.ges_literals_removed,
+            binary_clauses_compressed: formula.stats.ges_binary_clauses_compressed,
+            clauses_unrolled: formula.stats.ges_clauses_unrolled,
+            dip_extensions_unrolled: formula.stats.ges_dip_extensions_unrolled,
+            bva_extensions_unrolled: formula.stats.ges_bva_extensions_unrolled,
+            other_extensions_unrolled: formula.stats.ges_other_extensions_unrolled,
+            unrolled_source_literals: formula.stats.ges_unrolled_source_literals,
+            unrolled_working_literals: formula.stats.ges_unrolled_working_literals,
+            substitutions_after_unrolling: formula.stats.ges_substitutions_after_unrolling,
+            substitutions_to_dip: formula.stats.ges_substitutions_to_dip,
+            substitutions_to_bva: formula.stats.ges_substitutions_to_bva,
+            substitutions_to_other: formula.stats.ges_substitutions_to_other,
+            rewrites_after_unrolling: formula.stats.ges_rewrites_after_unrolling,
+            rerolled_rewrites_after_unrolling: formula.stats.ges_rerolled_rewrites_after_unrolling,
+            unrolled_rewrites_rejected: formula.stats.ges_unrolled_rewrites_rejected,
+            unrolled_rewrites_restored: formula.stats.ges_unrolled_rewrites_restored,
         }
     }
 
@@ -170,7 +240,7 @@ mod tests {
                 .build()
                 .unwrap()
                 .install(|| {
-                    let budget = MAX_CLAUSES_PER_PASS * threads;
+                    let budget = MIN_CLAUSES_PER_PASS * threads;
                     let count = budget + 7;
                     let scope = ClauseScope::range(0..count);
                     let setup = || {
@@ -195,6 +265,7 @@ mod tests {
                             &mut Some(DratLogger::new(&mut expected)),
                             None,
                             None,
+                            GesOptions::default(),
                         );
                         process(
                             &mut parallel,
@@ -205,8 +276,7 @@ mod tests {
                             None,
                         )
                         .unwrap();
-                        // The three extension axioms are live scoped entries too.
-                        let processed = if pass == 0 { budget - 3 } else { count };
+                        let processed = if pass == 0 { budget } else { count };
                         assert_eq!(state(&parallel), state(&sequential));
                         assert_eq!(actual, expected);
                         assert_eq!(report(&parallel), report(&sequential));
@@ -221,10 +291,10 @@ mod tests {
                         );
                         assert_eq!(
                             parallel.ges_cursor,
-                            if pass == 0 { budget - 6 } else { count + 3 }
+                            if pass == 0 { budget - 3 } else { count - 3 }
                         );
                         for idx in 0..count {
-                            let selected = pass == 1 || idx >= count - 3 || idx < budget - 6;
+                            let selected = pass == 1 || idx >= count - 3 || idx < budget - 3;
                             assert_eq!(parallel.is_clause_garbage(idx), selected);
                             if !selected {
                                 let source = parallel.get_clause_at_idx(idx);
@@ -256,35 +326,57 @@ mod tests {
     }
 
     #[test]
-    fn protected_entries_count_towards_budget_but_garbage_and_out_of_scope_do_not() {
+    fn ineligible_entries_do_not_consume_parallel_budget() {
         for threads in [1, 2, 4] {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap()
                 .install(|| {
-                    let budget = MAX_CLAUSES_PER_PASS * threads;
-                    let mut formula = fixture(budget + 4);
-                    for idx in 0..budget + 4 {
+                    let budget = MIN_CLAUSES_PER_PASS * threads;
+                    let source_count = budget + 7;
+                    let mut formula = fixture(source_count);
+                    for idx in 0..source_count {
                         formula.get_clause_at_idx_mut(idx).lbd = 5;
                     }
-                    let scope = ClauseScope::indices((0..budget + 4).filter(|&idx| idx != 1));
+                    let scope = ClauseScope::indices((0..source_count).filter(|&idx| idx != 1));
                     let mut logger: Option<DratLogger<Vec<u8>>> = None;
                     formula.delete_clause(0, &mut logger);
                     formula.get_clause_at_idx_mut(2).lbd = 0;
                     formula.get_clause_at_idx_mut(3).lbd = 2;
                     formula.get_clause_at_idx_mut(4).increment_lock_count();
-                    process(&mut formula, &scope, &mut logger, None, None, None).unwrap();
-                    assert_eq!(formula.ges_cursor, budget + 2);
-                    assert_eq!(formula.stats.ges_clauses_inspected, (budget - 3) as u64);
-                    for idx in [1, 2, 3, 4, budget + 2, budget + 3] {
+                    let options = GesOptions::default();
+
+                    process_with_options(
+                        &mut formula,
+                        &scope,
+                        &mut logger,
+                        None,
+                        None,
+                        None,
+                        options,
+                    )
+                    .unwrap();
+                    assert_eq!(formula.ges_cursor, budget + 5);
+                    assert_eq!(formula.stats.ges_clauses_inspected, budget as u64);
+                    for idx in [1, 2, 3, 4, budget + 5, budget + 6] {
                         assert!(!formula.is_clause_garbage(idx));
                     }
-                    process(&mut formula, &scope, &mut logger, None, None, None).unwrap();
-                    assert_eq!(formula.ges_cursor, 5);
-                    assert_eq!(formula.stats.ges_clauses_inspected, (budget - 1) as u64);
-                    assert!(formula.is_clause_garbage(budget + 2));
-                    assert!(formula.is_clause_garbage(budget + 3));
+
+                    process_with_options(
+                        &mut formula,
+                        &scope,
+                        &mut logger,
+                        None,
+                        None,
+                        None,
+                        options,
+                    )
+                    .unwrap();
+                    assert_eq!(formula.ges_cursor, source_count);
+                    assert_eq!(formula.stats.ges_clauses_inspected, (budget + 2) as u64);
+                    assert!(formula.is_clause_garbage(budget + 5));
+                    assert!(formula.is_clause_garbage(budget + 6));
                 });
         }
     }
@@ -384,22 +476,31 @@ mod tests {
                 &mut Some(DratLogger::new(&mut expected)),
                 None,
                 None,
+                GesOptions {
+                    substitution_only: true,
+                    ..GesOptions::default()
+                },
             );
-            process(
+            process_with_options(
                 &mut parallel,
                 &scope,
                 &mut Some(DratLogger::new(&mut actual)),
                 None,
                 None,
                 None,
+                GesOptions {
+                    substitution_only: true,
+                    ..GesOptions::default()
+                },
             )
             .unwrap();
             assert_eq!(state(&parallel), state(&sequential));
             assert_eq!(actual, expected);
-            for idx in [1, 2, 4, 6, 7] {
+            for idx in [1, 4, 6, 7] {
                 assert!(!parallel.is_clause_garbage(idx));
             }
             assert!(parallel.is_clause_garbage(0));
+            assert!(parallel.is_clause_garbage(2));
         }
     }
 
@@ -426,6 +527,7 @@ mod tests {
             &mut Some(DratLogger::new(&mut expected)),
             Some(&mut sh),
             Some(&levels),
+            GesOptions::default(),
         );
         process(
             &mut parallel,

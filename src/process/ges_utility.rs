@@ -1,4 +1,8 @@
-//! GES over the highest stored-LBD clauses, oldest physical index first on ties.
+//! Cursor GES maximizing signed literal utility from propagation and conflict use.
+//!
+//! Each greedy replacement must be at least as useful as both inputs. Final
+//! descending utility sequences must improve at their first differing entry;
+//! merely dropping a suffix is not an improvement. Branching VSIDS is unchanged.
 use std::io::Write;
 
 use pyo3::{Python, prelude::PyResult};
@@ -25,7 +29,7 @@ pub(crate) fn process_with_options<W: Write>(
         signal,
         history,
         reasoning_levels,
-        Policy::Lbd,
+        Policy::Utility,
         options,
     )
 }

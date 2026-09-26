@@ -27,7 +27,7 @@ def parse_dimacs(filename: Path) -> List[List[int]]:
 
 
 def solve_example() -> None:
-    clauses = parse_dimacs(Path("tests/benchmark/randkxor/randkxor-3-or-2-n360-s3.cnf"))
+    clauses = parse_dimacs(Path("tests/unsat/2bitadd_10.cnf"))
     solver = clsat.Sat(clauses)
     print("c Solving SAT problem...", flush=True)
     solver.solve(
@@ -36,7 +36,7 @@ def solve_example() -> None:
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=["bva"],
+        inprocessing=["bva","ges_vsids"],
     )
 
     if solver.model is not None:

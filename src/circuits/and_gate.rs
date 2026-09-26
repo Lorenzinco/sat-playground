@@ -1,6 +1,6 @@
 use crate::circuits::factorization::{
-    BvaBudget, FACTOR_BOUND, FactorSearch, claim_clause, generated_clause, is_tautological,
-    literal_tie_key, live_factor_clause, stable_signature_hash,
+    BvaBudget, FACTOR_BOUND, FactorSearch, claim_clause, definition_clause, is_tautological,
+    literal_tie_key, live_factor_clause, quotient_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
@@ -13,6 +13,7 @@ pub(crate) struct AndGate {
     literals: Vec<i32>,
     partials: Vec<Vec<i32>>,
     source_indices: Vec<usize>,
+    factor_score: isize,
     clause_saving: isize,
 }
 
@@ -22,6 +23,7 @@ impl AndGate {
         start: i32,
         pending_deleted: &[bool],
         budget: &mut BvaBudget,
+        index: &RemainderIndex,
     ) -> FactorSearch<AndGate> {
         let mut partials = Vec::<AndPartial>::new();
         let mut partial_hash_buckets = HashMap::<u64, Vec<usize>>::new();
@@ -58,24 +60,10 @@ impl AndGate {
             return FactorSearch::NotFound;
         }
 
-        // Discover each row through its shortest occurrence list. A candidate
-        // clause belongs to a cell exactly when it is the partial plus one literal.
+        // Hashes only narrow the lookup; exact remainders decide membership.
         for partial in &mut partials {
-            let anchor = match shortest_live_occurrence_literal(
-                formula,
-                &partial.literals,
-                pending_deleted,
-                budget,
-            ) {
-                FactorSearch::Found(anchor) => anchor,
-                FactorSearch::BudgetExhausted => return FactorSearch::BudgetExhausted,
-                FactorSearch::NotFound => {
-                    unreachable!("eligible factor clauses have non-empty partials")
-                }
-            };
             let mut cells = BTreeMap::<i32, Vec<usize>>::new();
-
-            for clause_idx in formula.occurrence_of(&Literal::new(anchor)) {
+            for &(clause_idx, extra) in index.lookup(&partial.literals) {
                 if !budget.visit_clause() {
                     return FactorSearch::BudgetExhausted;
                 }
@@ -83,20 +71,7 @@ impl AndGate {
                     continue;
                 }
 
-                let clause = formula.get_clause_at_idx(clause_idx);
-                if clause.len() != partial.literals.len() + 1 {
-                    continue;
-                }
-                sorted_clause.clear();
-                sorted_clause.extend(clause.iter().map(Literal::get_index));
-                sorted_clause.sort_unstable();
-                if is_tautological(&sorted_clause) {
-                    continue;
-                }
-
-                if let Some(extra) = one_extra_literal(&partial.literals, &sorted_clause) {
-                    cells.entry(extra).or_default().push(clause_idx);
-                }
+                cells.entry(extra).or_default().push(clause_idx);
             }
 
             partial.cells = cells
@@ -149,14 +124,18 @@ impl AndGate {
             }
             source_indices.sort_unstable();
             source_indices.dedup();
-            let clause_saving =
+            // Keep the historical BVA score for candidate acceptance and
+            // comparison. Exact binary factors emit one additional definition
+            // clause, which is reflected separately in the true net saving.
+            let factor_score =
                 source_indices.len() as isize - (literals.len() + partial_ids.len()) as isize;
+            let clause_saving = factor_score - isize::from(literals.len() == 2);
 
             // A better quotient can occur after a plateau or decline, so extend
             // the full greedy chain while retaining its best prefix.
             if best
                 .as_ref()
-                .is_none_or(|gate: &Self| clause_saving > gate.clause_saving)
+                .is_none_or(|gate: &Self| factor_score > gate.factor_score)
             {
                 best = Some(Self {
                     literals: literals.clone(),
@@ -165,15 +144,20 @@ impl AndGate {
                         .map(|&partial_id| partials[partial_id].literals.clone())
                         .collect(),
                     source_indices,
+                    factor_score,
                     clause_saving,
                 });
             }
         }
 
-        match best.filter(|gate| gate.clause_saving >= FACTOR_BOUND as isize) {
+        match best.filter(|gate| gate.factor_score >= FACTOR_BOUND as isize) {
             Some(gate) => FactorSearch::Found(gate),
             None => FactorSearch::NotFound,
         }
+    }
+
+    pub(crate) fn factor_score(&self) -> isize {
+        self.factor_score
     }
 
     pub(crate) fn clause_saving(&self) -> isize {
@@ -193,20 +177,34 @@ impl AndGate {
     ) {
         let auxiliary = formula.add_literal();
         formula.stats.add_bva_literal();
-        formula.extensions.add_and_definition(
-            self.literals.iter().copied().map(Literal::new).collect(),
-            &auxiliary,
-        );
+        if self.literals.len() == 2 {
+            formula.stats.bva_binary_and_factors += 1;
+            let first = Literal::new(self.literals[0]);
+            let second = Literal::new(self.literals[1]);
+            formula
+                .extensions
+                .add_bva_substitution(&first, &second, &auxiliary);
+            formula.add_clause_unchecked(
+                definition_clause(vec![auxiliary, first.negated(), second.negated()]),
+                logger,
+            );
+        } else {
+            formula.stats.bva_non_binary_and_factors += 1;
+            formula.extensions.add_and_definition(
+                self.literals.iter().copied().map(Literal::new).collect(),
+                &auxiliary,
+            );
+        }
 
         for partial in self.partials {
             let mut literals = Vec::with_capacity(partial.len() + 1);
             literals.push(auxiliary.clone());
             literals.extend(partial.into_iter().map(Literal::new));
-            formula.add_clause_unchecked(generated_clause(literals), logger);
+            formula.add_clause_unchecked(quotient_clause(literals), logger);
         }
         for literal in self.literals {
             formula.add_clause_unchecked(
-                generated_clause(vec![auxiliary.negated(), Literal::new(literal)]),
+                definition_clause(vec![auxiliary.negated(), Literal::new(literal)]),
                 logger,
             );
         }
@@ -233,34 +231,86 @@ struct AndCell {
     source_indices: Vec<usize>,
 }
 
-fn shortest_live_occurrence_literal(
-    formula: &Formula,
-    literals: &[i32],
-    pending_deleted: &[bool],
-    budget: &mut BvaBudget,
-) -> FactorSearch<i32> {
-    let mut best = None;
-    for &literal in literals {
-        let mut count = 0;
-        for clause_idx in formula.occurrence_of(&Literal::new(literal)) {
+/// Pass-local append-only index. Source clauses are immutable during the pass;
+/// pending and physical deletions are filtered at lookup, before using a cell.
+/// Eligibility bounds clause length to 20, avoiding unbounded quadratic keys.
+#[derive(Default)]
+pub(crate) struct RemainderIndex {
+    buckets: HashMap<u64, Vec<RemainderRow>>,
+    next_clause: usize,
+    entries: usize,
+}
+
+struct RemainderRow {
+    literals: Vec<i32>,
+    entries: Vec<(usize, i32)>,
+}
+
+impl RemainderIndex {
+    pub(crate) fn extend(
+        &mut self,
+        formula: &Formula,
+        pending_deleted: &[bool],
+        budget: &mut BvaBudget,
+    ) -> bool {
+        while self.next_clause < formula.clause_slots_len() {
+            let clause_idx = self.next_clause;
             if !budget.visit_clause() {
-                return FactorSearch::BudgetExhausted;
+                return false;
             }
             if live_factor_clause(formula, clause_idx, pending_deleted) {
-                count += 1;
+                let literals = formula
+                    .get_clause_at_idx(clause_idx)
+                    .sorted_literal_indices();
+                if !is_tautological(&literals) {
+                    // Bound pass-local storage independently of the effort cap.
+                    if self.entries.saturating_add(literals.len()) > 250_000 {
+                        return false;
+                    }
+                    // Reserve work before inserting so an interrupted clause
+                    // cannot leave duplicate entries if construction is resumed.
+                    for _ in &literals {
+                        if !budget.visit_clause() {
+                            return false;
+                        }
+                    }
+                    for &extra in &literals {
+                        let remainder = sorted_without(&literals, extra);
+                        self.insert(
+                            stable_signature_hash(&remainder),
+                            remainder,
+                            (clause_idx, extra),
+                        );
+                    }
+                }
             }
+            self.next_clause += 1;
         }
+        true
+    }
 
-        if best.is_none_or(|(best_literal, best_count)| {
-            (count, literal_tie_key(literal)) < (best_count, literal_tie_key(best_literal))
-        }) {
-            best = Some((literal, count));
+    fn insert(&mut self, hash: u64, literals: Vec<i32>, entry: (usize, i32)) {
+        self.entries += 1;
+        let bucket = self.buckets.entry(hash).or_default();
+        if let Some(row) = bucket.iter_mut().find(|row| row.literals == literals) {
+            row.entries.push(entry);
+        } else {
+            bucket.push(RemainderRow {
+                literals,
+                entries: vec![entry],
+            });
         }
     }
 
-    match best {
-        Some((literal, _)) => FactorSearch::Found(literal),
-        None => FactorSearch::NotFound,
+    fn lookup(&self, literals: &[i32]) -> &[(usize, i32)] {
+        self.lookup_hash(stable_signature_hash(literals), literals)
+    }
+
+    fn lookup_hash(&self, hash: u64, literals: &[i32]) -> &[(usize, i32)] {
+        self.buckets
+            .get(&hash)
+            .and_then(|bucket| bucket.iter().find(|row| row.literals == literals))
+            .map_or(&[], |row| row.entries.as_slice())
     }
 }
 
@@ -283,34 +333,6 @@ fn sorted_without(sorted_clause: &[i32], literal_to_remove: i32) -> Vec<i32> {
         .copied()
         .filter(|&literal| literal != literal_to_remove)
         .collect()
-}
-
-fn one_extra_literal(partial: &[i32], clause: &[i32]) -> Option<i32> {
-    if clause.len() != partial.len() + 1 {
-        return None;
-    }
-
-    let mut partial_position = 0;
-    let mut clause_position = 0;
-    let mut extra = None;
-    while clause_position < clause.len() {
-        if partial_position < partial.len() && partial[partial_position] == clause[clause_position]
-        {
-            partial_position += 1;
-            clause_position += 1;
-        } else if extra.is_none() {
-            extra = Some(clause[clause_position]);
-            clause_position += 1;
-        } else {
-            return None;
-        }
-    }
-
-    if partial_position == partial.len() {
-        extra
-    } else {
-        None
-    }
 }
 
 fn intern_partial(
@@ -352,7 +374,9 @@ mod tests {
 
     fn find(formula: &Formula, start: i32, pending_deleted: &[bool]) -> Option<AndGate> {
         let mut budget = BvaBudget::new(usize::MAX);
-        match AndGate::find(formula, start, pending_deleted, &mut budget) {
+        let mut index = RemainderIndex::default();
+        assert!(index.extend(formula, pending_deleted, &mut budget));
+        match AndGate::find(formula, start, pending_deleted, &mut budget, &index) {
             FactorSearch::Found(gate) => Some(gate),
             FactorSearch::NotFound => None,
             FactorSearch::BudgetExhausted => unreachable!("unlimited test budget exhausted"),
@@ -377,8 +401,76 @@ mod tests {
     }
 
     #[test]
+    fn remainder_index_bounds_storage_and_resumes_interrupted_clauses() {
+        let formula = Formula::from_vec(vec![vec![1, 2, 3]]);
+        let pending = vec![false];
+        let mut index = RemainderIndex::default();
+        assert!(!index.extend(&formula, &pending, &mut BvaBudget::new(2)));
+        assert_eq!(index.entries, 0);
+        assert!(index.extend(&formula, &pending, &mut BvaBudget::new(4)));
+        assert_eq!(index.lookup(&[2, 3]), &[(0, 1)]);
+        let mut capped = RemainderIndex {
+            entries: 250_000,
+            ..Default::default()
+        };
+        assert!(!capped.extend(&formula, &pending, &mut BvaBudget::new(100)));
+        assert!(capped.buckets.is_empty());
+        let long = Formula::from_vec(vec![(1..=21).collect()]);
+        let mut index = RemainderIndex::default();
+        assert!(index.extend(&long, &pending, &mut BvaBudget::new(1)));
+        assert!(index.buckets.is_empty());
+    }
+
+    #[test]
+    fn remainder_index_resolves_collisions_exactly() {
+        let mut index = RemainderIndex::default();
+        index.insert(7, vec![2, 10], (0, 1));
+        index.insert(7, vec![3, 10], (1, 1));
+        index.insert(7, vec![2, 10], (2, 4));
+        assert_eq!(index.lookup_hash(7, &[2, 10]), &[(0, 1), (2, 4)]);
+        assert_eq!(index.lookup_hash(7, &[3, 10]), &[(1, 1)]);
+        assert!(index.lookup_hash(7, &[4, 10]).is_empty());
+    }
+
+    #[test]
+    fn index_filters_deleted_cells_and_adds_generated_cells_incrementally() {
+        let mut formula = Formula::from_vec(
+            (1..=2)
+                .flat_map(|a| (3..=6).map(move |b| vec![a, b]))
+                .collect(),
+        );
+        let mut pending = vec![false; formula.clause_slots_len()];
+        let mut budget = BvaBudget::new(usize::MAX);
+        let mut index = RemainderIndex::default();
+        assert!(index.extend(&formula, &pending, &mut budget));
+        pending[4] = true;
+        formula.delete_clause::<std::io::Empty>(5, &mut None);
+        assert!(matches!(
+            AndGate::find(&formula, 1, &pending, &mut budget, &index),
+            FactorSearch::NotFound
+        ));
+        for b in [3, 4] {
+            formula.add_clause_unchecked::<std::io::Empty>(
+                definition_clause(vec![Literal::new(2), Literal::new(b)]),
+                &mut None,
+            );
+        }
+        pending.resize(formula.clause_slots_len(), false);
+        let before = budget.visits();
+        assert!(index.extend(&formula, &pending, &mut budget));
+        assert_eq!(budget.visits() - before, 6);
+        assert!(index.extend(&formula, &pending, &mut budget));
+        assert_eq!(budget.visits() - before, 6);
+        let FactorSearch::Found(gate) = AndGate::find(&formula, 1, &pending, &mut budget, &index)
+        else {
+            panic!("generated cells complete the grid")
+        };
+        assert_eq!(gate.source_indices, vec![0, 1, 2, 3, 6, 7, 8, 9]);
+    }
+
+    #[test]
     fn greedy_search_continues_past_a_savings_plateau() {
-        let formula = Formula::from_vec(vec![
+        let mut formula = Formula::from_vec(vec![
             vec![1, 10],
             vec![1, 11],
             vec![1, 12],
@@ -390,14 +482,25 @@ mod tests {
             vec![4, 10],
             vec![4, 11],
         ]);
-        let pending_deleted = vec![false; formula.clause_slots_len()];
+        let mut pending_deleted = vec![false; formula.clause_slots_len()];
 
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
 
+        assert_eq!(gate.factor_score(), 2);
         assert_eq!(gate.clause_saving(), 2);
         assert_eq!(gate.literals, vec![1, 2, 3, 4]);
         assert_eq!(gate.partials, vec![vec![10], vec![11]]);
         assert_eq!(gate.source_indices.len(), 8);
+
+        apply(gate, &mut formula, &mut pending_deleted);
+        assert_eq!(formula.stats.bva_binary_and_factors, 0);
+        assert_eq!(formula.stats.bva_non_binary_and_factors, 1);
+        assert_eq!(
+            formula
+                .extensions
+                .substitute(&Literal::new(1), &Literal::new(2)),
+            None
+        );
     }
 
     #[test]
@@ -420,6 +523,8 @@ mod tests {
 
         assert_eq!(formula.assignment.len(), 8);
         assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(formula.stats.bva_binary_and_factors, 1);
+        assert_eq!(formula.stats.bva_non_binary_and_factors, 0);
         assert_eq!(
             formula.extensions.definition(&Literal::new(7)),
             Some(&ExtensionDefinition::And(vec![
@@ -431,7 +536,11 @@ mod tests {
             formula
                 .extensions
                 .substitute(&Literal::new(1), &Literal::new(2)),
-            None
+            Some(Literal::new(7))
+        );
+        assert_eq!(
+            formula.extensions.substitution_inputs(&Literal::new(7)),
+            Some((Literal::new(2), Literal::new(1)))
         );
         assert!(pending_deleted.iter().all(|pending| *pending));
         assert_eq!(
@@ -443,6 +552,7 @@ mod tests {
             vec![
                 vec![-7, 1],
                 vec![-7, 2],
+                vec![-2, -1, 7],
                 vec![3, 7],
                 vec![4, 7],
                 vec![5, 7],
@@ -453,18 +563,33 @@ mod tests {
             formula
                 .get_clauses_and_garbage()
                 .filter(|(physical_index, _)| *physical_index >= initial_clause_limit)
-                .all(|(_, clause)| clause.bva_generated)
+                .all(|(idx, clause)| clause.bva_generated
+                    && clause.lbd
+                        == if (initial_clause_limit + 1..initial_clause_limit + 5).contains(&idx) {
+                            -1
+                        } else {
+                            0
+                        })
         );
     }
 
     #[test]
-    fn unprofitable_grid_is_a_noop() {
-        let formula = Formula::from_vec(vec![vec![1, 3], vec![1, 4], vec![2, 3], vec![2, 4]]);
+    fn binary_grid_that_breaks_even_keeps_legacy_acceptance() {
+        let formula = Formula::from_vec(vec![
+            vec![1, 3],
+            vec![1, 4],
+            vec![1, 5],
+            vec![2, 3],
+            vec![2, 4],
+            vec![2, 5],
+        ]);
         let pending_deleted = vec![false; formula.clause_slots_len()];
 
-        assert!(find(&formula, 1, &pending_deleted).is_none());
-        assert_eq!(formula.assignment.len(), 5);
-        assert_eq!(formula.live_clause_count(), 4);
+        let gate = find(&formula, 1, &pending_deleted).expect("legacy score is profitable");
+        assert_eq!(gate.factor_score(), 1);
+        assert_eq!(gate.clause_saving(), 0);
+        assert_eq!(formula.assignment.len(), 6);
+        assert_eq!(formula.live_clause_count(), 6);
         assert_eq!(formula.stats.bva_literals, 0);
     }
 
@@ -498,7 +623,7 @@ mod tests {
         let initial_clause_limit = formula.clause_slots_len();
         let mut pending_deleted = vec![false; initial_clause_limit];
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
-        assert_eq!(gate.clause_saving(), 2);
+        assert_eq!(gate.clause_saving(), 1);
 
         apply(gate, &mut formula, &mut pending_deleted);
 
@@ -507,12 +632,37 @@ mod tests {
             vec![
                 vec![-8, 1],
                 vec![-8, 2],
+                vec![-2, -1, 8],
                 vec![3, 4, 8],
                 vec![3, 5, 8],
                 vec![6, 8],
                 vec![7, 8],
             ]
         );
+
+        let quotient_idx = initial_clause_limit + 1;
+        assert_eq!(formula.get_clause_at_idx(quotient_idx).lbd, -1);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let z = crate::formula::extension::extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(-3),
+            &Literal::new(-4),
+        );
+        let replacement_idx = formula.clause_slots_len();
+        let scope = crate::process::ClauseScope::indices([quotient_idx]);
+        crate::process::ges::process(&mut formula, &scope, &mut logger, None, None, None).unwrap();
+        assert!(formula.is_clause_garbage(quotient_idx));
+        let replacement = formula
+            .get_clauses()
+            .filter(|(idx, _)| *idx >= replacement_idx)
+            .map(|(_, clause)| clause)
+            .find(|clause| clause.get_literals() == [Literal::new(8), z.negated()])
+            .expect("ordinary GES rewrites the generated AND quotient");
+        assert_eq!(replacement.lbd, -1);
+        assert!(replacement.bva_generated);
+        assert!(!formula.is_clause_garbage(initial_clause_limit));
+        assert_eq!(formula.get_clause_at_idx(initial_clause_limit).lbd, 0);
     }
 
     #[test]
@@ -530,14 +680,14 @@ mod tests {
         let mut pending_deleted = vec![false; initial_clause_limit];
 
         let gate = find(&formula, 1, &pending_deleted).expect("expected profitable grid");
-        assert_eq!(gate.clause_saving(), 4);
+        assert_eq!(gate.clause_saving(), 3);
         assert_eq!(gate.source_indices.len(), 8);
 
         let deletion_indices = apply(gate, &mut formula, &mut pending_deleted);
 
         assert_eq!(deletion_indices.len(), 8);
         assert_eq!(deletion_indices, (0..8).collect::<Vec<_>>());
-        assert_eq!(formula.live_clause_count(), 12);
+        assert_eq!(formula.live_clause_count(), 13);
         assert_eq!(formula.stats.bva_literals, 1);
     }
 

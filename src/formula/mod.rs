@@ -27,7 +27,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::Instant;
 
-const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 25_000;
+const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 15_000;
 const DB_REDUCTION_GARBAGE_RATIO: usize = 12;
 
 pub struct Formula {
@@ -42,6 +42,14 @@ pub struct Formula {
     pub(crate) vsids: Vsids,
     self_subsuming: bool,
     pub(crate) ges_cursor: usize,
+    pub(crate) ges_clause_budget: usize,
+    pub(crate) ges_feedback_used: u64,
+    pub(crate) ges_feedback_deleted_unused: u64,
+    ges_trail_tracking: bool,
+    pub(crate) ges_trail_touched: Vec<usize>,
+    ges_trail_seen: Vec<bool>,
+    pub(crate) bva_preprocessing_budget: usize,
+    pub(crate) bva_inprocessing_budget: usize,
 }
 
 impl Clone for Formula {
@@ -58,6 +66,14 @@ impl Clone for Formula {
             vsids: self.vsids.clone(),
             self_subsuming: self.self_subsuming,
             ges_cursor: self.ges_cursor,
+            ges_clause_budget: self.ges_clause_budget,
+            ges_feedback_used: self.ges_feedback_used,
+            ges_feedback_deleted_unused: self.ges_feedback_deleted_unused,
+            ges_trail_tracking: self.ges_trail_tracking,
+            ges_trail_touched: self.ges_trail_touched.clone(),
+            ges_trail_seen: self.ges_trail_seen.clone(),
+            bva_preprocessing_budget: self.bva_preprocessing_budget,
+            bva_inprocessing_budget: self.bva_inprocessing_budget,
         }
     }
 }
@@ -122,6 +138,14 @@ impl Formula {
             vsids: Vsids::new(storage),
             self_subsuming: false,
             ges_cursor: 0,
+            ges_clause_budget: 0,
+            ges_feedback_used: 0,
+            ges_feedback_deleted_unused: 0,
+            ges_trail_tracking: false,
+            ges_trail_touched: Vec::new(),
+            ges_trail_seen: Vec::new(),
+            bva_preprocessing_budget: 0,
+            bva_inprocessing_budget: 0,
         }
     }
 
@@ -145,6 +169,14 @@ impl Formula {
             vsids: Vsids::new(max_index as usize + 1),
             self_subsuming: false,
             ges_cursor: 0,
+            ges_clause_budget: 0,
+            ges_feedback_used: 0,
+            ges_feedback_deleted_unused: 0,
+            ges_trail_tracking: false,
+            ges_trail_touched: Vec::new(),
+            ges_trail_seen: vec![false; clauses.len()],
+            bva_preprocessing_budget: 0,
+            bva_inprocessing_budget: 0,
         };
 
         formula.rebuild_clause_indices();
@@ -402,9 +434,10 @@ impl Formula {
 
     pub fn add_clause_unchecked<W: Write>(
         &mut self,
-        clause: Clause,
+        mut clause: Clause,
         logger: &mut Option<DratLogger<W>>,
     ) -> usize {
+        clause.prioritize_unfalsified_watches(&self.assignment);
         let clause_idx = self.clauses.len();
         for lit in clause.get_literals() {
             self.add_to_occurrence(clause_idx, lit);
@@ -424,6 +457,7 @@ impl Formula {
 
         self.clauses.push(clause);
         self.garbage.push_live();
+        self.ges_trail_seen.push(false);
         clause_idx
     }
 
@@ -434,8 +468,31 @@ impl Formula {
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
         replace_subsumption_setting: bool,
+        history: Option<&mut History>,
+        reasoning_levels: Option<&[Option<usize>]>,
+    ) -> PyResult<()> {
+        self.process_in_phase(
+            methods,
+            scope,
+            logger,
+            signal,
+            replace_subsumption_setting,
+            history,
+            reasoning_levels,
+            process::ProcessPhase::Preprocessing,
+        )
+    }
+
+    pub fn process_in_phase<W: Write>(
+        &mut self,
+        methods: Vec<Process>,
+        scope: &ClauseScope,
+        logger: &mut Option<DratLogger<W>>,
+        signal: Option<(Python<'_>, &mut u64)>,
+        replace_subsumption_setting: bool,
         mut history: Option<&mut History>,
         reasoning_levels: Option<&[Option<usize>]>,
+        phase: process::ProcessPhase,
     ) -> PyResult<()> {
         if replace_subsumption_setting {
             self.self_subsuming = methods.contains(&Process::Subsumption);
@@ -443,13 +500,17 @@ impl Formula {
             self.self_subsuming = true;
         }
         let mut signal = signal;
+        let ges_options = process::ges::GesOptions {
+            substitution_only: methods.contains(&Process::GESCompress),
+            trail_first: methods.contains(&Process::GESTrail),
+        };
 
         let result: PyResult<()> = (|| -> PyResult<()> {
             for method in methods {
                 match method {
                     Process::BVA => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::bva::process(self, scope, logger, signal, history.as_deref_mut())?;
+                        process::bva::process_in_phase(self, scope, logger, signal, phase)?;
                     }
                     Process::BVE => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
@@ -460,15 +521,17 @@ impl Formula {
                     | Process::GESLBD
                     | Process::GESPar
                     | Process::GESRandom
+                    | Process::GESUtility
                     | Process::GESVSIDS => {
                         let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
                         let process_ges = match method {
-                            Process::GESAlways => process::ges_always::process,
-                            Process::GESLBD => process::ges_lbd::process,
-                            Process::GESPar => process::ges_par::process,
-                            Process::GESRandom => process::ges_random::process,
-                            Process::GESVSIDS => process::ges_vsids::process,
-                            _ => process::ges::process,
+                            Process::GESAlways => process::ges_always::process_with_options,
+                            Process::GESLBD => process::ges_lbd::process_with_options,
+                            Process::GESPar => process::ges_par::process_with_options,
+                            Process::GESRandom => process::ges_random::process_with_options,
+                            Process::GESUtility => process::ges_utility::process_with_options,
+                            Process::GESVSIDS => process::ges_vsids::process_with_options,
+                            _ => process::ges::process_with_options,
                         };
                         process_ges(
                             self,
@@ -477,8 +540,10 @@ impl Formula {
                             signal,
                             history.as_deref_mut(),
                             reasoning_levels,
+                            ges_options,
                         )?;
                     }
+                    Process::GESCompress | Process::GESTrail => {}
                     Process::Subsumption => process::subsumption::preprocess(self, scope, logger),
                     _ => println!("Not yet implemented!"),
                 }
@@ -591,6 +656,15 @@ impl Formula {
             .chain(old_to_new.iter().take(self.ges_cursor))
             .find_map(|&index| index)
             .unwrap_or(0);
+        self.ges_trail_touched = self
+            .ges_trail_touched
+            .iter()
+            .filter_map(|&old_index| old_to_new[old_index])
+            .collect();
+        self.ges_trail_seen = vec![false; self.clauses.len()];
+        for &clause_idx in &self.ges_trail_touched {
+            self.ges_trail_seen[clause_idx] = true;
+        }
         self.garbage.reset(self.clauses.len());
         self.rebuild_clause_indices();
 
@@ -654,9 +728,42 @@ impl Formula {
         history.add_decision(literal);
     }
 
+    pub(crate) fn configure_ges_trail_tracking(&mut self, enabled: bool) {
+        self.ges_trail_tracking = enabled;
+        self.clear_ges_trail_touched();
+    }
+
+    pub(crate) fn clear_ges_trail_touched(&mut self) {
+        for clause_idx in self.ges_trail_touched.drain(..) {
+            if let Some(seen) = self.ges_trail_seen.get_mut(clause_idx) {
+                *seen = false;
+            }
+        }
+    }
+
+    fn record_ges_trail_touch(&mut self, clause_idx: usize) {
+        if self.ges_trail_tracking && !self.ges_trail_seen[clause_idx] {
+            self.ges_trail_seen[clause_idx] = true;
+            self.ges_trail_touched.push(clause_idx);
+            self.stats.ges_trail_unique_touches += 1;
+        }
+    }
+
     pub(crate) fn record_ges_analysis_use(&mut self, clause_idx: usize) {
+        self.record_ges_trail_touch(clause_idx);
         self.stats
             .record_ges_analysis_use(&mut self.clauses[clause_idx]);
+    }
+
+    pub(crate) fn record_conflict_literal_utilities(
+        &mut self,
+        literals: impl IntoIterator<Item = Literal>,
+    ) {
+        self.extensions.begin_conflict_utility();
+        for literal in literals {
+            self.extensions.bump_conflict_utility(&literal);
+        }
+        self.extensions.decay_literal_utility();
     }
 
     pub fn assign_implication(
@@ -668,8 +775,10 @@ impl Formula {
         let result = self
             .assignment
             .assign_implication(literal, history, reason_clause_idx);
-        if matches!(result, AssignResult::Assigned(_)) {
+        if let AssignResult::Assigned(literal) = &result {
+            self.extensions.bump_propagation_utility(literal);
             if let Some(idx) = reason_clause_idx {
+                self.record_ges_trail_touch(idx);
                 self.clauses[idx].increment_lock_count();
                 self.stats.record_ges_reason_use(&mut self.clauses[idx]);
             }
@@ -951,7 +1060,15 @@ impl Formula {
                                         );
 
                                         history.add_implication(&other_lit, Some(clause_usize));
+                                        self.extensions.bump_propagation_utility(&other_lit);
 
+                                        if self.ges_trail_tracking
+                                            && !self.ges_trail_seen[clause_usize]
+                                        {
+                                            self.ges_trail_seen[clause_usize] = true;
+                                            self.ges_trail_touched.push(clause_usize);
+                                            self.stats.ges_trail_unique_touches += 1;
+                                        }
                                         clause.increment_lock_count();
                                         self.stats.record_ges_reason_use(clause);
                                         queue.push_back(other_lit);
@@ -1062,6 +1179,13 @@ impl Formula {
 
             let activity = clause.activity;
             clause.activity = clause.activity.saturating_sub(1);
+
+            // Give a GES replacement several complete reduction intervals to
+            // demonstrate usefulness before ordinary quality selection applies.
+            if clause.ges_protection > 0 {
+                clause.ges_protection -= 1;
+                continue;
+            }
 
             // Recently analyzed tier-one clauses survive while active. Tier-two
             // clauses get one additional reduction interval after being used.
@@ -1316,6 +1440,35 @@ mod tests {
     }
 
     #[test]
+    fn attachment_watches_unfalsified_literals_under_an_existing_assignment() {
+        let mut formula = Formula::new(4);
+        let mut history = History::new();
+        for literal in [Literal::new(-1), Literal::new(-2)] {
+            assert!(matches!(
+                formula.assign_implication(literal, &mut history, None),
+                AssignResult::Assigned(_)
+            ));
+        }
+
+        let clause_idx = formula.add_clause_unchecked::<Empty>(
+            Clause::from_literals([1, 2, 3, 4].map(Literal::new).to_vec(), 0),
+            &mut None,
+        );
+
+        assert_eq!(
+            formula.get_clause_at_idx(clause_idx).watched_literals(),
+            Some((&Literal::new(3), Some(&Literal::new(4))))
+        );
+        formula.add_decision(&Literal::new(-3), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(-3)])),
+            None
+        );
+        assert_eq!(formula.assignment.get_value(4), Some(true));
+        assert_watchlists_consistent(&formula);
+    }
+
+    #[test]
     fn ges_reason_uses_count_only_successful_implications_and_survive_backtracking() {
         let mut formula = Formula::from_vec(vec![vec![-1, 2]]);
         formula.get_clause_at_idx_mut(0).ges_generated = true;
@@ -1373,6 +1526,30 @@ mod tests {
         formula.delete_clauses(&[0, 1], &mut logger);
         formula.collect_garbage(None);
         assert_eq!(formula.stats.ges_replacements_deleted_unused, 2);
+    }
+
+    #[test]
+    fn ges_trail_touches_are_deduplicated_cleared_and_remapped() {
+        let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4], vec![5]]);
+        formula.configure_ges_trail_tracking(true);
+        for clause_idx in [4, 1, 4] {
+            formula.record_ges_analysis_use(clause_idx);
+        }
+        assert_eq!(formula.ges_trail_touched, vec![4, 1]);
+        assert_eq!(formula.stats.ges_trail_unique_touches, 2);
+
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        formula.delete_clauses(&[0, 4], &mut logger);
+        formula.collect_garbage(None);
+        assert_eq!(formula.ges_trail_touched, vec![0]);
+        assert_eq!(formula.ges_trail_seen, vec![true, false, false]);
+
+        formula.clear_ges_trail_touched();
+        assert!(formula.ges_trail_touched.is_empty());
+        assert_eq!(formula.ges_trail_seen, vec![false; 3]);
+        formula.record_ges_analysis_use(2);
+        assert_eq!(formula.ges_trail_touched, vec![2]);
+        assert_eq!(formula.stats.ges_trail_unique_touches, 3);
     }
 
     #[test]
@@ -1541,6 +1718,72 @@ mod tests {
             formula.get_clause_at_idx(0).get_literals()[2],
             Literal::new((count / 2 + 3) as i32)
         );
+    }
+
+    #[test]
+    fn reduction_preserves_bva_definitions_and_essential_quotients() {
+        use crate::circuits::factorization::{definition_clause, quotient_clause};
+        let count = DB_REDUCTION_MIN_REMOVABLE_CLAUSES;
+        let literals = [1, 2, 3].map(Literal::new).to_vec();
+        let mut clauses = vec![Clause::from_literals(literals.clone(), 7); count];
+        clauses.push(definition_clause(literals.clone()));
+        clauses.push(quotient_clause(literals.clone()));
+        let mut rewritten = quotient_clause(literals);
+        rewritten.ges_generated = true;
+        rewritten.ges_protection = 0;
+        clauses.push(rewritten);
+        let mut formula = Formula::from_clauses(&clauses);
+        formula.stats.clauses_kept = count as u64;
+        formula
+            .reduce_db::<Empty>(&mut History::new(), &mut None, None)
+            .unwrap();
+        assert_eq!(formula.live_clause_count(), count / 2 + 3);
+        let survivors: Vec<_> = formula
+            .get_clauses()
+            .filter(|(_, clause)| clause.bva_generated)
+            .map(|(_, clause)| (clause.lbd, clause.ges_generated))
+            .collect();
+        assert_eq!(survivors, vec![(0, false), (-1, false), (-1, true)]);
+    }
+
+    #[test]
+    fn reduction_protects_ges_replacements_for_five_complete_scans() {
+        let count = DB_REDUCTION_MIN_REMOVABLE_CLAUSES;
+        let clauses = (0..count)
+            .map(|offset| {
+                let mut clause = Clause::from_literals(
+                    vec![
+                        Literal::new(1),
+                        Literal::new(2),
+                        Literal::new((offset + 3) as i32),
+                    ],
+                    7,
+                );
+                clause.ges_generated = true;
+                clause.ges_protection = 5;
+                clause
+            })
+            .collect::<Vec<_>>();
+        let mut formula = Formula::from_clauses(&clauses);
+        formula.stats.clauses_kept = count as u64;
+        let mut history = History::new();
+
+        for expected in (0..5).rev() {
+            formula
+                .reduce_db::<Empty>(&mut history, &mut None, None)
+                .unwrap();
+            assert_eq!(formula.live_clause_count(), count);
+            assert!(
+                formula
+                    .get_clauses()
+                    .all(|(_, clause)| clause.ges_protection == expected)
+            );
+        }
+
+        formula
+            .reduce_db::<Empty>(&mut history, &mut None, None)
+            .unwrap();
+        assert_eq!(formula.live_clause_count(), count / 2);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::circuits::factorization::{
-    BvaBudget, FACTOR_BOUND, FactorSearch, MAX_FACTOR_CLAUSE_SIZE, claim_clause, generated_clause,
-    is_tautological, literal_tie_key, live_factor_clause, stable_signature_hash,
+    BvaBudget, FACTOR_BOUND, FactorSearch, MAX_FACTOR_CLAUSE_SIZE, claim_clause, definition_clause,
+    is_tautological, literal_tie_key, live_factor_clause, quotient_clause, stable_signature_hash,
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 const GATE_DEFINITION_CLAUSES: usize = 4;
-const MIN_GATE_MATCHES: usize = GATE_DEFINITION_CLAUSES + FACTOR_BOUND;
+const MIN_XOR_MATCHES: usize = GATE_DEFINITION_CLAUSES;
+const MIN_ITE_MATCHES: usize = GATE_DEFINITION_CLAUSES + FACTOR_BOUND;
 
 pub(crate) struct Gate {
     target: i32,
@@ -38,6 +39,10 @@ impl Gate {
         }
     }
 
+    pub(crate) fn factor_score(&self) -> isize {
+        self.clause_saving
+    }
+
     pub(crate) fn clause_saving(&self) -> isize {
         self.clause_saving
     }
@@ -55,6 +60,11 @@ impl Gate {
     ) {
         let z = formula.add_literal();
         formula.stats.add_bva_literal();
+        if self.second == -self.third {
+            formula.stats.bva_xor_factors += 1;
+        } else {
+            formula.stats.bva_ite_factors += 1;
+        }
         formula.extensions.add_ite_definition(
             Literal::new(self.target),
             Literal::new(-self.third),
@@ -88,7 +98,7 @@ impl Gate {
             ],
         ];
         for definition in definitions {
-            formula.add_clause_unchecked(generated_clause(definition), logger);
+            formula.add_clause_unchecked(definition_clause(definition), logger);
         }
 
         for gate_match in &self.matches {
@@ -131,7 +141,7 @@ impl Gate {
                 let _ = log.log_add(second);
             }
 
-            formula.add_clause_unchecked(generated_clause(quotient), logger);
+            formula.add_clause_unchecked(quotient_clause(quotient), logger);
 
             if let (Some(log), Some((first, second))) =
                 (logger.as_mut(), proof_intermediates.as_ref())
@@ -329,7 +339,7 @@ fn group_pairs(pairs: &[ExtractedPair], target: i32, initial_clause_limit: usize
     let mut groups = BTreeMap::<(u32, u32, bool), Vec<ExtractedPair>>::new();
     for &pair in pairs {
         let variable = pair.second_branch.unsigned_abs();
-        if variable_counts.get(&variable).copied().unwrap_or_default() < MIN_GATE_MATCHES {
+        if variable_counts.get(&variable).copied().unwrap_or_default() < MIN_XOR_MATCHES {
             continue;
         }
         let normalized_first = if pair.second_branch.is_positive() {
@@ -372,6 +382,15 @@ fn group_pairs(pairs: &[ExtractedPair], target: i32, initial_clause_limit: usize
             claimed[clause_idx] = false;
         }
 
+        let minimum_matches = if literal == -(variable as i32) {
+            MIN_XOR_MATCHES
+        } else {
+            MIN_ITE_MATCHES
+        };
+        if matches.len() < minimum_matches {
+            continue;
+        }
+
         if best_group
             .as_ref()
             .is_none_or(|(best_variable, best_literal, best_matches)| {
@@ -391,9 +410,8 @@ fn group_pairs(pairs: &[ExtractedPair], target: i32, initial_clause_limit: usize
 
     let (best_variable, best_second, matches) = best_group?;
     let clause_saving = matches.len() as isize - GATE_DEFINITION_CLAUSES as isize;
-    if clause_saving < FACTOR_BOUND as isize {
-        return None;
-    }
+    debug_assert!(clause_saving >= 0);
+    debug_assert!(clause_saving >= FACTOR_BOUND as isize || best_second == -(best_variable as i32));
     debug_assert!(matches.iter().all(|gate_match| {
         gate_match.first_clause < initial_clause_limit
             && gate_match.second_clause < initial_clause_limit
@@ -566,6 +584,8 @@ mod tests {
         assert_eq!(formula.assignment.len(), 16);
         assert_eq!(formula.live_clause_count(), initial_live_clause_count + 9);
         assert_eq!(formula.stats.bva_literals, 1);
+        assert_eq!(formula.stats.bva_ite_factors, 1);
+        assert_eq!(formula.stats.bva_xor_factors, 0);
         assert_eq!(
             formula.extensions.definition(&Literal::new(15)),
             Some(&ExtensionDefinition::Ite {
@@ -596,7 +616,12 @@ mod tests {
                 .get_clauses_and_garbage()
                 .filter(|(physical_index, clause)| {
                     *physical_index >= initial_clause_limit
-                        && clause.lbd == 0
+                        && clause.lbd
+                            == if *physical_index < initial_clause_limit + GATE_DEFINITION_CLAUSES {
+                                0
+                            } else {
+                                -1
+                            }
                         && clause.bva_generated
                 })
                 .count(),
@@ -606,7 +631,7 @@ mod tests {
 
     #[test]
     fn complementary_branches_are_classified_as_xor() {
-        let formula = Formula::from_vec(
+        let mut formula = Formula::from_vec(
             (10..=14)
                 .flat_map(|remainder| [vec![1, -3, remainder], vec![-1, 3, remainder]])
                 .collect(),
@@ -616,6 +641,107 @@ mod tests {
         assert_eq!(gate.second, -gate.third);
         assert_eq!(gate.second, -3);
         assert_eq!(gate.third, 3);
+
+        let mut pending_deleted = vec![false; formula.clause_slots_len()];
+        let mut deletion_indices = Vec::new();
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        gate.apply(
+            &mut formula,
+            &mut logger,
+            &mut pending_deleted,
+            &mut deletion_indices,
+        );
+        assert_eq!(formula.stats.bva_ite_factors, 0);
+        assert_eq!(formula.stats.bva_xor_factors, 1);
+        for (offset, (_, clause)) in formula
+            .get_clauses()
+            .skip(pending_deleted.len())
+            .enumerate()
+        {
+            assert!(clause.bva_generated);
+            assert_eq!(
+                clause.lbd,
+                if offset < GATE_DEFINITION_CLAUSES {
+                    0
+                } else {
+                    -1
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn clause_neutral_four_match_xor_is_accepted() {
+        let mut formula = Formula::from_vec(
+            (10..=13)
+                .flat_map(|remainder| [vec![1, -3, remainder], vec![-1, 3, remainder]])
+                .collect(),
+        );
+        let gate = find_gate(&formula, 1);
+
+        assert_eq!(gate.second, -gate.third);
+        assert_eq!(gate.matches.len(), MIN_XOR_MATCHES);
+        assert_eq!(gate.clause_saving(), 0);
+
+        let initial_clause_count = formula.live_clause_count();
+        let mut pending_deleted = vec![false; formula.clause_slots_len()];
+        let mut deletion_indices = Vec::new();
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        gate.apply(
+            &mut formula,
+            &mut logger,
+            &mut pending_deleted,
+            &mut deletion_indices,
+        );
+
+        assert_eq!(formula.stats.bva_xor_factors, 1);
+        assert_eq!(formula.stats.bva_ite_factors, 0);
+        assert_eq!(deletion_indices.len(), 2 * MIN_XOR_MATCHES);
+        assert_eq!(
+            formula.live_clause_count() - deletion_indices.len(),
+            initial_clause_count
+        );
+    }
+
+    #[test]
+    fn clause_neutral_four_match_ite_is_rejected() {
+        let formula = Formula::from_vec(
+            (10..=13)
+                .flat_map(|remainder| [vec![1, 2, remainder], vec![-1, 3, remainder]])
+                .collect(),
+        );
+        let pending_deleted = vec![false; formula.clause_slots_len()];
+        let mut budget = BvaBudget::new(usize::MAX);
+
+        assert!(matches!(
+            Gate::find(&formula, &pending_deleted, 1, &mut budget),
+            FactorSearch::NotFound
+        ));
+    }
+
+    #[test]
+    fn qualifying_four_match_xor_beats_unprofitable_four_match_ite() {
+        let mut pairs = Vec::new();
+        for offset in 0..4 {
+            pairs.push(ExtractedPair {
+                first_clause: offset * 2,
+                second_clause: offset * 2 + 1,
+                first_branch: -3,
+                second_branch: 3,
+            });
+            pairs.push(ExtractedPair {
+                first_clause: 8 + offset * 2,
+                second_clause: 8 + offset * 2 + 1,
+                first_branch: 2,
+                second_branch: 4,
+            });
+        }
+
+        let gate = group_pairs(&pairs, 1, 16).expect("expected neutral XOR gate");
+
+        assert_eq!(gate.matches.len(), MIN_XOR_MATCHES);
+        assert_eq!(gate.second, -gate.third);
+        assert_eq!(gate.clause_saving(), 0);
     }
 
     #[test]

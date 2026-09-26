@@ -28,6 +28,18 @@ pub struct Stats {
     #[pyo3(get)]
     pub extension_literals: u64,
     #[pyo3(get)]
+    pub dip_candidates_found: u64,
+    #[pyo3(get)]
+    pub dip_unit_post_clauses: u64,
+    #[pyo3(get)]
+    pub dip_glue_post_clauses: u64,
+    #[pyo3(get)]
+    pub dip_lbd_rejections: u64,
+    #[pyo3(get)]
+    pub dip_assigned_extension_rejections: u64,
+    #[pyo3(get)]
+    pub dip_uip_fallbacks: u64,
+    #[pyo3(get)]
     pub guidance_checks: u64,
     #[pyo3(get)]
     pub guidance_matches: u64,
@@ -52,6 +64,22 @@ pub struct Stats {
     #[pyo3(get)]
     pub bva_budget_exhaustions: u64,
     #[pyo3(get)]
+    pub bva_budget_increases: u64,
+    #[pyo3(get)]
+    pub bva_budget_decreases: u64,
+    #[pyo3(get)]
+    pub bva_current_budget: u64,
+    #[pyo3(get)]
+    pub bva_peak_budget: u64,
+    #[pyo3(get)]
+    pub bva_binary_and_factors: u64,
+    #[pyo3(get)]
+    pub bva_non_binary_and_factors: u64,
+    #[pyo3(get)]
+    pub bva_ite_factors: u64,
+    #[pyo3(get)]
+    pub bva_xor_factors: u64,
+    #[pyo3(get)]
     pub bve_eliminated_variables: u64,
     #[pyo3(get)]
     pub bve_resolvents: u64,
@@ -70,13 +98,63 @@ pub struct Stats {
     #[pyo3(get)]
     pub ges_vsids_improvements: u64,
     #[pyo3(get)]
+    pub ges_utility_improvements: u64,
+    #[pyo3(get)]
     pub ges_literals_removed: u64,
+    #[pyo3(get)]
+    pub ges_binary_clauses_compressed: u64,
+    #[pyo3(get)]
+    pub ges_clauses_unrolled: u64,
+    #[pyo3(get)]
+    pub ges_dip_extensions_unrolled: u64,
+    #[pyo3(get)]
+    pub ges_bva_extensions_unrolled: u64,
+    #[pyo3(get)]
+    pub ges_other_extensions_unrolled: u64,
+    #[pyo3(get)]
+    pub ges_unrolled_source_literals: u64,
+    #[pyo3(get)]
+    pub ges_unrolled_working_literals: u64,
+    #[pyo3(get)]
+    pub ges_substitutions_after_unrolling: u64,
+    #[pyo3(get)]
+    pub ges_substitutions_to_dip: u64,
+    #[pyo3(get)]
+    pub ges_substitutions_to_bva: u64,
+    #[pyo3(get)]
+    pub ges_substitutions_to_other: u64,
+    #[pyo3(get)]
+    pub ges_rewrites_after_unrolling: u64,
+    #[pyo3(get)]
+    pub ges_rerolled_rewrites_after_unrolling: u64,
+    #[pyo3(get)]
+    pub ges_unrolled_rewrites_rejected: u64,
+    #[pyo3(get)]
+    pub ges_unrolled_rewrites_restored: u64,
+    #[pyo3(get)]
+    pub ges_replacements_used: u64,
     #[pyo3(get)]
     pub ges_replacement_reason_uses: u64,
     #[pyo3(get)]
     pub ges_replacement_analysis_uses: u64,
     #[pyo3(get)]
     pub ges_replacements_deleted_unused: u64,
+    #[pyo3(get)]
+    pub ges_budget_increases: u64,
+    #[pyo3(get)]
+    pub ges_budget_decreases: u64,
+    #[pyo3(get)]
+    pub ges_current_budget: u64,
+    #[pyo3(get)]
+    pub ges_peak_budget: u64,
+    #[pyo3(get)]
+    pub ges_trail_unique_touches: u64,
+    #[pyo3(get)]
+    pub ges_trail_clauses_selected: u64,
+    #[pyo3(get)]
+    pub ges_trail_cursor_selected: u64,
+    #[pyo3(get)]
+    pub ges_trail_duplicate_skips: u64,
     pub learnt_clause_literals_kept: u64,
     pub preprocess_nanos: u128,
     pub solve_nanos: u128,
@@ -105,6 +183,12 @@ impl Stats {
             clauses_kept: 0,
             literals_learnt: 0,
             extension_literals: 0,
+            dip_candidates_found: 0,
+            dip_unit_post_clauses: 0,
+            dip_glue_post_clauses: 0,
+            dip_lbd_rejections: 0,
+            dip_assigned_extension_rejections: 0,
+            dip_uip_fallbacks: 0,
             guidance_checks: 0,
             guidance_matches: 0,
             guidance_unique_matches: 0,
@@ -117,6 +201,14 @@ impl Stats {
             bva_clauses_saved: 0,
             bva_source_clauses_replaced: 0,
             bva_budget_exhaustions: 0,
+            bva_budget_increases: 0,
+            bva_budget_decreases: 0,
+            bva_current_budget: 0,
+            bva_peak_budget: 0,
+            bva_binary_and_factors: 0,
+            bva_non_binary_and_factors: 0,
+            bva_ite_factors: 0,
+            bva_xor_factors: 0,
             bve_eliminated_variables: 0,
             bve_resolvents: 0,
             avg_clause_length: 0.0,
@@ -126,10 +218,35 @@ impl Stats {
             ges_rewrites_rejected: 0,
             ges_lbd_improvements: 0,
             ges_vsids_improvements: 0,
+            ges_utility_improvements: 0,
             ges_literals_removed: 0,
+            ges_binary_clauses_compressed: 0,
+            ges_clauses_unrolled: 0,
+            ges_dip_extensions_unrolled: 0,
+            ges_bva_extensions_unrolled: 0,
+            ges_other_extensions_unrolled: 0,
+            ges_unrolled_source_literals: 0,
+            ges_unrolled_working_literals: 0,
+            ges_substitutions_after_unrolling: 0,
+            ges_substitutions_to_dip: 0,
+            ges_substitutions_to_bva: 0,
+            ges_substitutions_to_other: 0,
+            ges_rewrites_after_unrolling: 0,
+            ges_rerolled_rewrites_after_unrolling: 0,
+            ges_unrolled_rewrites_rejected: 0,
+            ges_unrolled_rewrites_restored: 0,
+            ges_replacements_used: 0,
             ges_replacement_reason_uses: 0,
             ges_replacement_analysis_uses: 0,
             ges_replacements_deleted_unused: 0,
+            ges_budget_increases: 0,
+            ges_budget_decreases: 0,
+            ges_current_budget: 0,
+            ges_peak_budget: 0,
+            ges_trail_unique_touches: 0,
+            ges_trail_clauses_selected: 0,
+            ges_trail_cursor_selected: 0,
+            ges_trail_duplicate_skips: 0,
             learnt_clause_literals_kept: 0,
             preprocess_nanos: 0,
             solve_nanos: 0,
@@ -150,7 +267,10 @@ impl Stats {
     /// to a GES replacement. Repeated uses count even after `ges_used` is set.
     pub fn record_ges_reason_use(&mut self, clause: &mut Clause) {
         if clause.ges_generated {
-            clause.ges_used = true;
+            if !clause.ges_used {
+                self.ges_replacements_used += 1;
+                clause.ges_used = true;
+            }
             self.ges_replacement_reason_uses += 1;
         }
     }
@@ -159,7 +279,10 @@ impl Stats {
     /// (including the conflict clause), not subsequent minimization/DIP rereads.
     pub fn record_ges_analysis_use(&mut self, clause: &mut Clause) {
         if clause.ges_generated {
-            clause.ges_used = true;
+            if !clause.ges_used {
+                self.ges_replacements_used += 1;
+                clause.ges_used = true;
+            }
             self.ges_replacement_analysis_uses += 1;
         }
     }
@@ -374,6 +497,20 @@ impl Stats {
             )
         );
         let guidance_progress_s = format!("{:>40}", self.guidance_best_progress);
+        let dip_rows = [
+            ("DIP candidates found", self.dip_candidates_found),
+            ("DIP unit post clauses", self.dip_unit_post_clauses),
+            ("DIP glue post clauses", self.dip_glue_post_clauses),
+            ("DIP LBD rejections", self.dip_lbd_rejections),
+            (
+                "DIP assigned ext rejects",
+                self.dip_assigned_extension_rejections,
+            ),
+            ("DIP UIP fallbacks", self.dip_uip_fallbacks),
+        ]
+        .into_iter()
+        .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
+        .collect::<String>();
         let bva_lits_s = format!("{:>40}", self.bva_literals);
         let bva_rows = [
             ("BVA candidates attempted", self.bva_candidates_attempted),
@@ -381,6 +518,17 @@ impl Stats {
             ("BVA clauses saved", self.bva_clauses_saved),
             ("BVA sources replaced", self.bva_source_clauses_replaced),
             ("BVA budget exhaustions", self.bva_budget_exhaustions),
+            ("BVA budget increases", self.bva_budget_increases),
+            ("BVA budget decreases", self.bva_budget_decreases),
+            ("BVA current budget", self.bva_current_budget),
+            ("BVA peak budget", self.bva_peak_budget),
+            ("BVA binary AND factors", self.bva_binary_and_factors),
+            (
+                "BVA non-binary AND factors",
+                self.bva_non_binary_and_factors,
+            ),
+            ("BVA ITE factors", self.bva_ite_factors),
+            ("BVA XOR factors", self.bva_xor_factors),
         ]
         .into_iter()
         .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
@@ -435,10 +583,62 @@ impl Stats {
             ("GES rewrites rejected", self.ges_rewrites_rejected),
             ("GES LBD improvements", self.ges_lbd_improvements),
             ("GES VSIDS improvements", self.ges_vsids_improvements),
+            ("GES utility improvements", self.ges_utility_improvements),
             ("GES literals removed", self.ges_literals_removed),
+            ("GES binary compressed", self.ges_binary_clauses_compressed),
+            ("GES clauses unrolled", self.ges_clauses_unrolled),
+            (
+                "GES DIP extensions unrolled",
+                self.ges_dip_extensions_unrolled,
+            ),
+            (
+                "GES BVA extensions unrolled",
+                self.ges_bva_extensions_unrolled,
+            ),
+            ("GES other ext unrolled", self.ges_other_extensions_unrolled),
+            (
+                "GES unrolled source lits",
+                self.ges_unrolled_source_literals,
+            ),
+            (
+                "GES unrolled working lits",
+                self.ges_unrolled_working_literals,
+            ),
+            (
+                "GES post-unroll subs",
+                self.ges_substitutions_after_unrolling,
+            ),
+            ("GES substitutions to DIP", self.ges_substitutions_to_dip),
+            ("GES substitutions to BVA", self.ges_substitutions_to_bva),
+            (
+                "GES substitutions to other",
+                self.ges_substitutions_to_other,
+            ),
+            (
+                "GES rewrites after unroll",
+                self.ges_rewrites_after_unrolling,
+            ),
+            (
+                "GES rerolled rewrites",
+                self.ges_rerolled_rewrites_after_unrolling,
+            ),
+            ("GES unrolled rejected", self.ges_unrolled_rewrites_rejected),
+            ("GES unrolled restored", self.ges_unrolled_rewrites_restored),
+            ("GES replacements used", self.ges_replacements_used),
             ("GES reason uses", self.ges_replacement_reason_uses),
             ("GES analysis uses", self.ges_replacement_analysis_uses),
             ("GES deleted unused", self.ges_replacements_deleted_unused),
+            ("GES budget increases", self.ges_budget_increases),
+            ("GES budget decreases", self.ges_budget_decreases),
+            ("GES current budget", self.ges_current_budget),
+            ("GES peak budget", self.ges_peak_budget),
+            ("GES trail unique touches", self.ges_trail_unique_touches),
+            (
+                "GES trail clauses selected",
+                self.ges_trail_clauses_selected,
+            ),
+            ("GES trail cursor selected", self.ges_trail_cursor_selected),
+            ("GES trail duplicate skips", self.ges_trail_duplicate_skips),
         ]
         .into_iter()
         .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
@@ -465,6 +665,7 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
+                 {dip_rows}\
                  {bva_rows}\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
@@ -617,6 +818,34 @@ mod tests {
     use crate::formula::literal::Literal;
 
     #[test]
+    fn dip_counters_have_zero_readonly_python_getters_and_display_rows() {
+        let fields = [
+            ("dip_candidates_found", "DIP candidates found"),
+            ("dip_unit_post_clauses", "DIP unit post clauses"),
+            ("dip_glue_post_clauses", "DIP glue post clauses"),
+            ("dip_lbd_rejections", "DIP LBD rejections"),
+            (
+                "dip_assigned_extension_rejections",
+                "DIP assigned ext rejects",
+            ),
+            ("dip_uip_fallbacks", "DIP UIP fallbacks"),
+        ];
+        Python::initialize();
+        Python::attach(|py| {
+            let stats = Py::new(py, Stats::new()).unwrap();
+            let bound = stats.bind(py);
+            let display = stats.borrow(py).__str__();
+            for (field, label) in fields {
+                assert_eq!(bound.getattr(field).unwrap().extract::<u64>().unwrap(), 0);
+                assert!(bound.setattr(field, 1).is_err());
+                assert!(display.contains(label));
+                assert!(include_str!("../../tests/run.py").contains(field));
+                assert!(include_str!("../../clsat/clsat.pyi").contains(field));
+            }
+        });
+    }
+
+    #[test]
     fn bva_counters_have_zero_readonly_python_getters_and_display_rows() {
         let fields = [
             ("bva_candidates_attempted", "BVA candidates attempted"),
@@ -624,6 +853,14 @@ mod tests {
             ("bva_clauses_saved", "BVA clauses saved"),
             ("bva_source_clauses_replaced", "BVA sources replaced"),
             ("bva_budget_exhaustions", "BVA budget exhaustions"),
+            ("bva_budget_increases", "BVA budget increases"),
+            ("bva_budget_decreases", "BVA budget decreases"),
+            ("bva_current_budget", "BVA current budget"),
+            ("bva_peak_budget", "BVA peak budget"),
+            ("bva_binary_and_factors", "BVA binary AND factors"),
+            ("bva_non_binary_and_factors", "BVA non-binary AND factors"),
+            ("bva_ite_factors", "BVA ITE factors"),
+            ("bva_xor_factors", "BVA XOR factors"),
         ];
         Python::initialize();
         Python::attach(|py| {
@@ -648,10 +885,38 @@ mod tests {
             ("ges_rewrites_rejected", "GES rewrites rejected"),
             ("ges_lbd_improvements", "GES LBD improvements"),
             ("ges_vsids_improvements", "GES VSIDS improvements"),
+            ("ges_utility_improvements", "GES utility improvements"),
             ("ges_literals_removed", "GES literals removed"),
+            ("ges_binary_clauses_compressed", "GES binary compressed"),
+            ("ges_clauses_unrolled", "GES clauses unrolled"),
+            ("ges_dip_extensions_unrolled", "GES DIP extensions unrolled"),
+            ("ges_bva_extensions_unrolled", "GES BVA extensions unrolled"),
+            ("ges_other_extensions_unrolled", "GES other ext unrolled"),
+            ("ges_unrolled_source_literals", "GES unrolled source lits"),
+            ("ges_unrolled_working_literals", "GES unrolled working lits"),
+            ("ges_substitutions_after_unrolling", "GES post-unroll subs"),
+            ("ges_substitutions_to_dip", "GES substitutions to DIP"),
+            ("ges_substitutions_to_bva", "GES substitutions to BVA"),
+            ("ges_substitutions_to_other", "GES substitutions to other"),
+            ("ges_rewrites_after_unrolling", "GES rewrites after unroll"),
+            (
+                "ges_rerolled_rewrites_after_unrolling",
+                "GES rerolled rewrites",
+            ),
+            ("ges_unrolled_rewrites_rejected", "GES unrolled rejected"),
+            ("ges_unrolled_rewrites_restored", "GES unrolled restored"),
+            ("ges_replacements_used", "GES replacements used"),
             ("ges_replacement_reason_uses", "GES reason uses"),
             ("ges_replacement_analysis_uses", "GES analysis uses"),
             ("ges_replacements_deleted_unused", "GES deleted unused"),
+            ("ges_budget_increases", "GES budget increases"),
+            ("ges_budget_decreases", "GES budget decreases"),
+            ("ges_current_budget", "GES current budget"),
+            ("ges_peak_budget", "GES peak budget"),
+            ("ges_trail_unique_touches", "GES trail unique touches"),
+            ("ges_trail_clauses_selected", "GES trail clauses selected"),
+            ("ges_trail_cursor_selected", "GES trail cursor selected"),
+            ("ges_trail_duplicate_skips", "GES trail duplicate skips"),
         ];
         Python::initialize();
         Python::attach(|py| {
@@ -684,6 +949,7 @@ mod tests {
         stats.record_ges_reason_use(&mut clause);
         stats.record_ges_analysis_use(&mut clause);
         assert!(!clause.ges_used);
+        assert_eq!(stats.ges_replacements_used, 0);
         assert_eq!(stats.ges_replacement_reason_uses, 0);
         assert_eq!(stats.ges_replacement_analysis_uses, 0);
         clause.ges_generated = true;
@@ -692,8 +958,10 @@ mod tests {
             stats.record_ges_reason_use(&mut clause);
         }
         assert!(clause.ges_used);
+        assert_eq!(stats.ges_replacements_used, 1);
         assert_eq!(stats.ges_replacement_reason_uses, 2);
         stats.record_ges_analysis_use(&mut clause);
+        assert_eq!(stats.ges_replacements_used, 1);
         assert_eq!(stats.ges_replacement_analysis_uses, 1);
     }
 }

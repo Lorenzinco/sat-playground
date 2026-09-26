@@ -22,6 +22,7 @@ pub struct Clause {
     pub lbd: i16,
     pub activity: u8,
     pub lock_count: u8,
+    pub ges_protection: u8,
     pub bva_generated: bool,
     pub ges_generated: bool,
     pub ges_used: bool,
@@ -81,6 +82,7 @@ impl Clause {
                 0
             },
             lock_count: 0,
+            ges_protection: 0,
             bva_generated,
             ges_generated: false,
             ges_used: false,
@@ -95,6 +97,7 @@ impl Clause {
             lbd,
             activity: if lbd > 0 { Self::MAX_ACTIVITY } else { 0 },
             lock_count: 0,
+            ges_protection: 0,
             bva_generated: false,
             ges_generated: false,
             ges_used: false,
@@ -164,6 +167,20 @@ impl Clause {
             [] => None,
             [first] => Some((first, None)),
             [first, second, ..] => Some((first, Some(second))),
+        }
+    }
+
+    pub(crate) fn prioritize_unfalsified_watches(&mut self, assignment: &Assignment) {
+        let mut watch = 0;
+        for candidate in 0..self.literals.len() {
+            if self.literals[candidate].eval(assignment) == Some(false) {
+                continue;
+            }
+            self.literals.swap(watch, candidate);
+            watch += 1;
+            if watch == 2 {
+                break;
+            }
         }
     }
 
@@ -320,15 +337,19 @@ mod tests {
             CreationType::ProblemText,
         ] {
             let clause = Clause::new(vec![Literal::new(1)], 1, creation);
+            assert_eq!(clause.ges_protection, 0);
             assert!(!clause.ges_generated);
             assert!(!clause.ges_used);
         }
         let mut clause = Clause::from_literals(vec![Literal::new(1)], 1);
+        assert_eq!(clause.ges_protection, 0);
         assert!(!clause.ges_generated);
         assert!(!clause.ges_used);
+        clause.ges_protection = 5;
         clause.ges_generated = true;
         clause.ges_used = true;
         let cloned = clause.clone();
+        assert_eq!(cloned.ges_protection, 5);
         assert!(cloned.ges_generated && cloned.ges_used);
         assert_eq!(size_of::<Clause>(), 24);
     }
@@ -432,6 +453,22 @@ mod tests {
         clause.add_literals(&vec![Literal::new(1)]).unwrap();
         assert!(clause.add_literals(&vec![Literal::new(1)]).is_err());
         assert_eq!(clause.get_literals(), &[Literal::new(1)]);
+    }
+
+    #[test]
+    fn watch_initialization_prioritizes_two_unfalsified_literals() {
+        let mut assignment = Assignment::new(5);
+        assignment.assign_literal(Literal::new(-1));
+        assignment.assign_literal(Literal::new(-2));
+        let mut clause = Clause::from_literals([1, 2, 3, 4].map(Literal::new).to_vec(), 0);
+
+        clause.prioritize_unfalsified_watches(&assignment);
+
+        assert_eq!(
+            clause.watched_literals(),
+            Some((&Literal::new(3), Some(&Literal::new(4))))
+        );
+        assert_eq!(size_of::<Clause>(), 24);
     }
 
     #[test]

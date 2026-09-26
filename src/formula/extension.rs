@@ -8,6 +8,20 @@ use std::io::Write;
 
 /// A deterministic value that can be assigned to an extension variable when a
 /// model is reconstructed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExtensionOrigin {
+    Dip,
+    Bva,
+    #[default]
+    Other,
+}
+
+#[derive(Clone, Copy)]
+struct ExactSubstitution {
+    inputs: (i32, i32),
+    origin: ExtensionOrigin,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtensionDefinition {
     And(Vec<Literal>),
@@ -21,9 +35,13 @@ pub enum ExtensionDefinition {
 #[derive(Clone, Default)]
 pub struct ExtensionMap {
     substitutions: HashMap<(i32, i32), i32>,
-    substitution_inputs: HashMap<i32, (i32, i32)>,
+    substitution_inputs: HashMap<i32, ExactSubstitution>,
     substitution_partners: HashMap<i32, BTreeMap<i32, i32>>,
     definitions: BTreeMap<u32, ExtensionDefinition>,
+    literal_utility: Vec<f64>,
+    utility_increment: f64,
+    utility_conflict_epoch: u64,
+    utility_seen_epoch: Vec<u64>,
 }
 
 impl ExtensionMap {
@@ -33,10 +51,9 @@ impl ExtensionMap {
 
     /// Returns an exact, reusable binary-AND extension for the two literals.
     ///
-    /// Not every registered definition is indexed as a substitution. In
-    /// particular, BVA's AND-grid encoding permits the auxiliary variable to be
-    /// underconstrained, so it is recorded for model reconstruction but must not
-    /// be reused as an equivalence by conflict learning.
+    /// Not every registered definition is indexed as a substitution. Binary BVA
+    /// AND grids add the reverse implication and are exact; larger BVA ANDs and
+    /// ITE definitions remain model-only and are not reusable through this map.
     pub fn substitute(&self, lit1: &Literal, lit2: &Literal) -> Option<Literal> {
         self.substitutions
             .get(&ordered_pair(lit1.get_index(), lit2.get_index()))
@@ -46,13 +63,27 @@ impl ExtensionMap {
 
     /// Returns the inputs of an active exact binary-AND substitution.
     ///
-    /// This deliberately excludes model-only BVA and ITE definitions. A negated
-    /// substitute can be expanded in a clause using De Morgan's law.
+    /// This deliberately excludes model-only non-binary BVA and ITE definitions.
+    /// A negated substitute can be expanded in a clause using De Morgan's law.
     pub fn substitution_inputs(&self, substitute: &Literal) -> Option<(Literal, Literal)> {
+        self.substitution_inputs_with_origin(substitute)
+            .map(|(first, second, _)| (first, second))
+    }
+
+    pub(crate) fn substitution_inputs_with_origin(
+        &self,
+        substitute: &Literal,
+    ) -> Option<(Literal, Literal, ExtensionOrigin)> {
         self.substitution_inputs
             .get(&substitute.get_index())
-            .copied()
-            .map(|(first, second)| (Literal::new(first), Literal::new(second)))
+            .map(|substitution| {
+                let (first, second) = substitution.inputs;
+                (
+                    Literal::new(first),
+                    Literal::new(second),
+                    substitution.origin,
+                )
+            })
     }
 
     /// Returns `(partner, replacement)` for active exact binary-AND pairs
@@ -87,7 +118,114 @@ impl ExtensionMap {
         self.definitions.is_empty()
     }
 
+    /// Records a successful implication without affecting the branching heuristic.
+    pub(crate) fn bump_propagation_utility(&mut self, literal: &Literal) {
+        self.bump_literal_utility(literal);
+    }
+
+    /// Starts one conflict epoch. A signed literal is counted at most once even
+    /// when it occurs in several clauses traversed by the analysis.
+    pub(crate) fn begin_conflict_utility(&mut self) {
+        self.utility_conflict_epoch = self.utility_conflict_epoch.wrapping_add(1);
+        if self.utility_conflict_epoch == 0 {
+            self.utility_seen_epoch.fill(0);
+            self.utility_conflict_epoch = 1;
+        }
+    }
+
+    pub(crate) fn bump_conflict_utility(&mut self, literal: &Literal) {
+        let index = literal.get_unsigned_index() as usize;
+        self.ensure_utility_index(index);
+        if self.utility_seen_epoch[index] == self.utility_conflict_epoch {
+            return;
+        }
+        self.utility_seen_epoch[index] = self.utility_conflict_epoch;
+        self.bump_literal_utility(literal);
+    }
+
+    /// EVSIDS-style lazy decay: newer propagation and conflict events receive a
+    /// larger increment, avoiding a full scan of all literal scores per conflict.
+    pub(crate) fn decay_literal_utility(&mut self) {
+        const UTILITY_DECAY: f64 = 0.95;
+        self.ensure_utility_increment();
+        if self.utility_increment / UTILITY_DECAY > 1e150 {
+            self.rescale_literal_utility();
+        }
+        self.utility_increment /= UTILITY_DECAY;
+    }
+
+    pub(crate) fn literal_utility(&self, literal: &Literal) -> f64 {
+        self.literal_utility
+            .get(literal.get_unsigned_index() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    fn bump_literal_utility(&mut self, literal: &Literal) {
+        let index = literal.get_unsigned_index() as usize;
+        self.ensure_utility_index(index);
+        self.ensure_utility_increment();
+        if self.literal_utility[index] + self.utility_increment > 1e150 {
+            self.rescale_literal_utility();
+        }
+        self.literal_utility[index] += self.utility_increment;
+    }
+
+    fn ensure_utility_index(&mut self, index: usize) {
+        if index >= self.literal_utility.len() {
+            self.literal_utility.resize(index + 1, 0.0);
+            self.utility_seen_epoch.resize(index + 1, 0);
+        }
+    }
+
+    fn ensure_utility_increment(&mut self) {
+        if self.utility_increment == 0.0 {
+            self.utility_increment = 1.0;
+        }
+    }
+
+    fn rescale_literal_utility(&mut self) {
+        let divider = self
+            .literal_utility
+            .iter()
+            .copied()
+            .fold(self.utility_increment, f64::max);
+        let factor = 1.0 / divider;
+        for score in &mut self.literal_utility {
+            *score *= factor;
+        }
+        self.utility_increment *= factor;
+    }
+
     pub fn add_substitution(&mut self, lit1: &Literal, lit2: &Literal, substitute: &Literal) {
+        self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Other);
+    }
+
+    pub(crate) fn add_dip_substitution(
+        &mut self,
+        lit1: &Literal,
+        lit2: &Literal,
+        substitute: &Literal,
+    ) {
+        self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Dip);
+    }
+
+    pub(crate) fn add_bva_substitution(
+        &mut self,
+        lit1: &Literal,
+        lit2: &Literal,
+        substitute: &Literal,
+    ) {
+        self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Bva);
+    }
+
+    fn add_substitution_with_origin(
+        &mut self,
+        lit1: &Literal,
+        lit2: &Literal,
+        substitute: &Literal,
+        origin: ExtensionOrigin,
+    ) {
         let inputs = ordered_pair(lit1.get_index(), lit2.get_index());
         let replacement = substitute.get_index();
         if let Some(previous) = self.substitutions.get(&inputs).copied() {
@@ -103,8 +241,16 @@ impl ExtensionMap {
                 .insert(partner, replacement);
         }
         self.substitution_inputs
-            .insert(substitute.get_index(), inputs);
+            .insert(substitute.get_index(), ExactSubstitution { inputs, origin });
         self.add_and_definition(vec![*lit1, *lit2], substitute);
+    }
+
+    pub(crate) fn substitution_origin(&self, substitute: &Literal) -> Option<ExtensionOrigin> {
+        let index = substitute.get_index();
+        self.substitution_inputs
+            .get(&index)
+            .or_else(|| self.substitution_inputs.get(&-index))
+            .map(|substitution| substitution.origin)
     }
 
     /// Prevents conflict learning from reusing a substitution variable that BVE
@@ -122,9 +268,10 @@ impl ExtensionMap {
     }
 
     fn remove_substitution(&mut self, replacement: i32) {
-        let Some(inputs) = self.substitution_inputs.remove(&replacement) else {
+        let Some(substitution) = self.substitution_inputs.remove(&replacement) else {
             return;
         };
+        let inputs = substitution.inputs;
         self.substitutions.remove(&inputs);
         for (input, partner) in [inputs, (inputs.1, inputs.0)] {
             if let Some(partners) = self.substitution_partners.get_mut(&input) {
@@ -185,7 +332,7 @@ pub fn extension_literal<W: Write>(
 
     let z = formula.add_literal();
     formula.stats.add_extension_literal();
-    formula.extensions.add_substitution(x, y, &z);
+    formula.extensions.add_dip_substitution(x, y, &z);
 
     formula.add_clause(
         Clause::from_literals(vec![z, x.negated(), y.negated()], 0),
@@ -223,6 +370,27 @@ mod tests {
             &Literal::new(second),
             &Literal::new(replacement),
         );
+    }
+
+    #[test]
+    fn literal_utility_is_signed_recent_and_deduplicated_per_conflict() {
+        let mut extensions = ExtensionMap::new();
+        let positive = Literal::new(2);
+        let negative = positive.negated();
+
+        extensions.bump_propagation_utility(&positive);
+        assert_eq!(extensions.literal_utility(&positive), 1.0);
+        assert_eq!(extensions.literal_utility(&negative), 0.0);
+
+        extensions.begin_conflict_utility();
+        extensions.bump_conflict_utility(&negative);
+        extensions.bump_conflict_utility(&negative);
+        assert_eq!(extensions.literal_utility(&negative), 1.0);
+        extensions.decay_literal_utility();
+
+        extensions.bump_propagation_utility(&positive);
+        assert!(extensions.literal_utility(&positive) > 2.0);
+        assert_eq!(extensions.literal_utility(&negative), 1.0);
     }
 
     #[test]
@@ -339,6 +507,31 @@ mod tests {
         assert_eq!(
             extensions.definition(&z),
             Some(&ExtensionDefinition::And(vec![x, y]))
+        );
+    }
+
+    #[test]
+    fn exact_substitutions_retain_their_creation_origin() {
+        let mut extensions = ExtensionMap::new();
+        extensions.add_dip_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(10));
+        extensions.add_bva_substitution(&Literal::new(3), &Literal::new(4), &Literal::new(11));
+        extensions.add_substitution(&Literal::new(5), &Literal::new(6), &Literal::new(12));
+
+        assert_eq!(
+            extensions.substitution_origin(&Literal::new(10)),
+            Some(ExtensionOrigin::Dip)
+        );
+        assert_eq!(
+            extensions.substitution_origin(&Literal::new(-10)),
+            Some(ExtensionOrigin::Dip)
+        );
+        assert_eq!(
+            extensions.substitution_origin(&Literal::new(11)),
+            Some(ExtensionOrigin::Bva)
+        );
+        assert_eq!(
+            extensions.substitution_origin(&Literal::new(12)),
+            Some(ExtensionOrigin::Other)
         );
     }
 

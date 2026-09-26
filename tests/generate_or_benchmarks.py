@@ -1,4 +1,4 @@
-"""Generate 800 reproducible OR-substituted instances; never runs a solver.
+"""Generate the reproducible OR-substituted Tseitin instances; never runs a solver.
 
 Run: python -m tests.generate_or_benchmarks
 Existing files are preserved, allowing interrupted generation to resume.
@@ -33,20 +33,6 @@ def specifications():
             "tseitin", "first", "grid", str(rows), str(cols), "-T", "or", "2"
         ], {"rows": rows, "columns": cols, "vertices": rows * cols, "charge": "first"}
 
-    for family, generator, sizes in (
-        ("ordering-or2", "op", range(5, 45)),
-        ("pigeonhole-or2", "php", range(2, 42)),
-    ):
-        for n in sizes:
-            for seed in range(1, 6):
-                base = ["op", str(n)] if generator == "op" else ["php", str(n + 1), str(n)]
-                # Preserve signs so the OR encoding stays recognizable; vary only order.
-                args = base + ["-T", "or", "2", "-T", "shuffle", "--no-polarity-flips"]
-                yield family, "{}-n{:03d}-s{}.cnf".format(generator, n, seed), seed, args, {
-                    "elements" if generator == "op" else "holes": n,
-                    "shuffle_seed": seed,
-                    "variant": "variable and clause permutation of the same size-n formula",
-                }
 
 
 def generate(spec):
@@ -86,17 +72,18 @@ def main():
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     version = subprocess.check_output([str(CNFGEN), "--version"], text=True).strip()
+    specs = list(specifications())
     grouped = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        for count, (family, result) in enumerate(pool.map(generate, specifications()), 1):
+        for count, (family, result) in enumerate(pool.map(generate, specs), 1):
             grouped.setdefault(family, []).append(result)
             if count % 50 == 0:
-                print("Generated/verified {}/800".format(count), flush=True)
+                print("Generated/verified {}/{}".format(count, len(specs)), flush=True)
     for family, results in grouped.items():
         manifest = {
             "generator": version,
             "expected": "unsat",
-            "notes": "OR substitution preserves satisfiability. Ordering/pigeonhole seeds are permutations, not independent structural instances.",
+            "notes": "OR substitution preserves satisfiability; seeded random regular graphs provide independent Tseitin instances.",
             "instances": results,
         }
         (ROOT / family / "manifest.json").write_text(

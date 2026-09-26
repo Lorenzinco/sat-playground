@@ -3,12 +3,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.compare_benchmarks import (
     comparison_rows,
     main as compare_main,
     pairwise_summary,
+    plot_overlaid_cactus,
     problem_families,
 )
 
@@ -75,6 +76,31 @@ class CompareBenchmarksTests(unittest.TestCase):
         self.assertAlmostEqual(
             summary["second_speedup_vs_first"]["geometric_mean"], 2.0
         )
+
+    def test_cactus_uses_solved_instances_on_x_and_runtime_on_y(self) -> None:
+        plt = Mock()
+        figure = Mock()
+        axis = Mock()
+        plt.subplots.return_value = (figure, axis)
+        methods = {
+            method: [{"status": "completed", "wall_seconds": 2.0}]
+            for method in ("base", "ges", "ges_lbd")
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            plot_overlaid_cactus(
+                plt,
+                "overall",
+                methods,
+                Path(temporary) / "cactus.png",
+                10.0,
+            )
+
+        x_values, y_values = axis.step.call_args_list[0].args[:2]
+        self.assertEqual(x_values, [0, 1, 1])
+        self.assertEqual(y_values, [0.0, 2.0, 10.0])
+        axis.set_xlabel.assert_called_once_with("number of solved instances")
+        axis.set_ylabel.assert_called_once_with("individual wall runtime (seconds)")
 
     def test_script_generates_family_and_overall_outputs_without_solving(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

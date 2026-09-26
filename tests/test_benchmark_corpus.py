@@ -10,9 +10,10 @@ from unittest.mock import Mock, call, patch
 from tests import benchmark as corpus
 from tests import run as runner
 from tests.benchmark import PROCESS_CHOICES, parse_args, solver_config
+from tests.plot import cactus_coordinates
 
 
-METHODS = ("base", "ges", "ges_always", "ges_lbd", "ges_random", "ges_par", "ges_vsids")
+METHODS = ("base", "ges", "ges_always", "ges_lbd", "ges_random", "ges_par", "ges_vsids", "ges_utility")
 
 
 class RecordingBar:
@@ -151,7 +152,7 @@ class BenchmarkExportTests(unittest.TestCase):
         solver = Mock(model=[True], stats=stats)
         clsat = Mock()
         clsat.Sat.return_value = solver
-        config = solver_config(parse_args([]), "ges_vsids")
+        config = solver_config(parse_args(["--no-bva"]), "ges_vsids")
         metadata = {"problem": "family/one.cnf", "family": "family", "expected": "sat"}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -165,6 +166,30 @@ class BenchmarkExportTests(unittest.TestCase):
         summary = corpus.aggregate_results("family", [result])
         self.assertEqual(summary["average_counters"]["ges_vsids_improvements"], 7)
 
+    def test_utility_improvements_are_exported_and_aggregated(self):
+        stats = Mock()
+        for field in runner.COUNTER_FIELDS:
+            setattr(stats, field, 0)
+        stats.ges_utility_improvements = 11
+        for _, method in runner.RUNTIME_METHODS:
+            getattr(stats, method).return_value = 0
+        solver = Mock(model=[True], stats=stats)
+        clsat = Mock()
+        clsat.Sat.return_value = solver
+        config = solver_config(parse_args(["--no-bva"]), "ges_utility")
+        metadata = {"problem": "family/one.cnf", "family": "family", "expected": "sat"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "one.cnf", root / "result.json"
+            source.write_text("p cnf 1 1\n1 0\n", encoding="utf-8")
+            with patch.dict("sys.modules", {"clsat": clsat}):
+                self.assertEqual(runner.run_worker(source, output, config, metadata), 0)
+            result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(result["counters"]["ges_utility_improvements"], 11)
+        self.assertEqual(solver.solve.call_args.kwargs["inprocessing"], ["ges_utility"])
+        summary = corpus.aggregate_results("family", [result])
+        self.assertEqual(summary["average_counters"]["ges_utility_improvements"], 11)
+
 
 class BenchmarkParserTests(unittest.TestCase):
     def test_progress_dependency_is_lazy_and_missing_error_is_actionable(self):
@@ -172,6 +197,11 @@ class BenchmarkParserTests(unittest.TestCase):
             self.assertEqual(parse_args([]).family_timeout, corpus.MAX_FAMILY_TIMEOUT_SECONDS)
             with self.assertRaisesRegex(SystemExit, r'pip install.*\[benchmark\]'):
                 corpus.import_tqdm()
+
+    def test_input_directory_is_preserved_by_parser(self):
+        args = parse_args(["--input", "sat_2021", "--output", "benchmark_sat2021"])
+        self.assertEqual(args.input, Path("sat_2021"))
+        self.assertEqual(args.output, Path("benchmark_sat2021"))
 
     def test_worker_does_not_import_progress(self):
         with patch.object(corpus, "import_tqdm", side_effect=AssertionError("worker imported progress")), patch.object(corpus, "run_worker", return_value=0):
@@ -182,21 +212,21 @@ class BenchmarkParserTests(unittest.TestCase):
     def test_process_choices_include_all_ges_variants(self):
         self.assertEqual(
             PROCESS_CHOICES,
-            ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "subsumption"),
+            ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "subsumption"),
         )
 
     def test_ges_variants_are_preserved_by_parser(self):
         for phase in ("preprocess", "inprocessing"):
             for process in METHODS[1:]:
                 with self.subTest(phase=phase, process=process):
-                    args = parse_args(["--" + phase, process])
+                    args = parse_args(["--no-bva", "--" + phase, process])
                     self.assertEqual(getattr(args, phase), [process])
                     if phase == "preprocess":
                         self.assertEqual(solver_config(args)[phase], [process])
 
     def test_multiple_variants_preserve_order(self):
         args = parse_args([
-            "--preprocess", "ges_random", "ges_par", "ges_lbd",
+            "--no-bva", "--preprocess", "ges_random", "ges_par", "ges_lbd",
             "--inprocessing", "ges_lbd", "ges", "ges_par", "ges_random",
         ])
         self.assertEqual(solver_config(args)["preprocess"], ["ges_random", "ges_par", "ges_lbd"])
@@ -230,11 +260,11 @@ class BenchmarkParserTests(unittest.TestCase):
                     parse_args(["--family-timeout=" + value])
                 self.assertEqual(error.exception.code, 2)
 
-    def test_seven_configs_differ_only_in_inprocessing(self):
+    def test_eight_configs_differ_only_in_inprocessing(self):
         self.assertEqual(corpus.METHOD_ORDER, METHODS)
         for preprocess in ([], ["bve", "ges_par", "subsumption"]):
             args = parse_args([
-                "--algorithm", "dpll", "--implication-point", "uip",
+                "--no-bva", "--algorithm", "dpll", "--implication-point", "uip",
                 "--heuristics", "random", "--preprocess", *preprocess,
             ])
             for method in METHODS:
@@ -249,6 +279,99 @@ class BenchmarkParserTests(unittest.TestCase):
             self.assertEqual(solver_config(args), solver_config(args, "base"))
         with self.assertRaisesRegex(ValueError, "unknown benchmark method"):
             solver_config(parse_args([]), "unknown")
+
+    def test_managed_bva_and_ges_addons_are_composed_without_duplicate_rows(self):
+        args = parse_args(["--ges-addons", "ges_trail", "ges_compress"])
+        self.assertEqual(corpus.benchmark_methods(args), METHODS)
+        self.assertEqual(solver_config(args, "base")["preprocess"], ["bva"])
+        self.assertEqual(solver_config(args, "base")["inprocessing"], ["bva"])
+        self.assertEqual(
+            solver_config(args, "ges_vsids")["inprocessing"],
+            ["ges_vsids", "ges_trail", "ges_compress", "bva"],
+        )
+        self.assertNotIn("ges_trail", corpus.METHOD_ORDER)
+        self.assertNotIn("ges_compress", corpus.METHOD_ORDER)
+
+    def test_parallel_profiles_build_the_four_requested_matrices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = parse_args([
+                "--parallel", "--output", temporary, "--family-timeout", "12",
+                "--ges-addons", "ges_trail",
+            ])
+            observed = {}
+            for profile in corpus.PARALLEL_PROFILES:
+                output = corpus.parallel_profile_output(args, profile)
+                command = corpus.parallel_profile_command(args, profile, output)
+                child = parse_args(command[3:])
+                observed[profile.name] = {
+                    "output": output.name,
+                    "implication_point": child.implication_point,
+                    "bva": child.use_bva,
+                    "methods": corpus.benchmark_methods(child),
+                    "addons": child.ges_addons,
+                }
+
+        self.assertEqual(
+            observed,
+            {
+                "uip": {
+                    "output": "benchmark_uip", "implication_point": "uip",
+                    "bva": False, "methods": ("base",), "addons": ["ges_trail"],
+                },
+                "uip_bva": {
+                    "output": "benchmark_uip_bva", "implication_point": "uip",
+                    "bva": True, "methods": METHODS, "addons": ["ges_trail"],
+                },
+                "dip": {
+                    "output": "benchmark_dip", "implication_point": "dip",
+                    "bva": False, "methods": METHODS, "addons": ["ges_trail"],
+                },
+                "dip_bva": {
+                    "output": "benchmark_dip_bva", "implication_point": "dip",
+                    "bva": True, "methods": METHODS, "addons": ["ges_trail"],
+                },
+            },
+        )
+
+    def test_parallel_coordinator_spawns_every_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = parse_args(["--parallel", "--output", temporary, "--plot-only"])
+            processes = []
+
+            def spawn(*_args, **_kwargs):
+                process = Mock()
+                process.poll.return_value = 0
+                processes.append(process)
+                return process
+
+            bars = []
+            progress = Mock()
+            progress.side_effect = lambda **options: (
+                bars.append(RecordingBar(**options)) or bars[-1]
+            )
+            with patch.object(corpus.subprocess, "Popen", side_effect=spawn) as popen, patch.object(
+                corpus, "import_tqdm", return_value=progress
+            ):
+                self.assertEqual(corpus.run_parallel_benchmarks(args), 0)
+
+            self.assertEqual(popen.call_count, 4)
+            self.assertEqual(len(processes), 4)
+            self.assertEqual(bars[0].n, 4)
+            self.assertTrue(bars[0].closed)
+            for profile in corpus.PARALLEL_PROFILES:
+                self.assertTrue(
+                    (Path(temporary) / ("benchmark_" + profile.name) / "parallel.log").is_file()
+                )
+
+    def test_cactus_coordinates_put_solved_instances_before_wall_time(self):
+        counts, times = cactus_coordinates([
+            {"status": "completed", "wall_seconds": 3},
+            {"status": "timeout", "wall_seconds": 10},
+            {"status": "completed", "wall_seconds": 1},
+            {"status": "completed", "wall_seconds": 2},
+        ])
+        self.assertEqual(counts, [0, 1, 2, 3])
+        self.assertEqual(times, [0.0, 1.0, 2.0, 3.0])
 
     def test_matrix_rejects_legacy_inprocessing_override(self):
         with patch.object(corpus, "run_problem_subprocess") as worker:
@@ -307,7 +430,8 @@ class BenchmarkCorpusTests(unittest.TestCase):
 
     def run_matrix(self, timeout=10):
         return corpus.main([
-            "--output", str(self.output), "--family-timeout", str(timeout),
+            "--no-bva", "--output", str(self.output),
+            "--family-timeout", str(timeout),
             "--preprocess", "bve", "subsumption",
         ])
 
@@ -374,7 +498,8 @@ class BenchmarkCorpusTests(unittest.TestCase):
         upper_bound_key = "solver budget upper bound (not ETA; excludes plots/overhead)"
 
         def run(path, worker_output, config, metadata, deadline, progress_callback=None):
-            self.assertIsNotNone(progress_callback)
+            if progress_callback is None:
+                self.fail("benchmark did not provide a progress callback")
             global_bar, family_bar = self.bars[0], self.bars[1]
             counts = (global_bar.n, family_bar.n)
             for elapsed in (1, 2):
@@ -437,6 +562,64 @@ class BenchmarkCorpusTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "family directory"):
             corpus.problem_family(self.benchmark_root / "root.cnf")
+
+    def test_explicit_input_is_one_recursive_corpus_with_safe_output_paths(self):
+        input_root = self.root / "sat_2021"
+        root_problem = input_root / "root.cnf"
+        nested_problem = input_root / "nested" / "hard.cnf"
+        nested_problem.parent.mkdir(parents=True)
+        for path in (root_problem, nested_problem):
+            path.write_text("p cnf 1 1\n1 0\n", encoding="utf-8")
+        (input_root / "ignored.cnf.xz").write_text("compressed", encoding="utf-8")
+        (input_root / "directory.cnf").mkdir()
+
+        problems = corpus.discover_problems(input_root)
+        self.assertEqual(problems, [nested_problem, root_problem])
+        self.assertEqual(
+            corpus.group_problems_by_family(reversed(problems), input_root),
+            {"sat_2021": [nested_problem, root_problem]},
+        )
+        self.assertEqual(
+            corpus.problem_metadata(nested_problem, input_root),
+            {
+                "problem": "sat_2021/nested/hard.cnf",
+                "family": "sat_2021",
+                "expected": "unknown",
+            },
+        )
+        self.assertEqual(
+            corpus.result_json_path(self.output, "sat_2021/nested/hard.cnf"),
+            self.output / "problems/sat_2021/nested/hard.json",
+        )
+
+        self.assertEqual(
+            corpus.main([
+                "--input", str(input_root), "--output", str(self.output),
+                "--family-timeout", "0",
+            ]),
+            0,
+        )
+        index = self.read_json(self.output / "index.json")
+        self.assertEqual(index["completed_families"], ["sat_2021"])
+        for method in METHODS:
+            _, results = corpus.load_saved_results(self.output / method)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result["family"] == "sat_2021" for result in results))
+            self.assertTrue(all(result["status"] == "skipped" for result in results))
+
+    def test_missing_or_empty_explicit_input_is_reported(self):
+        empty = self.root / "empty_sat_2021"
+        empty.mkdir()
+        for input_root, message in (
+            (self.root / "missing_sat_2021", "input directory not found"),
+            (empty, "no .cnf problems found"),
+        ):
+            with self.subTest(input_root=input_root), self.assertRaisesRegex(SystemExit, message):
+                corpus.main([
+                    "--input", str(input_root), "--output", str(self.output),
+                    "--family-timeout", "0",
+                ])
+        self.worker.assert_not_called()
 
     def test_missing_or_empty_corpus_does_not_fall_back_to_legacy(self):
         self.add_problem("sat/legacy.cnf")
@@ -522,7 +705,7 @@ class BenchmarkCorpusTests(unittest.TestCase):
             self.assertEqual([r["status"] for r in results], ["skipped", "skipped"])
             self.assertEqual([r["family"] for r in results], ["a", "b"])
 
-    def test_persistence_and_overlays_include_all_seven_configurations(self):
+    def test_persistence_and_overlays_include_all_eight_configurations(self):
         paths = [self.add_problem("benchmark/{}/nested/one.cnf".format(family)) for family in ("a", "b")]
         self.assertEqual(self.run_matrix(), 0)
         index = self.read_json(self.output / "index.json")
@@ -536,6 +719,10 @@ class BenchmarkCorpusTests(unittest.TestCase):
         for method in METHODS:
             with self.subTest(method=method):
                 entry = index["methods"][method]
+                self.assertEqual(
+                    entry["label"],
+                    "DIP" if method == "base" else "DIP + " + corpus.METHOD_LABELS[method],
+                )
                 self.assertEqual(entry["path"], method)
                 self.assertEqual(entry["index"], method + "/index.json")
                 method_output = self.output / method
@@ -568,7 +755,13 @@ class BenchmarkCorpusTests(unittest.TestCase):
             pyplot, actual_name, methods, destination, actual_timeout = call
             self.assertIs(pyplot, self.pyplot.return_value)
             self.assertEqual(actual_name, name)
-            self.assertEqual(list(methods), [corpus.METHOD_LABELS[method] for method in METHODS])
+            self.assertEqual(
+                list(methods),
+                [
+                    "DIP" if method == "base" else "DIP + " + corpus.METHOD_LABELS[method]
+                    for method in METHODS
+                ],
+            )
             self.assertEqual(destination, self.output / "plots/cactus" / (name + ".png"))
             self.assertEqual(actual_timeout, timeout)
             for method, results in zip(METHODS, methods.values()):
@@ -576,6 +769,23 @@ class BenchmarkCorpusTests(unittest.TestCase):
                 self.assertTrue(all(r["configuration"]["inprocessing"] == ([] if method == "base" else [method]) for r in results))
                 if name != "overall":
                     self.assertTrue(all(r["family"] == name for r in results))
+
+    def test_cactus_plot_uses_only_the_available_methods_in_their_saved_order(self):
+        methods = {"base": [], "ges": []}
+
+        labels = {method: corpus.METHOD_LABELS[method] for method in methods}
+        path = corpus.plot_matrix_cactus(
+            self.pyplot.return_value, self.output, "legacy", methods, labels, 17
+        )
+
+        self.assertEqual(path, "plots/cactus/legacy.png")
+        _, name, plotted_methods, destination, timeout = self.overlays[-1]
+        self.assertEqual(name, "legacy")
+        self.assertEqual(list(plotted_methods), [
+            corpus.METHOD_LABELS["base"], corpus.METHOD_LABELS["ges"],
+        ])
+        self.assertEqual(destination, self.output / "plots/cactus/legacy.png")
+        self.assertEqual(timeout, 17)
 
     def test_plot_only_uses_saved_indexes_never_solver_or_corpus(self):
         for family in ("a", "b"):

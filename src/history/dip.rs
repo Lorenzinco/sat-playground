@@ -5,31 +5,41 @@ use crate::history::two_vertex_bottlenecks;
 use crate::history::uip;
 use crate::history::{ConflictLearnResult, History};
 
-const MAX_DIP_CLAUSE_LBD: i64 = 2;
+// The fresh extension literal contributes one additional LBD block to the
+// learned post clause. At most one lower-level block therefore guarantees that
+// every accepted DIP post clause is unit or glue.
+const MAX_DIP_REMAINDER_LEVELS: i64 = 1;
 
 pub fn find_dip(
     history: &History,
-    formula: &Formula,
+    formula: &mut Formula,
     conflict_clause_index: usize,
 ) -> ConflictLearnResult {
     let Some(analysis) = analyze_conflict_graph(history, formula, conflict_clause_index) else {
+        formula.stats.dip_uip_fallbacks += 1;
         return uip::empty_result();
     };
 
-    learn_from_analysis(&analysis, history, formula, conflict_clause_index)
-        .unwrap_or_else(|| uip::learn_from_analysis(&analysis, history, formula))
+    match learn_from_analysis(&analysis, history, formula, conflict_clause_index) {
+        Some(result) => result,
+        None => {
+            formula.stats.dip_uip_fallbacks += 1;
+            uip::learn_from_analysis(&analysis, history, formula)
+        }
+    }
 }
 
 pub(super) fn learn_from_analysis(
     analysis: &ConflictAnalysis,
     history: &History,
-    formula: &Formula,
+    formula: &mut Formula,
     conflict_clause_index: usize,
 ) -> Option<ConflictLearnResult> {
     let pair =
         two_vertex_bottlenecks::find_middle_pair(&analysis.predecessors, &analysis.pred_index)?;
     let (dip_a, dip_b, clause) =
         dip_clause::extract(analysis, history, formula, conflict_clause_index, pair)?;
+    formula.stats.dip_candidates_found += 1;
 
     // A reused, assigned extension makes the post clause non-asserting: if z is
     // false it is already satisfied, and if z is true its level also affects
@@ -39,10 +49,12 @@ pub(super) fn learn_from_analysis(
         .substitute(&dip_a, &dip_b)
         .is_some_and(|z| z.eval(&formula.assignment).is_some())
     {
+        formula.stats.dip_assigned_extension_rejections += 1;
         return None;
     }
 
-    if clause.post_lbd > MAX_DIP_CLAUSE_LBD {
+    if clause.post_lbd > MAX_DIP_REMAINDER_LEVELS {
+        formula.stats.dip_lbd_rejections += 1;
         return None;
     }
 
@@ -192,6 +204,42 @@ mod tests {
         let post_set = lit_set(&post_clause_without_z);
         let expected_post: HashSet<_> = [lit_key(&r)].into_iter().collect();
         assert_eq!(post_set, expected_post);
+        assert_eq!(formula.stats.dip_candidates_found, 1);
+        // Unit/glue post clauses are counted after minimization during learning.
+        assert_eq!(formula.stats.dip_unit_post_clauses, 0);
+        assert_eq!(formula.stats.dip_glue_post_clauses, 0);
+        assert_eq!(formula.stats.dip_lbd_rejections, 0);
+        assert_eq!(formula.stats.dip_assigned_extension_rejections, 0);
+        assert_eq!(formula.stats.dip_uip_fallbacks, 0);
+    }
+
+    #[test]
+    fn dip_with_empty_remainder_counts_unit_post_clause() {
+        let clauses = vec![
+            vec![-1, 2],  // ¬x ∨ a
+            vec![-1, 3],  // ¬x ∨ b
+            vec![-2, -3], // ¬a ∨ ¬b (conflict)
+        ];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+
+        let x = Literal::new(1);
+        formula.assignment.assign_history(&x, &mut history);
+        for (literal, reason) in [(Literal::new(2), 0), (Literal::new(3), 1)] {
+            formula
+                .assignment
+                .assign(literal.get_index().unsigned_abs() as usize, true);
+            history.add_implication(&literal, Some(reason));
+        }
+
+        assert!(matches!(
+            history.analyze_conflict(&mut formula, 2, ImplicationPoint::DIP),
+            ConflictLearnResult::Dip { .. }
+        ));
+        assert_eq!(formula.stats.dip_candidates_found, 1);
+        assert_eq!(formula.stats.dip_unit_post_clauses, 0);
+        assert_eq!(formula.stats.dip_glue_post_clauses, 0);
+        assert_eq!(formula.stats.dip_uip_fallbacks, 0);
     }
 
     #[test]
@@ -400,6 +448,49 @@ mod tests {
     }
 
     #[test]
+    fn dip_with_two_lower_level_blocks_falls_back_to_uip() {
+        let clauses = vec![
+            vec![-3, -1, 4],      // ¬x2 ∨ ¬x1 ∨ a
+            vec![-3, -2, 5],      // ¬x2 ∨ ¬y ∨ b
+            vec![-4, 6],          // ¬a ∨ c
+            vec![-5, 7],          // ¬b ∨ d
+            vec![-6, -7, -1, -2], // ¬c ∨ ¬d ∨ ¬x1 ∨ ¬y (conflict)
+        ];
+        let mut formula = Formula::from_vec(clauses);
+        let mut history = History::new();
+
+        let x1 = Literal::new(1);
+        formula.assignment.assign_history(&x1, &mut history);
+        let y = Literal::new(2);
+        formula.assignment.assign_history(&y, &mut history);
+        let x2 = Literal::new(3);
+        formula.assignment.assign_history(&x2, &mut history);
+
+        for (literal, reason) in [
+            (Literal::new(4), 0),
+            (Literal::new(5), 1),
+            (Literal::new(6), 2),
+            (Literal::new(7), 3),
+        ] {
+            formula
+                .assignment
+                .assign(literal.get_index().unsigned_abs() as usize, true);
+            history.add_implication(&literal, Some(reason));
+        }
+
+        assert!(matches!(
+            history.analyze_conflict(&mut formula, 4, ImplicationPoint::DIP),
+            ConflictLearnResult::Uip { .. }
+        ));
+        assert_eq!(formula.stats.dip_candidates_found, 1);
+        assert_eq!(formula.stats.dip_unit_post_clauses, 0);
+        assert_eq!(formula.stats.dip_glue_post_clauses, 0);
+        assert_eq!(formula.stats.dip_lbd_rejections, 1);
+        assert_eq!(formula.stats.dip_assigned_extension_rejections, 0);
+        assert_eq!(formula.stats.dip_uip_fallbacks, 1);
+    }
+
+    #[test]
     fn assigned_reused_extension_falls_back_to_uip() {
         let clauses = vec![
             vec![-3, -2, 4],  // ¬f ∨ ¬p ∨ a
@@ -438,6 +529,10 @@ mod tests {
             history.analyze_conflict(&mut formula, 2, ImplicationPoint::DIP),
             ConflictLearnResult::Uip { .. }
         ));
+        assert_eq!(formula.stats.dip_candidates_found, 1);
+        assert_eq!(formula.stats.dip_lbd_rejections, 0);
+        assert_eq!(formula.stats.dip_assigned_extension_rejections, 1);
+        assert_eq!(formula.stats.dip_uip_fallbacks, 1);
     }
 
     #[test]

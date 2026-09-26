@@ -4,8 +4,23 @@ import clsat
 
 
 class SolverApiTests(unittest.TestCase):
+    def test_bva_preprocessing_preserves_model_and_reports_factors(self):
+        clauses = [[a, b] for a in (1, 2) for b in (3, 4, 5, 6)]
+        solver = clsat.Sat(clauses)
+        solver.solve(
+            algorithm="cdcl", implication_point="uip", heuristics="vsids",
+            preprocess=["bva"], inprocessing=["bva"],
+        )
+        self.assertIsNotNone(solver.model)
+        self.assertTrue(all(
+            any(solver.model[abs(lit) - 1] == (lit > 0) for lit in clause)
+            for clause in clauses
+        ))
+        self.assertEqual(solver.stats.bva_literals, 1)
+        self.assertEqual(solver.stats.bva_budget_exhaustions, 0)
+
     def test_ges_variants_are_accepted(self):
-        for process in ("ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids"):
+        for process in ("ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail"):
             for phase in ("preprocess", "inprocessing"):
                 for clauses, satisfiable in (([[1, 2], [-1, 2]], True), ([[1], [-1]], False)):
                     with self.subTest(process=process, phase=phase, satisfiable=satisfiable):
@@ -34,6 +49,17 @@ class SolverApiTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             solver.stats.ges_vsids_improvements = 1
 
+    def test_utility_improvement_counter_is_zero_readonly_and_displayed(self):
+        solver = clsat.Sat([[1]])
+        solver.solve(
+            algorithm="cdcl", implication_point="uip", heuristics="vsids",
+            preprocess=[], inprocessing=[],
+        )
+        self.assertEqual(solver.stats.ges_utility_improvements, 0)
+        self.assertIn("GES utility improvements", str(solver.stats))
+        with self.assertRaises(AttributeError):
+            solver.stats.ges_utility_improvements = 1
+
     def test_unknown_process_lists_ges_variants(self):
         for phase in ("preprocess", "inprocessing"):
             with self.subTest(phase=phase):
@@ -45,4 +71,4 @@ class SolverApiTests(unittest.TestCase):
                         heuristics="vsids", **options,
                     )
                 self.assertIn("unknown_process", str(error.exception))
-                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, subsumption", str(error.exception))
+                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, subsumption", str(error.exception))

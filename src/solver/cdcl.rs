@@ -17,11 +17,12 @@ use crate::python::signal_checker;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::time::Instant;
 
 const RESTART_CONFLICT_SCALE: u64 = 100;
+const GES_RESTART_INTERVAL: u64 = 2;
 const INPROCESSING_RESTART_INTERVAL: u64 = 8;
 const DB_REDUCTION_CONFLICT_INTERVAL: u64 = 2_000;
 
@@ -35,6 +36,9 @@ pub fn solve_cdcl<'py, W: Write>(
     guidance: &mut Option<GuidanceTracker>,
 ) -> PyResult<Option<Vec<bool>>> {
     let mut history = History::new();
+    formula.configure_ges_trail_tracking(
+        inprocessing.contains(&Process::GESTrail) && inprocessing.iter().any(is_ges),
+    );
     let mut steps = 0;
     let mut restart_count = 0;
     let mut conflicts_at_last_restart = 0;
@@ -162,16 +166,20 @@ pub fn solve_cdcl<'py, W: Write>(
                 restart_count += 1;
                 conflicts_at_last_restart = formula.stats.conflicts;
                 next_restart_conflicts = RESTART_CONFLICT_SCALE * luby(restart_count + 1);
+                let run_ges = restart_count.is_multiple_of(GES_RESTART_INTERVAL);
                 let run_inprocessing = restart_count.is_multiple_of(INPROCESSING_RESTART_INTERVAL);
-                restart(
+                if restart(
                     py,
                     &mut steps,
                     formula,
                     &mut history,
                     &inprocessing,
+                    run_ges,
                     run_inprocessing,
                     logger,
-                )?;
+                )? {
+                    return unsat(logger);
+                }
                 propagation.clear();
                 break;
             }
@@ -187,6 +195,13 @@ fn learn_uip_clause<W: Write>(
     learned: Clause,
     backtrack_level: usize,
 ) -> PyResult<Option<Clause>> {
+    let mut learned = learned;
+    let mut backtrack_level = backtrack_level;
+    if let Some(literals) = compress_learned_clause(formula, history, learned.get_literals()) {
+        let (level, lbd) = history.clause_levels(&literals);
+        learned = Clause::from_literals(literals, lbd);
+        backtrack_level = level;
+    }
     if history
         .backtrack_until_not_conflicting(&learned, backtrack_level, formula)
         .is_none()
@@ -237,8 +252,17 @@ fn learn_dip_clauses<W: Write>(
         .stats
         .add_minimized_literals(minimized_literals as u64);
     formula.stats.record_minimization_time(minimization_time);
+    if let Some(compressed) = compress_learned_clause(formula, history, &post_literals) {
+        post_literals = compressed;
+    }
     order_asserting_clause(&mut post_literals, history);
     let (post_backtrack_level, post_lbd) = dip_post_clause_metrics(&post_literals, history);
+    if post_lbd == 1 {
+        formula.stats.dip_unit_post_clauses += 1;
+    } else {
+        debug_assert_eq!(post_lbd, 2);
+        formula.stats.dip_glue_post_clauses += 1;
+    }
     let post_clause = Clause::from_literals(post_literals, post_lbd);
 
     let Some(actual_backtrack) =
@@ -296,6 +320,72 @@ fn learn_dip_clauses<W: Write>(
     }
 
     Ok(Some(learned))
+}
+
+// Scan each existing non-asserting literal once. Only use replacements already
+// falsified below the conflict level, so the learned clause stays asserting.
+fn compress_learned_clause(
+    formula: &Formula,
+    history: &History,
+    literals: &[Literal],
+) -> Option<Vec<Literal>> {
+    if literals.len() < 3 || formula.extensions.len() == 0 {
+        return None;
+    }
+    let mut variables: HashSet<u32> = literals
+        .iter()
+        .map(|literal| literal.get_index().unsigned_abs())
+        .collect();
+    let mut positions: HashMap<i32, usize> = literals
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, lit)| (lit.get_index(), index))
+        .collect();
+    let mut result = literals.to_vec();
+    let mut removed = vec![false; literals.len()];
+    let mut changed = false;
+    let conflict_level = history.get_decision_level();
+    for index in 1..result.len() {
+        if removed[index] {
+            continue;
+        }
+        let input = result[index].negated();
+        for (partner, extension) in formula.extensions.substitution_partners(&input) {
+            let Some(&other) = positions.get(&partner.negated().get_index()) else {
+                continue;
+            };
+            if other <= index || removed[other] {
+                continue;
+            }
+            let replacement = extension.negated();
+            if replacement.eval(&formula.assignment) != Some(false)
+                || history
+                    .get_literal_level(&replacement)
+                    .is_none_or(|level| level >= conflict_level)
+                || variables.contains(&replacement.get_index().unsigned_abs())
+            {
+                continue;
+            }
+            positions.remove(&result[index].get_index());
+            positions.remove(&result[other].get_index());
+            variables.remove(&result[index].get_index().unsigned_abs());
+            variables.remove(&result[other].get_index().unsigned_abs());
+            variables.insert(replacement.get_index().unsigned_abs());
+            result[index] = replacement;
+            positions.insert(replacement.get_index(), index);
+            removed[other] = true;
+            changed = true;
+            break;
+        }
+    }
+    changed.then(|| {
+        result
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, literal)| (!removed[index]).then_some(literal))
+            .collect()
+    })
 }
 
 fn observe_dip_extension(
@@ -396,16 +486,49 @@ fn is_ges(process: &Process) -> bool {
             | Process::GESLBD
             | Process::GESRandom
             | Process::GESPar
+            | Process::GESUtility
             | Process::GESVSIDS
     )
 }
 
-fn scheduled_inprocessing(inprocessing: &[Process], run_inprocessing: bool) -> Vec<Process> {
-    inprocessing
+fn is_ges_modifier(process: &Process) -> bool {
+    matches!(process, Process::GESCompress | Process::GESTrail)
+}
+
+fn scheduled_inprocessing(
+    inprocessing: &[Process],
+    run_ges: bool,
+    run_inprocessing: bool,
+) -> Vec<Process> {
+    let ges_enabled = inprocessing.iter().any(is_ges);
+    let mut methods = inprocessing
         .iter()
         .copied()
-        .filter(|process| run_inprocessing || is_ges(process))
-        .collect()
+        .filter(|process| {
+            if is_ges(process) {
+                run_ges
+            } else if is_ges_modifier(process) {
+                run_ges && ges_enabled
+            } else {
+                run_inprocessing
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if run_ges
+        && run_inprocessing
+        && ges_enabled
+        && let Some(bva_index) = methods.iter().position(|process| *process == Process::BVA)
+    {
+        let trailing = methods.drain(bva_index + 1..).collect::<Vec<_>>();
+        let (ges, others): (Vec<_>, Vec<_>) = trailing
+            .into_iter()
+            .partition(|process| is_ges(process) || is_ges_modifier(process));
+        methods.splice(bva_index..bva_index, ges);
+        methods.extend(others);
+    }
+
+    methods
 }
 
 fn restart<W: Write>(
@@ -414,22 +537,23 @@ fn restart<W: Write>(
     formula: &mut Formula,
     history: &mut History,
     inprocessing: &[Process],
+    run_ges: bool,
     run_inprocessing: bool,
     logger: &mut Option<DratLogger<W>>,
-) -> PyResult<()> {
+) -> PyResult<bool> {
     let restart_start = Instant::now();
     formula.stats.add_restart();
-    let methods = scheduled_inprocessing(inprocessing, run_inprocessing);
-    let reasoning_levels = methods
-        .iter()
-        .any(is_ges)
-        .then(|| history.snapshot_literal_levels(formula.assignment.len()));
+    let methods = scheduled_inprocessing(inprocessing, run_ges, run_inprocessing);
+    let ran_ges = methods.iter().any(is_ges);
+    let reasoning_levels =
+        ran_ges.then(|| history.snapshot_literal_levels(formula.assignment.len()));
     formula.revert_decision(1, history);
 
+    let first_new_clause = formula.clause_slots_len();
     if !methods.is_empty() {
         let inprocessing_start = Instant::now();
         let scope = global_inprocessing_scope(formula);
-        formula.process(
+        formula.process_in_phase(
             methods,
             &scope,
             logger,
@@ -437,14 +561,56 @@ fn restart<W: Write>(
             false,
             Some(history),
             reasoning_levels.as_deref(),
+            crate::process::ProcessPhase::Inprocessing,
         )?;
         formula
             .stats
             .record_inprocessing_time(inprocessing_start.elapsed());
     }
+    if ran_ges {
+        formula.clear_ges_trail_touched();
+    }
+
+    let mut propagation = Vec::new();
+    let mut root_conflict = false;
+    for idx in first_new_clause..formula.clause_slots_len() {
+        if formula.is_clause_garbage(idx) {
+            continue;
+        }
+        let assertion = {
+            let clause = formula.get_clause_at_idx(idx);
+            if clause.is_empty(&formula.assignment) {
+                None
+            } else {
+                clause.get_unit_literal(&formula.assignment).copied()
+            }
+        };
+        let Some(literal) = assertion else {
+            if formula.get_clause_at_idx(idx).is_empty(&formula.assignment) {
+                root_conflict = true;
+                break;
+            }
+            continue;
+        };
+        match formula.assign_implication(literal, history, Some(idx)) {
+            AssignResult::Conflict => {
+                root_conflict = true;
+                break;
+            }
+            AssignResult::AlreadyAssigned => {}
+            AssignResult::Assigned(literal) => propagation.push(literal),
+        }
+    }
+    if !root_conflict && !propagation.is_empty() {
+        let propagation_start = Instant::now();
+        root_conflict = propagate_from(formula, history, propagation).is_some();
+        formula
+            .stats
+            .record_propagation_time(propagation_start.elapsed());
+    }
 
     formula.stats.record_restart_time(restart_start.elapsed());
-    Ok(())
+    Ok(root_conflict)
 }
 
 #[cfg(test)]
@@ -488,42 +654,159 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_inprocessing_preserves_order_without_duplicating_ges() {
+    fn scheduled_inprocessing_runs_ges_before_bva_without_duplication() {
         let selected = [
             Process::BVE,
             Process::GESRandom,
+            Process::GESCompress,
+            Process::GESTrail,
             Process::Subsumption,
             Process::GES,
             Process::GESAlways,
             Process::BVA,
             Process::GESPar,
             Process::Others,
+            Process::GESUtility,
             Process::GESVSIDS,
             Process::GESLBD,
         ];
         assert_eq!(
-            scheduled_inprocessing(&selected, false),
+            scheduled_inprocessing(&selected, true, false),
             vec![
                 Process::GESRandom,
+                Process::GESCompress,
+                Process::GESTrail,
                 Process::GES,
                 Process::GESAlways,
                 Process::GESPar,
+                Process::GESUtility,
                 Process::GESVSIDS,
                 Process::GESLBD
             ]
         );
-        assert_eq!(scheduled_inprocessing(&selected, true), selected);
+        assert_eq!(
+            scheduled_inprocessing(&selected, false, true),
+            vec![
+                Process::BVE,
+                Process::Subsumption,
+                Process::BVA,
+                Process::Others,
+            ]
+        );
+        assert_eq!(
+            scheduled_inprocessing(&selected, true, true),
+            vec![
+                Process::BVE,
+                Process::GESRandom,
+                Process::GESCompress,
+                Process::GESTrail,
+                Process::Subsumption,
+                Process::GES,
+                Process::GESAlways,
+                Process::GESPar,
+                Process::GESUtility,
+                Process::GESVSIDS,
+                Process::GESLBD,
+                Process::BVA,
+                Process::Others,
+            ]
+        );
+        assert_eq!(
+            scheduled_inprocessing(
+                &[Process::BVA, Process::GESUtility, Process::GESVSIDS],
+                true,
+                true,
+            ),
+            vec![Process::GESUtility, Process::GESVSIDS, Process::BVA]
+        );
         let others = [
             Process::BVA,
             Process::BVE,
+            Process::GESCompress,
+            Process::GESTrail,
             Process::Subsumption,
             Process::Others,
         ];
-        assert!(scheduled_inprocessing(&others, false).is_empty());
-        assert_eq!(scheduled_inprocessing(&others, true), others);
-        for run_inprocessing in [false, true] {
-            assert!(scheduled_inprocessing(&[], run_inprocessing).is_empty());
+        assert!(scheduled_inprocessing(&others, false, false).is_empty());
+        assert!(scheduled_inprocessing(&others, true, false).is_empty());
+        assert_eq!(
+            scheduled_inprocessing(&others, false, true),
+            vec![
+                Process::BVA,
+                Process::BVE,
+                Process::Subsumption,
+                Process::Others
+            ]
+        );
+        for run_ges in [false, true] {
+            for run_inprocessing in [false, true] {
+                assert!(scheduled_inprocessing(&[], run_ges, run_inprocessing).is_empty());
+            }
         }
+    }
+
+    #[test]
+    fn restart_consumes_and_clears_trail_touches_before_the_next_segment() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3], vec![4]]);
+            for (_, clause) in formula.get_clauses_mut() {
+                clause.lbd = 3;
+            }
+            formula.configure_ges_trail_tracking(true);
+            formula.record_ges_analysis_use(2);
+            let mut history = History::new();
+            formula.add_decision(&Literal::new(1), &mut history);
+            let mut logger: Option<DratLogger<Empty>> = None;
+            let mut steps = 0;
+
+            restart(
+                py,
+                &mut steps,
+                &mut formula,
+                &mut history,
+                &[Process::GESVSIDS, Process::GESTrail],
+                true,
+                false,
+                &mut logger,
+            )
+            .unwrap();
+
+            assert!(formula.ges_trail_touched.is_empty());
+            assert_eq!(formula.stats.ges_trail_unique_touches, 1);
+            assert_eq!(formula.stats.ges_trail_clauses_selected, 1);
+            assert_eq!(formula.stats.ges_trail_cursor_selected, 3);
+            assert_eq!(formula.stats.ges_trail_duplicate_skips, 1);
+        });
+    }
+
+    #[test]
+    fn restart_preserves_trail_touches_when_ges_is_not_due() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![1], vec![2], vec![3]]);
+            formula.configure_ges_trail_tracking(true);
+            formula.record_ges_analysis_use(2);
+            let mut history = History::new();
+            formula.add_decision(&Literal::new(1), &mut history);
+            let mut logger: Option<DratLogger<Empty>> = None;
+            let mut steps = 0;
+
+            restart(
+                py,
+                &mut steps,
+                &mut formula,
+                &mut history,
+                &[Process::GESVSIDS, Process::GESTrail],
+                false,
+                false,
+                &mut logger,
+            )
+            .unwrap();
+
+            assert_eq!(formula.ges_trail_touched, vec![2]);
+            assert_eq!(formula.stats.ges_trail_clauses_selected, 0);
+        });
     }
 
     #[test]
@@ -535,6 +818,7 @@ mod tests {
                 Process::GESLBD,
                 Process::GESRandom,
                 Process::GESPar,
+                Process::GESUtility,
             ] {
                 for run_inprocessing in [false, true] {
                     let mut formula = Formula::from_vec(vec![vec![-1, -2, 3]]);
@@ -562,6 +846,7 @@ mod tests {
                         &mut formula,
                         &mut history,
                         &[Process::Subsumption, process],
+                        true,
                         run_inprocessing,
                         &mut logger,
                     )
@@ -591,6 +876,105 @@ mod tests {
     }
 
     #[test]
+    fn restart_immediately_propagates_a_ges_clause_that_is_unit_at_root() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![-1, -2, 3]]);
+            formula.get_clause_at_idx_mut(0).lbd = 0;
+            let mut logger: Option<DratLogger<Empty>> = None;
+            let extension = extension_literal(
+                &mut formula,
+                &mut logger,
+                &Literal::new(1),
+                &Literal::new(2),
+            );
+            let mut history = History::new();
+            assert!(matches!(
+                formula.assign_implication(Literal::new(-3), &mut history, None),
+                AssignResult::Assigned(_)
+            ));
+            let mut steps = 0;
+
+            let conflict = restart(
+                py,
+                &mut steps,
+                &mut formula,
+                &mut history,
+                &[Process::GES, Process::GESCompress],
+                true,
+                false,
+                &mut logger,
+            )
+            .unwrap();
+
+            assert!(!conflict);
+            assert_eq!(history.get_decision_level(), 0);
+            assert_eq!(
+                formula.assignment.get_value(extension.get_index() as usize),
+                Some(false)
+            );
+            let replacement = formula.get_clause_at_idx(4);
+            assert_eq!(
+                replacement.get_literals(),
+                &[extension.negated(), Literal::new(3)]
+            );
+        });
+    }
+
+    #[test]
+    fn ges_replacement_watches_ignore_literals_already_false_at_root() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut formula = Formula::from_vec(vec![vec![-1, -2, 3, 4, 5]]);
+            formula.get_clause_at_idx_mut(0).lbd = 0;
+            let mut logger: Option<DratLogger<Empty>> = None;
+            let extension = extension_literal(
+                &mut formula,
+                &mut logger,
+                &Literal::new(1),
+                &Literal::new(2),
+            );
+            let mut history = History::new();
+            for literal in [Literal::new(-3), Literal::new(-4)] {
+                assert!(matches!(
+                    formula.assign_implication(literal, &mut history, None),
+                    AssignResult::Assigned(_)
+                ));
+            }
+            let mut steps = 0;
+
+            assert!(
+                !restart(
+                    py,
+                    &mut steps,
+                    &mut formula,
+                    &mut history,
+                    &[Process::GES, Process::GESCompress],
+                    true,
+                    false,
+                    &mut logger,
+                )
+                .unwrap()
+            );
+
+            let replacement = formula.get_clause_at_idx(4);
+            assert_eq!(
+                replacement.watched_literals(),
+                Some((&Literal::new(5), Some(&extension.negated())))
+            );
+            formula.add_decision(&Literal::new(-5), &mut history);
+            assert_eq!(
+                propagate_from(&mut formula, &mut history, [Literal::new(-5)]),
+                None
+            );
+            assert_eq!(
+                formula.assignment.get_value(extension.get_index() as usize),
+                Some(false)
+            );
+        });
+    }
+
+    #[test]
     fn restart_backtracks_to_root_and_unlocks_reason_clauses() {
         let mut formula = Formula::from_vec(vec![vec![1], vec![-1, 2]]);
         let mut history = History::new();
@@ -613,6 +997,7 @@ mod tests {
                 &mut formula,
                 &mut history,
                 &[],
+                false,
                 true,
                 &mut logger,
             )
@@ -625,6 +1010,94 @@ mod tests {
         assert_eq!(formula.assignment.get_value(1), None);
         assert_eq!(formula.assignment.get_value(2), None);
         assert_eq!(formula.get_clause_at_idx(1).lock_count, 0);
+    }
+
+    #[test]
+    fn learned_clause_compression_requires_an_assigned_lower_level_extension() {
+        let mut formula = Formula::new(4);
+        let mut history = History::new();
+        let mut logger: Option<DratLogger<Empty>> = None;
+        let a = Literal::new(1);
+        let b = Literal::new(2);
+        let asserting = Literal::new(3);
+        let z = extension_literal(&mut formula, &mut logger, &a, &b);
+        formula.add_decision(&a, &mut history);
+        formula.assign_implication(b, &mut history, None);
+        formula.add_decision(&asserting, &mut history);
+        let clause = vec![asserting.negated(), a.negated(), b.negated()];
+        assert_eq!(compress_learned_clause(&formula, &history, &clause), None);
+
+        formula.revert_last_decision(&mut history);
+        formula.assign_implication(z, &mut history, None);
+        formula.add_decision(&asserting, &mut history);
+        assert_eq!(
+            compress_learned_clause(&formula, &history, &clause),
+            Some(vec![asserting.negated(), z.negated()])
+        );
+    }
+
+    #[test]
+    fn uip_learning_compresses_before_backtracking_and_asserts() {
+        let mut formula = Formula::new(4);
+        let mut history = History::new();
+        let mut logger: Option<DratLogger<Empty>> = None;
+        let a = Literal::new(1);
+        let b = Literal::new(2);
+        let current = Literal::new(3);
+        let z = extension_literal(&mut formula, &mut logger, &a, &b);
+        formula.add_decision(&a, &mut history);
+        formula.assign_implication(b, &mut history, None);
+        formula.assign_implication(z, &mut history, None);
+        formula.add_decision(&current, &mut history);
+        let mut propagation = Vec::new();
+        let learned = learn_uip_clause(
+            &mut formula,
+            &mut history,
+            &mut logger,
+            &mut propagation,
+            Clause::from_literals(vec![current.negated(), a.negated(), b.negated()], 2),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(learned.get_literals(), &[current.negated(), z.negated()]);
+        assert_eq!(learned.lbd, 2);
+        assert_eq!(propagation, vec![current.negated()]);
+    }
+
+    #[test]
+    fn dip_learning_compresses_lower_literals_and_asserts_post_clause() {
+        let mut formula = Formula::new(5);
+        let mut history = History::new();
+        let mut logger: Option<DratLogger<Empty>> = None;
+        let a = Literal::new(1);
+        let b = Literal::new(2);
+        let dip_a = Literal::new(3);
+        let dip_b = Literal::new(4);
+        let z = extension_literal(&mut formula, &mut logger, &a, &b);
+        formula.add_decision(&a, &mut history);
+        formula.assign_implication(b, &mut history, None);
+        formula.assign_implication(z, &mut history, None);
+        formula.add_decision(&dip_a, &mut history);
+        formula.assign_implication(dip_b, &mut history, None);
+        let mut propagation = Vec::new();
+        let mut guidance = None;
+        let learned = learn_dip_clauses(
+            &mut formula,
+            &mut history,
+            &mut logger,
+            &mut propagation,
+            dip_a,
+            dip_b,
+            vec![a.negated(), b.negated()],
+            &mut guidance,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(learned.get_literals(), &[Literal::new(-7), z.negated()]);
+        assert_eq!(learned.lbd, 2);
+        assert_eq!(propagation, vec![Literal::new(-7)]);
+        assert_eq!(formula.stats.dip_glue_post_clauses, 1);
     }
 
     #[test]

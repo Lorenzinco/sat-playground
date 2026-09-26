@@ -115,14 +115,14 @@ def plot_problem(plt, result: Mapping[str, Any], destination: Path) -> None:
 
 def cactus_coordinates(
     results: Sequence[Mapping[str, Any]],
-) -> Tuple[List[float], List[int]]:
-    """Return sorted individual wall runtimes (not cumulative) and completed counts."""
+) -> Tuple[List[int], List[float]]:
+    """Return solved-instance counts and their sorted individual wall runtimes."""
     completed_times = sorted(
         float(result.get("wall_seconds", 0.0))
         for result in results
         if result.get("status") == "completed"
     )
-    return [0.0] + completed_times, list(range(len(completed_times) + 1))
+    return list(range(len(completed_times) + 1)), [0.0] + completed_times
 
 
 def _plot_cactus(
@@ -144,7 +144,7 @@ def _plot_cactus(
         for label, results in method_results.items()
     ]
     # Never truncate a completed run, even if it slightly exceeded the deadline.
-    endpoint = max([endpoint, 0.0] + [times[-1] for _, times, _ in coordinates])
+    endpoint = max([endpoint, 0.0] + [times[-1] for _, _, times in coordinates])
     if endpoint == 0.0:
         endpoint = 1.0
     colors = (
@@ -153,7 +153,7 @@ def _plot_cactus(
     )
     styles = ("-", "--", "-.", ":")
     maximum_completed = 0
-    for index, (label, times, counts) in enumerate(coordinates):
+    for index, (label, counts, times) in enumerate(coordinates):
         maximum_completed = max(maximum_completed, counts[-1])
         axis.step(
             times + [endpoint],
@@ -164,7 +164,7 @@ def _plot_cactus(
             linestyle=styles[(index + index // len(colors)) % len(styles)],
         )
     axis.set_xlabel("individual wall runtime (seconds)")
-    axis.set_ylabel("number of completed problems")
+    axis.set_ylabel("number of solved instances")
     axis.set_xlim(0.0, endpoint)
     tick_step = max(1, (maximum_completed + 9) // 10)
     axis.set_yticks(list(range(0, maximum_completed + 1, tick_step)))
@@ -181,12 +181,11 @@ def plot_comparison_cactus(
     destination: Path,
     timeout_seconds: Optional[float] = None,
 ) -> None:
-    """Compare methods (e.g. baseline and 4GES) using individual wall runtimes.
+    """Compare methods with individual runtimes on x and solved counts on y.
 
-    Runtimes are sorted, not summed: y counts completed problems whose runtime
-    is at most x. Other statuses never increase the count. All curves plateau
-    to the timeout, or the maximum observed runtime when no timeout is given;
-    completed runs beyond the timeout remain visible.
+    Runtimes are sorted, not summed. Other statuses never increase the solved
+    count. Curves extend horizontally to the timeout, or the maximum observed
+    runtime when no timeout is given; completed runs beyond it remain visible.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     figure, axis = plt.subplots(figsize=(10, 7))

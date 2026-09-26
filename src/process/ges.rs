@@ -1,7 +1,7 @@
 use crate::drat::DratLogger;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
-use crate::formula::extension::ExtensionMap;
+use crate::formula::extension::{ExtensionMap, ExtensionOrigin};
 use crate::formula::literal::Literal;
 use crate::heuristics::vsids::Vsids;
 use crate::history::History;
@@ -15,12 +15,29 @@ use std::io::Write;
 
 /// Reformulates live clauses with exact extension substitutions.
 ///
-/// Every compressible `!z` is first expanded through registered
-/// `z <-> (a & b)` definitions. The clause is then rerolled using substitutions
-/// that minimize its LBD under the current reasoning snapshot. The replacement
-/// is added before the source is deleted, so proof logging retains the source
-/// clause and extension axioms needed to RUP-check it.
-pub(crate) const MAX_CLAUSES_PER_PASS: usize = 250;
+/// By default, negated exact extension literals are recursively expanded through
+/// their `z <-> (a & b)` definitions, regardless of whether DIP or BVA created
+/// them. The clause is then rerolled using every exact substitution. With
+/// `ges_compress`, GES skips expansion and only rerolls literals already present
+/// in the source clause.
+/// With `ges_trail`, clauses used since the previous restart are selected first
+/// and the cursor fills any remaining budget without selecting duplicates.
+/// Replacements are added before their sources are deleted,
+/// preserving the proof dependencies needed to RUP-check them.
+pub(crate) const MIN_CLAUSES_PER_PASS: usize = 200;
+pub(crate) const MAX_CLAUSES_PER_PASS: usize = 3_000;
+pub(crate) const MAX_PARALLEL_CLAUSES_PER_PASS: usize = 12_000;
+const CLAUSES_PER_BUDGET_UNIT: usize = 1_000;
+const MIN_ADAPTIVE_CLAUSES_PER_PASS: usize = 50;
+const MIN_FEEDBACK_SAMPLES: u64 = 8;
+const MIN_ACCEPTED_PERCENT_FOR_GROWTH: u64 = 25;
+const DB_REDUCTION_PROTECTION: u8 = 3;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GesOptions {
+    pub(crate) substitution_only: bool,
+    pub(crate) trail_first: bool,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Policy {
@@ -28,6 +45,7 @@ pub(crate) enum Policy {
     Lbd,
     Random,
     Vsids,
+    Utility,
     Always,
 }
 
@@ -35,15 +53,17 @@ pub(crate) enum Policy {
 enum Objective {
     Lbd,
     Vsids,
+    Utility,
     Always,
 }
 
 impl Objective {
     fn uses_lbd(self) -> bool {
-        !matches!(self, Self::Vsids)
+        matches!(self, Self::Lbd | Self::Always)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn process<W: Write>(
     formula: &mut Formula,
     scope: &ClauseScope,
@@ -51,6 +71,26 @@ pub(crate) fn process<W: Write>(
     signal: Option<(Python<'_>, &mut u64)>,
     history: Option<&mut History>,
     reasoning_levels: Option<&[Option<usize>]>,
+) -> PyResult<()> {
+    process_with_options(
+        formula,
+        scope,
+        logger,
+        signal,
+        history,
+        reasoning_levels,
+        GesOptions::default(),
+    )
+}
+
+pub(crate) fn process_with_options<W: Write>(
+    formula: &mut Formula,
+    scope: &ClauseScope,
+    logger: &mut Option<DratLogger<W>>,
+    signal: Option<(Python<'_>, &mut u64)>,
+    history: Option<&mut History>,
+    reasoning_levels: Option<&[Option<usize>]>,
+    options: GesOptions,
 ) -> PyResult<()> {
     process_with_policy(
         formula,
@@ -60,6 +100,7 @@ pub(crate) fn process<W: Write>(
         history,
         reasoning_levels,
         Policy::Cursor,
+        options,
     )
 }
 
@@ -71,16 +112,19 @@ pub(crate) fn process_with_policy<W: Write>(
     history: Option<&mut History>,
     reasoning_levels: Option<&[Option<usize>]>,
     policy: Policy,
+    options: GesOptions,
 ) -> PyResult<()> {
     if let Some((py, steps)) = signal.as_mut() {
         signal_checker(*py, *steps)?;
     }
 
     let mut replacements = Vec::new();
-    let indices = select_clause_indices(formula, scope, policy);
-    let mut workspace = PassWorkspace::new(&formula.extensions);
+    let has_history = history.is_some();
+    let indices = select_clause_indices(formula, scope, policy, options, has_history);
+    let mut workspace = PassWorkspace::with_options(&formula.extensions, options);
     workspace.objective = match policy {
         Policy::Vsids => Objective::Vsids,
+        Policy::Utility => Objective::Utility,
         Policy::Always => Objective::Always,
         _ => Objective::Lbd,
     };
@@ -89,7 +133,7 @@ pub(crate) fn process_with_policy<W: Write>(
         let evaluation = workspace.evaluate(
             &formula.vsids,
             formula.get_clause_at_idx(clause_idx),
-            history.is_some(),
+            has_history,
             reasoning_levels,
         );
         reports.push(evaluation.report);
@@ -98,11 +142,80 @@ pub(crate) fn process_with_policy<W: Write>(
         }
     }
 
+    let inspected = reports.iter().map(|report| report.inspected).sum();
+    let unsuccessful = reports
+        .iter()
+        .map(|report| report.noop.saturating_add(report.rejected))
+        .sum();
+    let accepted = replacements.len() as u64;
     for report in reports {
         report.merge_into(formula);
     }
+    update_adaptive_clause_budget(formula, inspected, accepted, unsuccessful);
     commit_replacements(formula, replacements, logger, history);
     Ok(())
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct OriginCounts {
+    dip: u64,
+    bva: u64,
+    other: u64,
+}
+
+impl OriginCounts {
+    fn record(&mut self, origin: ExtensionOrigin) {
+        match origin {
+            ExtensionOrigin::Dip => self.dip += 1,
+            ExtensionOrigin::Bva => self.bva += 1,
+            ExtensionOrigin::Other => self.other += 1,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.dip += other.dip;
+        self.bva += other.bva;
+        self.other += other.other;
+    }
+
+    fn total(self) -> u64 {
+        self.dip + self.bva + self.other
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct RewriteTrace {
+    unrolled: OriginCounts,
+    source_literals: u64,
+    expanded_literals: u64,
+    substitutions: OriginCounts,
+}
+
+impl RewriteTrace {
+    fn report(self, noop: bool, rejected: bool, accepted: bool) -> EvaluationReport {
+        let was_unrolled = self.unrolled.total() != 0;
+        let was_rerolled = self.substitutions.total() != 0;
+        EvaluationReport {
+            inspected: 1,
+            noop: u64::from(noop),
+            rejected: u64::from(rejected),
+            clauses_unrolled: u64::from(was_unrolled),
+            dip_extensions_unrolled: self.unrolled.dip,
+            bva_extensions_unrolled: self.unrolled.bva,
+            other_extensions_unrolled: self.unrolled.other,
+            unrolled_source_literals: u64::from(was_unrolled) * self.source_literals,
+            unrolled_working_literals: u64::from(was_unrolled) * self.expanded_literals,
+            substitutions_after_unrolling: u64::from(was_unrolled) * self.substitutions.total(),
+            substitutions_to_dip: u64::from(was_unrolled) * self.substitutions.dip,
+            substitutions_to_bva: u64::from(was_unrolled) * self.substitutions.bva,
+            substitutions_to_other: u64::from(was_unrolled) * self.substitutions.other,
+            rewrites_after_unrolling: u64::from(was_unrolled && accepted),
+            rerolled_rewrites_after_unrolling: u64::from(was_unrolled && was_rerolled && accepted),
+            unrolled_rewrites_rejected: u64::from(was_unrolled && rejected),
+            unrolled_rewrites_restored: u64::from(was_unrolled && noop),
+            ..EvaluationReport::default()
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +225,23 @@ pub(crate) struct EvaluationReport {
     pub(crate) rejected: u64,
     pub(crate) lbd_improvements: u64,
     pub(crate) vsids_improvements: u64,
+    pub(crate) utility_improvements: u64,
     pub(crate) literals_removed: u64,
+    pub(crate) binary_clauses_compressed: u64,
+    pub(crate) clauses_unrolled: u64,
+    pub(crate) dip_extensions_unrolled: u64,
+    pub(crate) bva_extensions_unrolled: u64,
+    pub(crate) other_extensions_unrolled: u64,
+    pub(crate) unrolled_source_literals: u64,
+    pub(crate) unrolled_working_literals: u64,
+    pub(crate) substitutions_after_unrolling: u64,
+    pub(crate) substitutions_to_dip: u64,
+    pub(crate) substitutions_to_bva: u64,
+    pub(crate) substitutions_to_other: u64,
+    pub(crate) rewrites_after_unrolling: u64,
+    pub(crate) rerolled_rewrites_after_unrolling: u64,
+    pub(crate) unrolled_rewrites_rejected: u64,
+    pub(crate) unrolled_rewrites_restored: u64,
 }
 
 impl EvaluationReport {
@@ -122,7 +251,24 @@ impl EvaluationReport {
         formula.stats.ges_rewrites_rejected += self.rejected;
         formula.stats.ges_lbd_improvements += self.lbd_improvements;
         formula.stats.ges_vsids_improvements += self.vsids_improvements;
+        formula.stats.ges_utility_improvements += self.utility_improvements;
         formula.stats.ges_literals_removed += self.literals_removed;
+        formula.stats.ges_binary_clauses_compressed += self.binary_clauses_compressed;
+        formula.stats.ges_clauses_unrolled += self.clauses_unrolled;
+        formula.stats.ges_dip_extensions_unrolled += self.dip_extensions_unrolled;
+        formula.stats.ges_bva_extensions_unrolled += self.bva_extensions_unrolled;
+        formula.stats.ges_other_extensions_unrolled += self.other_extensions_unrolled;
+        formula.stats.ges_unrolled_source_literals += self.unrolled_source_literals;
+        formula.stats.ges_unrolled_working_literals += self.unrolled_working_literals;
+        formula.stats.ges_substitutions_after_unrolling += self.substitutions_after_unrolling;
+        formula.stats.ges_substitutions_to_dip += self.substitutions_to_dip;
+        formula.stats.ges_substitutions_to_bva += self.substitutions_to_bva;
+        formula.stats.ges_substitutions_to_other += self.substitutions_to_other;
+        formula.stats.ges_rewrites_after_unrolling += self.rewrites_after_unrolling;
+        formula.stats.ges_rerolled_rewrites_after_unrolling +=
+            self.rerolled_rewrites_after_unrolling;
+        formula.stats.ges_unrolled_rewrites_rejected += self.unrolled_rewrites_rejected;
+        formula.stats.ges_unrolled_rewrites_restored += self.unrolled_rewrites_restored;
     }
 }
 
@@ -156,15 +302,22 @@ pub(crate) fn evaluate_clause(
     PassWorkspace::new(extensions).evaluate(vsids, clause, has_history, reasoning_levels)
 }
 
+struct CachedExpansion {
+    literals: Option<Vec<Literal>>,
+    unrolled: OriginCounts,
+}
+
 /// Borrows one immutable extension snapshot, so cached expansions cannot outlive it.
 /// Parallel callers own one workspace per chunk, with no shared mutable cache.
 pub(crate) struct PassWorkspace<'a> {
     extensions: &'a ExtensionMap,
     objective: Objective,
+    substitution_only: bool,
     source_activities: Vec<f64>,
     final_activities: Vec<f64>,
-    expansions: HashMap<i32, Option<Vec<Literal>>>,
+    expansions: HashMap<i32, CachedExpansion>,
     cached_units: usize,
+    unrolled: OriginCounts,
     expanded: Vec<Literal>,
     expanding: HashSet<i32>,
     literals: Vec<Literal>,
@@ -180,14 +333,21 @@ pub(crate) struct PassWorkspace<'a> {
 const MAX_CACHED_EXPANSION_UNITS: usize = 65_536;
 
 impl<'a> PassWorkspace<'a> {
+    #[cfg(test)]
     pub(crate) fn new(extensions: &'a ExtensionMap) -> Self {
+        Self::with_options(extensions, GesOptions::default())
+    }
+
+    pub(crate) fn with_options(extensions: &'a ExtensionMap, options: GesOptions) -> Self {
         Self {
             extensions,
             objective: Objective::Lbd,
+            substitution_only: options.substitution_only,
             source_activities: Vec::new(),
             final_activities: Vec::new(),
             expansions: HashMap::new(),
             cached_units: 0,
+            unrolled: OriginCounts::default(),
             expanded: Vec::new(),
             expanding: HashSet::new(),
             literals: Vec::new(),
@@ -203,50 +363,53 @@ impl<'a> PassWorkspace<'a> {
     fn unroll(&mut self, source: &[Literal]) -> bool {
         self.literals.clear();
         self.literal_set.clear();
-        for &literal in source {
-            if self
-                .extensions
-                .substitution_inputs(&literal.negated())
-                .is_none()
-            {
-                if !append_expansion(&[literal], &mut self.literals, &mut self.literal_set) {
-                    return false;
-                }
-                continue;
-            }
-            let key = literal.get_index();
-            if let Some(cached) = self.expansions.get(&key) {
-                let Some(expansion) = cached else {
-                    return false;
-                };
-                if !append_expansion(expansion, &mut self.literals, &mut self.literal_set) {
-                    return false;
-                }
-                continue;
-            }
-            self.expanded.clear();
-            self.expanding.clear();
-            // Expand each root with an empty recursion stack. Caching a subtree
-            // reached inside a cycle would make the result context-dependent.
-            let valid = unroll_literal(
-                self.extensions,
-                literal,
-                &mut self.expanding,
-                &mut self.expanded,
-            );
-            let units = if valid { self.expanded.len() + 1 } else { 1 };
-            if units <= MAX_CACHED_EXPANSION_UNITS - self.cached_units {
-                self.expansions
-                    .insert(key, valid.then(|| self.expanded.clone()));
-                self.cached_units += units;
-            }
-            if !valid
-                || !append_expansion(&self.expanded, &mut self.literals, &mut self.literal_set)
-            {
-                return false;
-            }
+        self.unrolled = OriginCounts::default();
+        source
+            .iter()
+            .all(|&literal| self.append_source_expansion(literal))
+    }
+
+    fn append_source_expansion(&mut self, literal: Literal) -> bool {
+        if !has_exact_expansion(self.extensions, literal) {
+            return append_literal(literal, &mut self.literals, &mut self.literal_set);
         }
-        true
+
+        let key = literal.get_index();
+        if let Some(cached) = self.expansions.get(&key) {
+            self.unrolled.merge(cached.unrolled);
+            let Some(expansion) = cached.literals.as_deref() else {
+                return false;
+            };
+            return append_expansion(expansion, &mut self.literals, &mut self.literal_set);
+        }
+
+        self.expanded.clear();
+        self.expanding.clear();
+        // Only complete root expansions are cached. A subtree reached inside a
+        // cycle depends on the current recursion stack and cannot be reused.
+        let mut unrolled = OriginCounts::default();
+        let valid = unroll_literal(
+            self.extensions,
+            literal,
+            &mut self.expanding,
+            &mut self.expanded,
+            &mut unrolled,
+        );
+        self.unrolled.merge(unrolled);
+
+        let units = if valid { self.expanded.len() + 1 } else { 1 };
+        if units <= MAX_CACHED_EXPANSION_UNITS - self.cached_units {
+            self.expansions.insert(
+                key,
+                CachedExpansion {
+                    literals: valid.then(|| self.expanded.clone()),
+                    unrolled,
+                },
+            );
+            self.cached_units += units;
+        }
+
+        valid && append_expansion(&self.expanded, &mut self.literals, &mut self.literal_set)
     }
 
     pub(crate) fn evaluate(
@@ -256,12 +419,24 @@ impl<'a> PassWorkspace<'a> {
         has_history: bool,
         reasoning_levels: Option<&[Option<usize>]>,
     ) -> Evaluation {
-        // Extension axioms remain immutable. Only the isolated `ges_always`
-        // experiment may reformulate glue clauses.
-        if clause.lbd == 0
-            || (clause.lbd == 2 && self.objective != Objective::Always)
-            || (clause.lock_count != 0 && !has_history)
-        {
+        if clause.lock_count != 0 && (clause.lbd == 0 || !has_history) {
+            return Evaluation {
+                replacement: None,
+                report: EvaluationReport::default(),
+            };
+        }
+        if clause.lbd == 0 {
+            return if self.substitution_only {
+                direct_permanent_substitution(self, clause)
+            } else {
+                Evaluation {
+                    replacement: None,
+                    report: EvaluationReport::default(),
+                }
+            };
+        }
+        // Only the isolated `ges_always` experiment may reformulate glue clauses.
+        if clause.lbd == 2 && self.objective != Objective::Always {
             return Evaluation {
                 replacement: None,
                 report: EvaluationReport::default(),
@@ -271,20 +446,28 @@ impl<'a> PassWorkspace<'a> {
     }
 }
 
+fn append_literal(
+    literal: Literal,
+    literals: &mut Vec<Literal>,
+    seen: &mut HashSet<Literal>,
+) -> bool {
+    if seen.contains(&literal.negated()) {
+        return false;
+    }
+    if seen.insert(literal) {
+        literals.push(literal);
+    }
+    true
+}
+
 fn append_expansion(
     expansion: &[Literal],
     literals: &mut Vec<Literal>,
     seen: &mut HashSet<Literal>,
 ) -> bool {
-    for &literal in expansion {
-        if seen.contains(&literal.negated()) {
-            return false;
-        }
-        if seen.insert(literal) {
-            literals.push(literal);
-        }
-    }
-    true
+    expansion
+        .iter()
+        .all(|&literal| append_literal(literal, literals, seen))
 }
 
 pub(crate) fn commit_replacements<W: Write>(
@@ -296,10 +479,17 @@ pub(crate) fn commit_replacements<W: Write>(
     for (clause_idx, mut replacement) in replacements {
         // Keep proof order: the source clause is needed to RUP-check the
         // replacement, so add the replacement before logging its deletion.
-        let source_lock_count = formula.get_clause_at_idx(clause_idx).lock_count;
+        let source = formula.get_clause_at_idx(clause_idx);
+        let source_lock_count = source.lock_count;
+        replacement.activity = source.activity;
         replacement.lock_count = source_lock_count;
         replacement.ges_generated = true;
         replacement.ges_used = false;
+        replacement.ges_protection = if replacement.lbd > 0 {
+            DB_REDUCTION_PROTECTION
+        } else {
+            0
+        };
         for _ in 0..source_lock_count {
             formula.stats.record_ges_reason_use(&mut replacement);
         }
@@ -322,9 +512,29 @@ pub(crate) fn commit_replacements<W: Write>(
     }
 }
 
-fn select_clause_indices(formula: &mut Formula, scope: &ClauseScope, policy: Policy) -> Vec<usize> {
-    if matches!(policy, Policy::Cursor | Policy::Vsids | Policy::Always) {
-        return select_cursor_clause_indices(formula, scope, MAX_CLAUSES_PER_PASS);
+fn select_clause_indices(
+    formula: &mut Formula,
+    scope: &ClauseScope,
+    policy: Policy,
+    options: GesOptions,
+    has_history: bool,
+) -> Vec<usize> {
+    let budget = adaptive_serial_clause_budget(formula);
+    if options.trail_first {
+        return select_trail_then_cursor_clause_indices(
+            formula,
+            scope,
+            policy,
+            options,
+            has_history,
+            budget,
+        );
+    }
+    if matches!(
+        policy,
+        Policy::Cursor | Policy::Vsids | Policy::Utility | Policy::Always
+    ) {
+        return select_cursor_clause_indices(formula, scope, policy, options, has_history, budget);
     }
     let slots = formula.clause_slots_len();
     if slots == 0 {
@@ -334,7 +544,9 @@ fn select_clause_indices(formula: &mut Formula, scope: &ClauseScope, policy: Pol
         let mut tier3 = Vec::new();
         let mut tier2 = Vec::new();
         for (idx, clause) in formula.get_clauses() {
-            if scope.includes(idx, clause) && clause.lbd >= 3 {
+            if scope.includes(idx, clause)
+                && eligible_for_policy(clause, policy, options, has_history)
+            {
                 if clause.lbd > 6 {
                     tier3.push((idx, clause.lbd));
                 } else {
@@ -342,8 +554,8 @@ fn select_clause_indices(formula: &mut Formula, scope: &ClauseScope, policy: Pol
                 }
             }
         }
-        select_lbd_tier(&mut tier3, MAX_CLAUSES_PER_PASS);
-        let remaining = MAX_CLAUSES_PER_PASS - tier3.len();
+        select_lbd_tier(&mut tier3, budget);
+        let remaining = budget - tier3.len();
         if remaining != 0 {
             select_lbd_tier(&mut tier2, remaining);
             tier3.extend(tier2);
@@ -351,21 +563,218 @@ fn select_clause_indices(formula: &mut Formula, scope: &ClauseScope, policy: Pol
         return tier3.into_iter().map(|(idx, _)| idx).collect();
     }
     let start = rand::random_range(0..slots);
-    sequential_clause_window(formula, scope, start, MAX_CLAUSES_PER_PASS)
+    sequential_clause_window(formula, scope, start, budget, policy, options, has_history)
         .map(|(idx, _)| idx)
         .collect()
 }
 
-/// Count live scoped entries, including clauses protected from evaluation.
-/// An empty window leaves the shared cursor unchanged.
+fn eligible_for_policy(
+    clause: &Clause,
+    policy: Policy,
+    options: GesOptions,
+    has_history: bool,
+) -> bool {
+    if clause.lock_count != 0 && (clause.lbd == 0 || !has_history) {
+        return false;
+    }
+    if clause.lbd == 0 {
+        return options.substitution_only && clause.len() >= 2;
+    }
+    if clause.lbd == 2 && !matches!(policy, Policy::Always) {
+        return false;
+    }
+    if matches!(policy, Policy::Lbd) {
+        return clause.lbd >= 3;
+    }
+    true
+}
+
+pub(crate) fn serial_clause_budget(live_clauses: usize) -> usize {
+    if live_clauses == 0 {
+        return 0;
+    }
+    live_clauses
+        .div_ceil(CLAUSES_PER_BUDGET_UNIT)
+        .clamp(MIN_CLAUSES_PER_PASS, MAX_CLAUSES_PER_PASS)
+        .min(live_clauses)
+}
+
+/// Returns the current serial work slot. Feedback is applied after evaluation,
+/// when both immediate pass productivity and delayed replacement usefulness are
+/// available.
+pub(crate) fn adaptive_serial_clause_budget(formula: &mut Formula) -> usize {
+    let live_clauses = formula.live_clause_count();
+    if live_clauses == 0 {
+        formula.stats.ges_current_budget = 0;
+        return 0;
+    }
+
+    if formula.ges_clause_budget == 0 {
+        formula.ges_clause_budget = serial_clause_budget(live_clauses);
+    }
+    let budget = formula.ges_clause_budget.min(live_clauses);
+    formula.stats.ges_current_budget = budget as u64;
+    formula.stats.ges_peak_budget = formula.stats.ges_peak_budget.max(budget as u64);
+    budget
+}
+
+/// Adjusts the next serial slot. A mostly unsuccessful pass backs off
+/// immediately. Growth requires both frequent accepted rewrites in this pass
+/// and enough older replacements resolving as useful; repeated uses of one hot
+/// clause therefore cannot grow the budget by themselves.
+pub(crate) fn update_adaptive_clause_budget(
+    formula: &mut Formula,
+    inspected: u64,
+    accepted: u64,
+    unsuccessful: u64,
+) {
+    let useful = formula.stats.ges_replacements_used;
+    let deleted_unused = formula.stats.ges_replacements_deleted_unused;
+    let new_useful = useful.saturating_sub(formula.ges_feedback_used);
+    let new_deleted_unused = deleted_unused.saturating_sub(formula.ges_feedback_deleted_unused);
+    let samples = new_useful.saturating_add(new_deleted_unused);
+    formula.ges_feedback_used = useful;
+    formula.ges_feedback_deleted_unused = deleted_unused;
+
+    if formula.ges_clause_budget == 0 || inspected == 0 {
+        return;
+    }
+
+    let poor_pass = unsuccessful.saturating_mul(2) > inspected;
+    let poor_delayed_feedback =
+        samples >= MIN_FEEDBACK_SAMPLES && new_useful.saturating_mul(4) <= samples;
+    let productive_pass =
+        accepted.saturating_mul(100) >= inspected.saturating_mul(MIN_ACCEPTED_PERCENT_FOR_GROWTH);
+    let useful_delayed_feedback =
+        samples >= MIN_FEEDBACK_SAMPLES && new_useful.saturating_mul(2) >= samples;
+
+    if poor_pass || poor_delayed_feedback {
+        let previous = formula.ges_clause_budget;
+        formula.ges_clause_budget = previous
+            .saturating_sub(previous.div_ceil(4))
+            .max(MIN_ADAPTIVE_CLAUSES_PER_PASS);
+        formula.stats.ges_budget_decreases += u64::from(formula.ges_clause_budget < previous);
+    } else if productive_pass && useful_delayed_feedback {
+        let previous = formula.ges_clause_budget;
+        formula.ges_clause_budget = previous
+            .saturating_add(previous.div_ceil(4))
+            .min(MAX_CLAUSES_PER_PASS);
+        formula.stats.ges_budget_increases += u64::from(formula.ges_clause_budget > previous);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parallel_clause_budget(live_clauses: usize, threads: usize) -> usize {
+    serial_clause_budget(live_clauses)
+        .saturating_mul(threads)
+        .min(MAX_PARALLEL_CLAUSES_PER_PASS)
+        .min(live_clauses)
+}
+
+pub(crate) fn adaptive_parallel_clause_budget(
+    live_clauses: usize,
+    serial_budget: usize,
+    threads: usize,
+) -> usize {
+    serial_budget
+        .saturating_mul(threads)
+        .min(MAX_PARALLEL_CLAUSES_PER_PASS)
+        .min(live_clauses)
+}
+
+/// Selects unique trail-touched clauses in first-touch order, then fills the
+/// remaining budget from the cursor without evaluating a touched clause twice.
+/// The cursor advances only over fallback work; a trail-filled pass leaves it
+/// unchanged for future database coverage.
+pub(crate) fn select_trail_then_cursor_clause_indices(
+    formula: &mut Formula,
+    scope: &ClauseScope,
+    policy: Policy,
+    options: GesOptions,
+    has_history: bool,
+    limit: usize,
+) -> Vec<usize> {
+    let slots = formula.clause_slots_len();
+    if slots == 0 || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut indices = Vec::with_capacity(limit);
+    let mut selected = HashSet::with_capacity(limit);
+    for &clause_idx in &formula.ges_trail_touched {
+        if indices.len() == limit {
+            break;
+        }
+        if clause_idx >= slots || formula.is_clause_garbage(clause_idx) {
+            continue;
+        }
+        let clause = formula.get_clause_at_idx(clause_idx);
+        if scope.includes(clause_idx, clause)
+            && eligible_for_policy(clause, policy, options, has_history)
+            && selected.insert(clause_idx)
+        {
+            indices.push(clause_idx);
+        }
+    }
+    let trail_selected = indices.len();
+
+    let start = formula.ges_cursor % slots;
+    let mut fallback_selected = 0;
+    let mut duplicate_skips = 0;
+    let mut last_fallback = None;
+    if indices.len() < limit {
+        for clause_idx in (start..slots).chain(0..start) {
+            if formula.is_clause_garbage(clause_idx) {
+                continue;
+            }
+            let clause = formula.get_clause_at_idx(clause_idx);
+            if !scope.includes(clause_idx, clause)
+                || !eligible_for_policy(clause, policy, options, has_history)
+            {
+                continue;
+            }
+            if !selected.insert(clause_idx) {
+                duplicate_skips += 1;
+                continue;
+            }
+            indices.push(clause_idx);
+            fallback_selected += 1;
+            last_fallback = Some(clause_idx);
+            if indices.len() == limit {
+                break;
+            }
+        }
+    }
+
+    if let Some(last) = last_fallback {
+        formula.ges_cursor = (last + 1) % slots;
+    }
+    formula.stats.ges_trail_clauses_selected += trail_selected as u64;
+    formula.stats.ges_trail_cursor_selected += fallback_selected as u64;
+    formula.stats.ges_trail_duplicate_skips += duplicate_skips;
+    indices
+}
+
+/// Select eligible clauses in cursor order. An empty window leaves the cursor unchanged.
 pub(crate) fn select_cursor_clause_indices(
     formula: &mut Formula,
     scope: &ClauseScope,
+    policy: Policy,
+    options: GesOptions,
+    has_history: bool,
     limit: usize,
 ) -> Vec<usize> {
-    let indices: Vec<_> = sequential_clause_window(formula, scope, formula.ges_cursor, limit)
-        .map(|(idx, _)| idx)
-        .collect();
+    let indices: Vec<_> = sequential_clause_window(
+        formula,
+        scope,
+        formula.ges_cursor,
+        limit,
+        policy,
+        options,
+        has_history,
+    )
+    .map(|(idx, _)| idx)
+    .collect();
     if let Some(&last) = indices.last() {
         formula.ges_cursor = (last + 1) % formula.clause_slots_len();
     }
@@ -388,6 +797,9 @@ fn sequential_clause_window<'a>(
     scope: &'a ClauseScope,
     start: usize,
     limit: usize,
+    policy: Policy,
+    options: GesOptions,
+    has_history: bool,
 ) -> impl Iterator<Item = (usize, &'a Clause)> + 'a {
     let slots = formula.clause_slots_len();
     let start = if slots == 0 { 0 } else { start % slots };
@@ -395,7 +807,10 @@ fn sequential_clause_window<'a>(
         .chain(0..start)
         .filter(move |&idx| !formula.is_clause_garbage(idx))
         .map(move |idx| (idx, formula.get_clause_at_idx(idx)))
-        .filter(move |(idx, clause)| scope.includes(*idx, clause))
+        .filter(move |(idx, clause)| {
+            scope.includes(*idx, clause)
+                && eligible_for_policy(clause, policy, options, has_history)
+        })
         .take(limit)
 }
 
@@ -430,8 +845,23 @@ fn substitute_snapshot(
     let source_lbd = objective
         .uses_lbd()
         .then(|| dynamic_lbd_with_scratch(source, reasoning_levels, &mut workspace.frequencies));
-    if !workspace.unroll(source) {
-        return Evaluation::without_replacement(false, true);
+    let mut trace = RewriteTrace {
+        source_literals: source.len() as u64,
+        ..RewriteTrace::default()
+    };
+    if workspace.substitution_only {
+        workspace.literals.clear();
+        workspace.literals.extend_from_slice(source);
+    } else {
+        let valid = workspace.unroll(source);
+        trace.unrolled = workspace.unrolled;
+        trace.expanded_literals = workspace.literals.len() as u64;
+        if !valid {
+            return Evaluation {
+                replacement: None,
+                report: trace.report(false, true, false),
+            };
+        }
     }
     let PassWorkspace {
         extensions,
@@ -466,7 +896,10 @@ fn substitute_snapshot(
                 continue;
             }
 
-            let activity = vsids.literal_activity(&replacement);
+            let activity = match objective {
+                Objective::Utility => extensions.literal_utility(&replacement),
+                _ => vsids.literal_activity(&replacement),
+            };
             let candidate_lbd = match objective {
                 Objective::Lbd | Objective::Always => {
                     let lbd = substitution_lbd(
@@ -480,16 +913,20 @@ fn substitute_snapshot(
                     }
                     lbd
                 }
-                Objective::Vsids => {
-                    // Equal activities permit intermediate steps towards a
-                    // hotter extension, but never consume a hotter input.
-                    if activity < vsids.literal_activity(&literals[left_idx])
-                        || activity < vsids.literal_activity(&literals[right_idx])
+                Objective::Vsids | Objective::Utility => {
+                    let input_activity = |literal: &Literal| match objective {
+                        Objective::Utility => extensions.literal_utility(literal),
+                        _ => vsids.literal_activity(literal),
+                    };
+                    // Equal scores permit intermediate steps towards a hotter
+                    // extension, but never consume a hotter input.
+                    if activity < input_activity(&literals[left_idx])
+                        || activity < input_activity(&literals[right_idx])
                     {
                         continue;
                     }
-                    // All candidates share this neutral rank: only activity
-                    // and then the existing literal-position order decide.
+                    // All candidates share this neutral rank: only the selected
+                    // objective and then literal-position order decide.
                     0
                 }
             };
@@ -505,6 +942,13 @@ fn substitute_snapshot(
         let Some((_, _, left_idx, right_idx, replacement)) = best else {
             break;
         };
+        if trace.unrolled.total() != 0 {
+            trace.substitutions.record(
+                extensions
+                    .substitution_origin(&replacement)
+                    .unwrap_or(ExtensionOrigin::Other),
+            );
+        }
         literals.remove(right_idx);
         literals.remove(left_idx);
         if objective.uses_lbd() {
@@ -525,28 +969,51 @@ fn substitute_snapshot(
     source_set.extend(source.iter().copied());
     // Working literals are unique after expansion and every substitution.
     if source_set.len() == literals.len() && literals.iter().all(|lit| source_set.contains(lit)) {
-        return Evaluation::without_replacement(true, false);
+        return Evaluation {
+            replacement: None,
+            report: trace.report(true, false, false),
+        };
     }
     if literals.len() > source.len() {
-        return Evaluation::without_replacement(false, true);
+        return Evaluation {
+            replacement: None,
+            report: trace.report(false, true, false),
+        };
     }
-    if objective == Objective::Vsids
-        && !activities_improve(vsids, source, literals, source_activities, final_activities)
-    {
-        return Evaluation::without_replacement(false, true);
+    let score_improves = match objective {
+        Objective::Vsids => {
+            activities_improve(vsids, source, literals, source_activities, final_activities)
+        }
+        Objective::Utility => utilities_improve(
+            extensions,
+            source,
+            literals,
+            source_activities,
+            final_activities,
+        ),
+        _ => true,
+    };
+    if !score_improves {
+        return Evaluation {
+            replacement: None,
+            report: trace.report(false, true, false),
+        };
     }
-    // VSIDS never uses LBD for ranking or acceptance, only for the existing
-    // learned-clause metadata update after its activity check succeeds.
+    // Activity objectives never use LBD for ranking or acceptance, only for the
+    // existing learned-clause metadata update after their score check succeeds.
     let current_lbd = match objective {
         Objective::Lbd | Objective::Always => saturate_lbd(frequencies.len()),
-        Objective::Vsids if clause.lbd > 2 => {
+        Objective::Vsids | Objective::Utility if clause.lbd > 2 => {
             dynamic_lbd_with_scratch(literals, reasoning_levels, frequencies)
         }
-        Objective::Vsids => 0, // Original clauses keep their sentinel; no LBD work needed.
+        Objective::Vsids | Objective::Utility => 0,
     };
     if objective == Objective::Lbd && source_lbd.is_some_and(|source_lbd| current_lbd >= source_lbd)
     {
-        return Evaluation::without_replacement(false, true);
+        return Evaluation {
+            replacement: None,
+            report: trace.report(false, true, false),
+        };
     }
     let literals_removed = (source.len() - literals.len()) as u64;
     let lbd = match (objective, clause.lbd) {
@@ -560,7 +1027,72 @@ fn substitute_snapshot(
     };
     // Only accepted clauses need owned storage; retain the working capacity.
     let mut replacement = Clause::from_literals(literals.clone(), lbd);
-    replacement.activity = clause.activity;
+    replacement.bva_generated = clause.bva_generated;
+    replacement.ges_generated = true;
+    replacement.ges_used = false;
+    let mut report = trace.report(false, false, true);
+    report.lbd_improvements = u64::from(match objective {
+        Objective::Lbd => true,
+        Objective::Always => source_lbd.is_some_and(|source| current_lbd < source),
+        Objective::Vsids | Objective::Utility => false,
+    });
+    report.vsids_improvements = u64::from(objective == Objective::Vsids);
+    report.utility_improvements = u64::from(objective == Objective::Utility);
+    report.literals_removed = literals_removed;
+    Evaluation {
+        replacement: Some(replacement),
+        report,
+    }
+}
+
+fn direct_permanent_substitution(workspace: &mut PassWorkspace<'_>, clause: &Clause) -> Evaluation {
+    let PassWorkspace {
+        extensions,
+        literals,
+        positions,
+        pairs,
+        ..
+    } = workspace;
+    literals.clear();
+    literals.extend_from_slice(clause.get_literals());
+    let source_len = literals.len();
+
+    while literals.len() >= 2 {
+        fill_substitution_pairs(extensions, literals, positions, pairs);
+        let best = pairs
+            .iter()
+            .copied()
+            .filter(|&(_, _, replacement)| !literals.contains(&replacement.negated()))
+            .min_by_key(|&(left, right, replacement)| {
+                let replacement_survives = literals
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, literal)| idx != left && idx != right && *literal == replacement);
+                (usize::from(!replacement_survives), left, right)
+            });
+        let Some((left_idx, right_idx, replacement)) = best else {
+            break;
+        };
+
+        literals.remove(right_idx);
+        literals.remove(left_idx);
+        if !literals.contains(&replacement) {
+            literals.push(replacement);
+        }
+    }
+
+    if literals.len() == source_len {
+        return Evaluation {
+            replacement: None,
+            report: EvaluationReport {
+                inspected: 1,
+                noop: 1,
+                ..EvaluationReport::default()
+            },
+        };
+    }
+
+    let mut replacement = Clause::from_literals(literals.clone(), 0);
     replacement.bva_generated = clause.bva_generated;
     replacement.ges_generated = true;
     replacement.ges_used = false;
@@ -568,13 +1100,8 @@ fn substitute_snapshot(
         replacement: Some(replacement),
         report: EvaluationReport {
             inspected: 1,
-            lbd_improvements: u64::from(match objective {
-                Objective::Lbd => true,
-                Objective::Always => source_lbd.is_some_and(|source| current_lbd < source),
-                Objective::Vsids => false,
-            }),
-            vsids_improvements: u64::from(objective == Objective::Vsids),
-            literals_removed,
+            literals_removed: (source_len - literals.len()) as u64,
+            binary_clauses_compressed: u64::from(source_len == 2 && literals.len() == 1),
             ..EvaluationReport::default()
         },
     }
@@ -587,18 +1114,50 @@ fn activities_improve(
     source_activities: &mut Vec<f64>,
     final_activities: &mut Vec<f64>,
 ) -> bool {
-    for (literals, activities) in [
-        (source, &mut *source_activities),
-        (candidate, &mut *final_activities),
+    scores_improve(
+        source,
+        candidate,
+        source_activities,
+        final_activities,
+        |literal| vsids.literal_activity(literal),
+    )
+}
+
+fn utilities_improve(
+    extensions: &ExtensionMap,
+    source: &[Literal],
+    candidate: &[Literal],
+    source_utilities: &mut Vec<f64>,
+    final_utilities: &mut Vec<f64>,
+) -> bool {
+    scores_improve(
+        source,
+        candidate,
+        source_utilities,
+        final_utilities,
+        |literal| extensions.literal_utility(literal),
+    )
+}
+
+fn scores_improve(
+    source: &[Literal],
+    candidate: &[Literal],
+    source_scores: &mut Vec<f64>,
+    final_scores: &mut Vec<f64>,
+    score: impl Fn(&Literal) -> f64,
+) -> bool {
+    for (literals, scores) in [
+        (source, &mut *source_scores),
+        (candidate, &mut *final_scores),
     ] {
-        activities.clear();
-        activities.extend(literals.iter().map(|lit| vsids.literal_activity(lit)));
-        activities.sort_unstable_by(|a, b| b.total_cmp(a));
+        scores.clear();
+        scores.extend(literals.iter().map(&score));
+        scores.sort_unstable_by(|a, b| b.total_cmp(a));
     }
-    // A proper prefix only removes activity entries; it is not an improvement.
-    source_activities
+    // A proper prefix only removes score entries; it is not an improvement.
+    source_scores
         .iter()
-        .zip(final_activities.iter())
+        .zip(final_scores.iter())
         .find_map(|(source, candidate)| (source != candidate).then_some(candidate > source))
         .unwrap_or(false)
 }
@@ -661,12 +1220,25 @@ fn apply_substitution(
 fn unroll_clause(extensions: &ExtensionMap, literals: &[Literal]) -> Option<Vec<Literal>> {
     let mut unrolled = Vec::new();
     let mut expanding = HashSet::new();
+    let mut origins = OriginCounts::default();
     for &literal in literals {
-        if !unroll_literal(extensions, literal, &mut expanding, &mut unrolled) {
+        if !unroll_literal(
+            extensions,
+            literal,
+            &mut expanding,
+            &mut unrolled,
+            &mut origins,
+        ) {
             return None;
         }
     }
     Some(unrolled)
+}
+
+fn has_exact_expansion(extensions: &ExtensionMap, literal: Literal) -> bool {
+    extensions
+        .substitution_inputs_with_origin(&literal.negated())
+        .is_some()
 }
 
 fn unroll_literal(
@@ -674,13 +1246,15 @@ fn unroll_literal(
     literal: Literal,
     expanding: &mut HashSet<i32>,
     unrolled: &mut Vec<Literal>,
+    origins: &mut OriginCounts,
 ) -> bool {
     let substitute = literal.negated();
-    if let Some((first, second)) = extensions.substitution_inputs(&substitute)
+    if let Some((first, second, origin)) = extensions.substitution_inputs_with_origin(&substitute)
         && expanding.insert(substitute.get_index())
     {
-        let valid = unroll_literal(extensions, first.negated(), expanding, unrolled)
-            && unroll_literal(extensions, second.negated(), expanding, unrolled);
+        origins.record(origin);
+        let valid = unroll_literal(extensions, first.negated(), expanding, unrolled, origins)
+            && unroll_literal(extensions, second.negated(), expanding, unrolled, origins);
         expanding.remove(&substitute.get_index());
         return valid;
     }
@@ -846,6 +1420,12 @@ mod tests {
         workspace.evaluate(&formula.vsids, clause, false, levels)
     }
 
+    fn evaluate_utility(formula: &Formula, clause: &Clause) -> Evaluation {
+        let mut workspace = PassWorkspace::new(&formula.extensions);
+        workspace.objective = Objective::Utility;
+        workspace.evaluate(&formula.vsids, clause, false, None)
+    }
+
     fn vsids_fixture(definitions: &[(i32, i32, i32)], activities: &[f64]) -> Formula {
         let mut formula = Formula::new(activities.len() - 1);
         for &(a, b, z) in definitions {
@@ -857,6 +1437,51 @@ mod tests {
         }
         formula.vsids.activity.copy_from_slice(activities);
         formula
+    }
+
+    #[test]
+    fn utility_prefers_propagated_signed_replacement_without_changing_vsids() {
+        let mut formula = Formula::new(4);
+        formula
+            .extensions
+            .add_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(4));
+        formula
+            .extensions
+            .bump_propagation_utility(&Literal::new(-4));
+        formula
+            .extensions
+            .bump_propagation_utility(&Literal::new(-4));
+        let clause = Clause::from_literals([-1, -2, 3].map(Literal::new).to_vec(), -1);
+
+        let evaluation = evaluate_utility(&formula, &clause);
+        assert_eq!(
+            evaluation.replacement.unwrap().get_literals(),
+            [3, -4].map(Literal::new)
+        );
+        assert_eq!(evaluation.report.utility_improvements, 1);
+        assert_eq!(evaluation.report.vsids_improvements, 0);
+        assert!(
+            formula
+                .vsids
+                .activity
+                .iter()
+                .all(|activity| *activity == 0.0)
+        );
+
+        let mut opposite_only = Formula::new(4);
+        opposite_only.extensions.add_substitution(
+            &Literal::new(1),
+            &Literal::new(2),
+            &Literal::new(4),
+        );
+        opposite_only
+            .extensions
+            .bump_propagation_utility(&Literal::new(4));
+        assert!(
+            evaluate_utility(&opposite_only, &clause)
+                .replacement
+                .is_none()
+        );
     }
 
     #[test]
@@ -991,7 +1616,9 @@ mod tests {
 
     #[test]
     fn vsids_cursor_budget_and_proof_stats_match_shared_infrastructure() {
-        let mut formula = Formula::from_vec(vec![vec![-1, -2, 4]; MAX_CLAUSES_PER_PASS + 2]);
+        let count = MIN_CLAUSES_PER_PASS + 2;
+        let budget = serial_clause_budget(count);
+        let mut formula = Formula::from_vec(vec![vec![-1, -2, 4]; count]);
         let mut proof = Vec::new();
         let mut logger = Some(DratLogger::new(&mut proof));
         let z = extension_literal(
@@ -1007,17 +1634,11 @@ mod tests {
             .unwrap();
         drop(logger);
         assert!(!formula.is_clause_garbage(0));
-        assert!(!formula.is_clause_garbage(MAX_CLAUSES_PER_PASS + 1));
-        assert_eq!(formula.ges_cursor, MAX_CLAUSES_PER_PASS + 1);
-        assert_eq!(
-            formula.stats.ges_vsids_improvements,
-            MAX_CLAUSES_PER_PASS as u64
-        );
+        assert!(!formula.is_clause_garbage(count - 1));
+        assert_eq!(formula.ges_cursor, budget + 1);
+        assert_eq!(formula.stats.ges_vsids_improvements, budget as u64);
         assert_eq!(formula.stats.ges_lbd_improvements, 0);
-        assert_eq!(
-            formula.stats.ges_literals_removed,
-            MAX_CLAUSES_PER_PASS as u64
-        );
+        assert_eq!(formula.stats.ges_literals_removed, budget as u64);
         let proof = String::from_utf8(proof).unwrap();
         assert!(proof.ends_with("4 -5 0\nd -1 -2 4 0\n"));
     }
@@ -1072,9 +1693,174 @@ mod tests {
     }
 
     #[test]
+    fn locked_permanent_clause_is_not_directly_compressed() {
+        let mut formula = Formula::new(3);
+        formula
+            .extensions
+            .add_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(3));
+        let mut clause = Clause::from_literals([-1, -2].map(Literal::new).to_vec(), 0);
+        clause.increment_lock_count();
+
+        for has_history in [false, true] {
+            let mut workspace = PassWorkspace::with_options(
+                &formula.extensions,
+                GesOptions {
+                    substitution_only: true,
+                    ..GesOptions::default()
+                },
+            );
+            let evaluation = workspace.evaluate(&formula.vsids, &clause, has_history, None);
+            assert!(evaluation.replacement.is_none());
+            assert_eq!(evaluation.report, EvaluationReport::default());
+        }
+    }
+
+    #[test]
+    fn compression_only_skips_unrolling_and_substitutes_existing_literals() {
+        let mut formula = Formula::new(6);
+        formula.extensions.add_dip_substitution(
+            &Literal::new(1),
+            &Literal::new(2),
+            &Literal::new(4),
+        );
+        formula.extensions.add_bva_substitution(
+            &Literal::new(1),
+            &Literal::new(3),
+            &Literal::new(5),
+        );
+        formula.extensions.add_dip_substitution(
+            &Literal::new(2),
+            &Literal::new(5),
+            &Literal::new(6),
+        );
+        formula.vsids.activity[5] = 10.0;
+        formula.vsids.activity[6] = 20.0;
+        let clause = Clause::from_literals([-4, -3].map(Literal::new).to_vec(), -1);
+
+        let mut regular = PassWorkspace::new(&formula.extensions);
+        regular.objective = Objective::Vsids;
+        let regular = regular.evaluate(&formula.vsids, &clause, false, None);
+        assert_eq!(
+            regular.replacement.unwrap().get_literals(),
+            &[Literal::new(-6)]
+        );
+        assert_eq!(regular.report.clauses_unrolled, 1);
+        assert_eq!(regular.report.dip_extensions_unrolled, 1);
+        assert_eq!(regular.report.bva_extensions_unrolled, 0);
+        assert_eq!(regular.report.unrolled_source_literals, 2);
+        assert_eq!(regular.report.unrolled_working_literals, 3);
+        assert_eq!(regular.report.substitutions_after_unrolling, 2);
+        assert_eq!(regular.report.substitutions_to_dip, 1);
+        assert_eq!(regular.report.substitutions_to_bva, 1);
+        assert_eq!(regular.report.rewrites_after_unrolling, 1);
+        assert_eq!(regular.report.rerolled_rewrites_after_unrolling, 1);
+
+        let mut compression_only = PassWorkspace::with_options(
+            &formula.extensions,
+            GesOptions {
+                substitution_only: true,
+                ..GesOptions::default()
+            },
+        );
+        compression_only.objective = Objective::Vsids;
+        let evaluation = compression_only.evaluate(&formula.vsids, &clause, false, None);
+        assert!(evaluation.replacement.is_none());
+        assert_eq!(
+            evaluation.report,
+            Evaluation::without_replacement(true, false).report
+        );
+
+        let directly_compressible =
+            Clause::from_literals([-1, -3, 2].map(Literal::new).to_vec(), -1);
+        assert!(
+            compression_only
+                .evaluate(&formula.vsids, &directly_compressible, false, None)
+                .replacement
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn traces_unroll_reroll_round_trips_as_restored() {
+        let mut formula = Formula::new(4);
+        formula.extensions.add_dip_substitution(
+            &Literal::new(1),
+            &Literal::new(2),
+            &Literal::new(3),
+        );
+        let clause = Clause::from_literals([-3, 4].map(Literal::new).to_vec(), -1);
+        let evaluation =
+            PassWorkspace::new(&formula.extensions).evaluate(&formula.vsids, &clause, false, None);
+
+        assert!(evaluation.replacement.is_none());
+        assert_eq!(evaluation.report.noop, 1);
+        assert_eq!(evaluation.report.clauses_unrolled, 1);
+        assert_eq!(evaluation.report.dip_extensions_unrolled, 1);
+        assert_eq!(evaluation.report.substitutions_after_unrolling, 1);
+        assert_eq!(evaluation.report.substitutions_to_dip, 1);
+        assert_eq!(evaluation.report.rewrites_after_unrolling, 0);
+        assert_eq!(evaluation.report.rerolled_rewrites_after_unrolling, 0);
+        assert_eq!(evaluation.report.unrolled_rewrites_restored, 1);
+    }
+
+    #[test]
+    fn directly_compresses_a_permanent_extension_axiom_to_a_permanent_unit() {
+        let mut formula = Formula::new(2);
+        let mut proof = Vec::new();
+        let mut logger = Some(DratLogger::new(&mut proof));
+        let z = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let nested = extension_literal(&mut formula, &mut logger, &z, &Literal::new(-1));
+        let scope = full_scope(&formula);
+
+        assert_eq!(
+            formula.get_clause_at_idx(1).get_literals(),
+            &[z.negated(), Literal::new(1)]
+        );
+        process(&mut formula, &scope, &mut logger, None, None, None).unwrap();
+        assert!(!formula.is_clause_garbage(1));
+        assert_eq!(formula.stats.ges_binary_clauses_compressed, 0);
+
+        formula
+            .process(
+                vec![
+                    crate::process::Process::GES,
+                    crate::process::Process::GESCompress,
+                ],
+                &scope,
+                &mut logger,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        drop(logger);
+
+        assert!(formula.is_clause_garbage(1));
+        let replacement = formula.get_clause_at_idx(6);
+        assert_eq!(replacement.get_literals(), &[nested.negated()]);
+        assert_eq!(replacement.lbd, 0);
+        assert_eq!(replacement.ges_protection, 0);
+        assert!(replacement.ges_generated);
+        assert_eq!(formula.stats.ges_clauses_inspected, 6);
+        assert_eq!(formula.stats.ges_noop_rewrites, 5);
+        assert_eq!(formula.stats.ges_literals_removed, 1);
+        assert_eq!(formula.stats.ges_binary_clauses_compressed, 1);
+        assert_eq!(formula.stats.global_extension_substitution, 1);
+        let proof = String::from_utf8(proof).unwrap();
+        assert!(proof.ends_with("-4 0\nd -3 1 0\n"));
+    }
+
+    #[test]
     fn always_wrapper_uses_cursor_budget_shared_commit_and_current_lbd() {
         let mut formula = Formula::from_vec(vec![vec![-1, -2, 3, 4]]);
         formula.get_clause_at_idx_mut(0).lbd = 2;
+        formula.get_clause_at_idx_mut(0).activity = 9;
         let mut proof = Vec::new();
         let mut logger = Some(DratLogger::new(&mut proof));
         let extension = extension_literal(
@@ -1098,10 +1884,11 @@ mod tests {
         drop(logger);
 
         assert!(formula.is_clause_garbage(0));
-        assert_eq!(formula.ges_cursor, 0);
+        assert_eq!(formula.ges_cursor, 1);
         let replacement = formula.get_clause_at_idx(4);
         assert_eq!(replacement.get_literals(), [3, 4, -5].map(Literal::new));
         assert_eq!(replacement.lbd, 3);
+        assert_eq!(replacement.activity, 9);
         assert_eq!(formula.stats.ges_clauses_inspected, 1);
         assert_eq!(formula.stats.ges_lbd_improvements, 0);
         assert_eq!(formula.stats.ges_literals_removed, 1);
@@ -1152,6 +1939,52 @@ mod tests {
     }
 
     #[test]
+    fn expansion_cache_recursively_flattens_dip_and_exact_bva_extensions() {
+        let mut extensions = ExtensionMap::new();
+        extensions.add_dip_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(10));
+        extensions.add_bva_substitution(&Literal::new(3), &Literal::new(4), &Literal::new(11));
+        extensions.add_dip_substitution(&Literal::new(10), &Literal::new(11), &Literal::new(20));
+        let mut workspace = PassWorkspace::new(&extensions);
+
+        let expected = [-4, -3, -2, -1].map(Literal::new);
+        assert!(workspace.unroll(&[Literal::new(-20)]));
+        assert_eq!(workspace.literals, expected);
+        assert_eq!(workspace.unrolled.dip, 2);
+        assert_eq!(workspace.unrolled.bva, 1);
+        assert_eq!(
+            workspace.expansions[&-20].literals.as_deref(),
+            Some(expected.as_slice())
+        );
+
+        assert!(workspace.unroll(&[Literal::new(-20)]));
+        assert_eq!(workspace.literals, expected);
+        assert_eq!(workspace.unrolled.dip, 2);
+        assert_eq!(workspace.unrolled.bva, 1);
+    }
+
+    #[test]
+    fn exact_bva_expansion_that_rerolls_to_source_is_a_noop() {
+        let mut formula = Formula::new(11);
+        formula.extensions.add_bva_substitution(
+            &Literal::new(3),
+            &Literal::new(4),
+            &Literal::new(11),
+        );
+        let clause = Clause::from_literals([-11, 5].map(Literal::new).to_vec(), -1);
+
+        let evaluation = evaluate_clause(&formula.extensions, &formula.vsids, &clause, false, None);
+
+        assert!(evaluation.replacement.is_none());
+        assert_eq!(evaluation.report.inspected, 1);
+        assert_eq!(evaluation.report.noop, 1);
+        assert_eq!(evaluation.report.rejected, 0);
+        assert_eq!(evaluation.report.clauses_unrolled, 1);
+        assert_eq!(evaluation.report.bva_extensions_unrolled, 1);
+        assert_eq!(evaluation.report.substitutions_to_bva, 1);
+        assert_eq!(evaluation.report.unrolled_rewrites_restored, 1);
+    }
+
+    #[test]
     fn expansion_cache_reuses_storage_and_full_cache_falls_back() {
         let mut formula = Formula::new(6);
         for (a, b, z) in [(1, 2, 5), (5, 3, 6)] {
@@ -1164,15 +1997,25 @@ mod tests {
         let mut workspace = PassWorkspace::new(&formula.extensions);
         let source = [-6, -5, 4].map(Literal::new);
         assert!(workspace.unroll(&source));
-        let cached_ptr = workspace.expansions[&-6].as_ref().unwrap().as_ptr();
+        let cached_ptr = workspace.expansions[&-6]
+            .literals
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        let cached_origins = workspace.unrolled;
         let units = workspace.cached_units;
         let capacity = workspace.literals.capacity();
         for _ in 0..3 {
             assert!(workspace.unroll(&source));
             assert_eq!(
-                workspace.expansions[&-6].as_ref().unwrap().as_ptr(),
+                workspace.expansions[&-6]
+                    .literals
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr(),
                 cached_ptr
             );
+            assert_eq!(workspace.unrolled, cached_origins);
             assert_eq!(workspace.cached_units, units);
             assert_eq!(workspace.literals.capacity(), capacity);
         }
@@ -1299,7 +2142,7 @@ mod tests {
 
     #[test]
     fn policies_limit_order_and_preserve_independent_cursor() {
-        let mut formula = Formula::from_vec(vec![vec![1]; MAX_CLAUSES_PER_PASS + 4]);
+        let mut formula = Formula::from_vec(vec![vec![1]; MIN_CLAUSES_PER_PASS + 4]);
         for idx in 0..formula.clause_slots_len() {
             formula.get_clause_at_idx_mut(idx).lbd = 4;
         }
@@ -1309,24 +2152,56 @@ mod tests {
         formula.delete_clause(1, &mut logger);
         let scope = ClauseScope::indices((0..=last).filter(|&idx| idx != 2));
         formula.ges_cursor = 3;
-        let lbd = select_clause_indices(&mut formula, &scope, Policy::Lbd);
-        assert_eq!(lbd.len(), MAX_CLAUSES_PER_PASS);
+        let budget = serial_clause_budget(last - 1);
+        let lbd = select_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Lbd,
+            GesOptions::default(),
+            false,
+        );
+        assert_eq!(lbd.len(), budget);
         assert_eq!(&lbd[..4], &[last, 0, 3, 4]);
         assert_eq!(formula.ges_cursor, 3);
         for _ in 0..20 {
-            let random = select_clause_indices(&mut formula, &scope, Policy::Random);
-            assert_eq!(random.len(), MAX_CLAUSES_PER_PASS);
-            let expected: Vec<_> =
-                sequential_clause_window(&formula, &scope, random[0], MAX_CLAUSES_PER_PASS)
-                    .map(|(idx, _)| idx)
-                    .collect();
+            let random = select_clause_indices(
+                &mut formula,
+                &scope,
+                Policy::Random,
+                GesOptions::default(),
+                false,
+            );
+            assert_eq!(random.len(), budget);
+            let expected: Vec<_> = sequential_clause_window(
+                &formula,
+                &scope,
+                random[0],
+                budget,
+                Policy::Random,
+                GesOptions::default(),
+                false,
+            )
+            .map(|(idx, _)| idx)
+            .collect();
             assert_eq!(random, expected);
             assert_eq!(formula.ges_cursor, 3);
         }
-        let cursor = select_clause_indices(&mut formula, &scope, Policy::Cursor);
+        let cursor = select_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Cursor,
+            GesOptions::default(),
+            false,
+        );
         assert_eq!(cursor, (3..last).collect::<Vec<_>>());
         assert_eq!(formula.ges_cursor, last);
-        let next = select_clause_indices(&mut formula, &scope, Policy::Cursor);
+        let next = select_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Cursor,
+            GesOptions::default(),
+            false,
+        );
         assert_eq!(&next[..3], &[last, 0, 3]);
     }
 
@@ -1338,27 +2213,115 @@ mod tests {
         }
         let scope = full_scope(&formula);
         assert_eq!(
-            select_clause_indices(&mut formula, &scope, Policy::Lbd),
+            select_clause_indices(
+                &mut formula,
+                &scope,
+                Policy::Lbd,
+                GesOptions::default(),
+                false,
+            ),
             vec![7, 6, 5, 8, 4]
         );
         let mut original = Formula::from_vec(vec![vec![1, 2]]);
         let scope = full_scope(&original);
-        assert!(select_clause_indices(&mut original, &scope, Policy::Lbd).is_empty());
+        assert!(
+            select_clause_indices(
+                &mut original,
+                &scope,
+                Policy::Lbd,
+                GesOptions::default(),
+                false,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn trail_selection_is_unique_and_falls_back_to_the_cursor() {
+        let mut formula = Formula::from_vec(vec![vec![1]; 6]);
+        for (_, clause) in formula.get_clauses_mut() {
+            clause.lbd = 3;
+        }
+        formula.configure_ges_trail_tracking(true);
+        for clause_idx in [2, 0, 2] {
+            formula.record_ges_analysis_use(clause_idx);
+        }
+        formula.ges_cursor = 0;
+        let scope = full_scope(&formula);
+        let options = GesOptions {
+            trail_first: true,
+            ..GesOptions::default()
+        };
+
+        let selected = select_trail_then_cursor_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Vsids,
+            options,
+            true,
+            4,
+        );
+
+        assert_eq!(selected, vec![2, 0, 1, 3]);
+        assert_eq!(formula.ges_cursor, 4);
+        assert_eq!(formula.stats.ges_trail_unique_touches, 2);
+        assert_eq!(formula.stats.ges_trail_clauses_selected, 2);
+        assert_eq!(formula.stats.ges_trail_cursor_selected, 2);
+        assert_eq!(formula.stats.ges_trail_duplicate_skips, 2);
+    }
+
+    #[test]
+    fn trail_filled_budget_leaves_cursor_unchanged() {
+        let mut formula = Formula::from_vec(vec![vec![1]; 4]);
+        for (_, clause) in formula.get_clauses_mut() {
+            clause.lbd = 3;
+        }
+        formula.configure_ges_trail_tracking(true);
+        for clause_idx in [3, 1, 0] {
+            formula.record_ges_analysis_use(clause_idx);
+        }
+        formula.ges_cursor = 2;
+        let scope = full_scope(&formula);
+        let options = GesOptions {
+            trail_first: true,
+            ..GesOptions::default()
+        };
+
+        let selected = select_trail_then_cursor_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Cursor,
+            options,
+            true,
+            2,
+        );
+
+        assert_eq!(selected, vec![3, 1]);
+        assert_eq!(formula.ges_cursor, 2);
+        assert_eq!(formula.stats.ges_trail_clauses_selected, 2);
+        assert_eq!(formula.stats.ges_trail_cursor_selected, 0);
+        assert_eq!(formula.stats.ges_trail_duplicate_skips, 0);
     }
 
     #[test]
     fn full_tier_three_window_matches_full_sort() {
-        let mut formula = Formula::from_vec(vec![vec![1]; MAX_CLAUSES_PER_PASS + 20]);
+        let mut formula = Formula::from_vec(vec![vec![1]; MIN_CLAUSES_PER_PASS + 20]);
         for idx in 0..formula.clause_slots_len() {
             formula.get_clause_at_idx_mut(idx).lbd = 7 + (idx % 5) as i16;
         }
         formula.get_clause_at_idx_mut(0).lbd = 6;
         let mut expected: Vec<_> = formula.get_clauses().map(|(idx, c)| (idx, c.lbd)).collect();
         expected.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        expected.truncate(MAX_CLAUSES_PER_PASS);
+        expected.truncate(serial_clause_budget(formula.clause_slots_len()));
         let scope = full_scope(&formula);
         assert_eq!(
-            select_clause_indices(&mut formula, &scope, Policy::Lbd),
+            select_clause_indices(
+                &mut formula,
+                &scope,
+                Policy::Lbd,
+                GesOptions::default(),
+                false,
+            ),
             expected.into_iter().map(|(idx, _)| idx).collect::<Vec<_>>()
         );
     }
@@ -1374,9 +2337,86 @@ mod tests {
             Policy::Always,
         ] {
             assert!(
-                select_clause_indices(&mut formula, &ClauseScope::range(0..0), policy).is_empty()
+                select_clause_indices(
+                    &mut formula,
+                    &ClauseScope::range(0..0),
+                    policy,
+                    GesOptions::default(),
+                    false,
+                )
+                .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn adaptive_clause_budgets_scale_and_cap() {
+        for (live_clauses, expected) in [
+            (0, 0),
+            (1, 1),
+            (10_000, 200),
+            (40_000, 200),
+            (100_000, 200),
+            (200_000, 200),
+            (240_000, 240),
+            (300_000, 300),
+            (500_000, 500),
+            (3_000_000, 3_000),
+            (5_000_000, 3_000),
+        ] {
+            assert_eq!(serial_clause_budget(live_clauses), expected);
+        }
+        for (live_clauses, expected) in [
+            (40_000, 1_600),
+            (100_000, 1_600),
+            (300_000, 2_400),
+            (1_000_000, 8_000),
+            (1_500_000, 12_000),
+        ] {
+            assert_eq!(parallel_clause_budget(live_clauses, 8), expected);
+        }
+    }
+
+    #[test]
+    fn adaptive_budget_combines_pass_productivity_with_unique_outcomes() {
+        let mut formula = Formula::from_vec(vec![vec![1]; 10_000]);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 200);
+        assert_eq!(formula.stats.ges_current_budget, 200);
+
+        formula.stats.ges_replacements_used = 8;
+        update_adaptive_clause_budget(&mut formula, 100, 25, 40);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 250);
+        assert_eq!(formula.stats.ges_budget_increases, 1);
+        assert_eq!(formula.stats.ges_peak_budget, 250);
+
+        // Event counts do not affect scheduling; only unique outcomes do.
+        formula.stats.ges_replacement_reason_uses = 10_000;
+        update_adaptive_clause_budget(&mut formula, 100, 25, 40);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 250);
+
+        formula.stats.ges_replacements_deleted_unused = 8;
+        update_adaptive_clause_budget(&mut formula, 100, 25, 40);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 187);
+        assert_eq!(formula.stats.ges_budget_decreases, 1);
+
+        // Immediate pass feedback does not wait for replacements to be deleted.
+        update_adaptive_clause_budget(&mut formula, 100, 10, 60);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 140);
+        assert_eq!(formula.stats.ges_budget_decreases, 2);
+        assert_eq!(formula.stats.ges_peak_budget, 250);
+    }
+
+    #[test]
+    fn adaptive_budget_requires_common_acceptance_before_growth() {
+        let mut formula = Formula::from_vec(vec![vec![1]; 10_000]);
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 200);
+        formula.stats.ges_replacements_used = 8;
+
+        update_adaptive_clause_budget(&mut formula, 100, 24, 40);
+
+        assert_eq!(adaptive_serial_clause_budget(&mut formula), 200);
+        assert_eq!(formula.stats.ges_budget_increases, 0);
+        assert_eq!(formula.stats.ges_budget_decreases, 0);
     }
 
     #[test]
@@ -1688,11 +2728,59 @@ mod tests {
         formula.delete_clause(4, &mut logger);
 
         let scope = full_scope(&formula);
-        let indices = sequential_clause_window(&formula, &scope, 2, 4)
-            .map(|(clause_idx, _)| clause_idx)
-            .collect::<Vec<_>>();
+        let indices = sequential_clause_window(
+            &formula,
+            &scope,
+            2,
+            4,
+            Policy::Cursor,
+            GesOptions::default(),
+            false,
+        )
+        .map(|(clause_idx, _)| clause_idx)
+        .collect::<Vec<_>>();
 
         assert_eq!(indices, vec![2, 3, 5, 0]);
+    }
+
+    #[test]
+    fn ordinary_cursor_rewrites_bva_quotients_but_protects_definitions() {
+        use crate::circuits::factorization::{definition_clause, quotient_clause};
+        let literals = [-1, -2, 3, 4].map(Literal::new).to_vec();
+        let mut formula = Formula::from_clauses(&[
+            quotient_clause(literals.clone()),
+            definition_clause(literals),
+        ]);
+        let mut logger: Option<DratLogger<std::io::Empty>> = None;
+        let z = extension_literal(
+            &mut formula,
+            &mut logger,
+            &Literal::new(1),
+            &Literal::new(2),
+        );
+        let scope = full_scope(&formula);
+        let selected = select_clause_indices(
+            &mut formula,
+            &scope,
+            Policy::Cursor,
+            GesOptions::default(),
+            false,
+        );
+        assert_eq!(selected, vec![0]);
+        process(&mut formula, &scope, &mut logger, None, None, None).unwrap();
+        assert!(formula.is_clause_garbage(0));
+        for idx in 1..5 {
+            assert!(!formula.is_clause_garbage(idx));
+            assert_eq!(formula.get_clause_at_idx(idx).lbd, 0);
+        }
+        let replacement = formula.get_clause_at_idx(5);
+        assert_eq!(
+            replacement.get_literals(),
+            [Literal::new(3), Literal::new(4), z.negated()]
+        );
+        assert_eq!(replacement.lbd, -1);
+        assert!(replacement.bva_generated);
+        assert!(replacement.ges_generated);
     }
 
     #[test]
@@ -1886,15 +2974,13 @@ mod tests {
 
         assert!(!formula.is_clause_garbage(0));
         assert!(formula.is_clause_garbage(1));
-        assert_eq!(
-            formula
-                .get_clauses()
-                .find(|(_, clause)| clause.get_literals().contains(&Literal::new(5)))
-                .unwrap()
-                .1
-                .get_literals(),
-            &[Literal::new(5), z.negated()]
-        );
+        let replacement = formula
+            .get_clauses()
+            .find(|(_, clause)| clause.get_literals().contains(&Literal::new(5)))
+            .unwrap()
+            .1;
+        assert_eq!(replacement.get_literals(), &[Literal::new(5), z.negated()]);
+        assert_eq!(replacement.ges_protection, DB_REDUCTION_PROTECTION);
     }
 
     #[test]

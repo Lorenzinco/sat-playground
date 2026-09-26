@@ -309,16 +309,16 @@ def plot_overlaid_cactus(
 
     for method in METHOD_ORDER:
         results = method_results[method]
-        x_values, y_values = plot.cactus_coordinates(results)
-        solved = y_values[-1]
+        solved_counts, wall_times = plot.cactus_coordinates(results)
+        solved = solved_counts[-1]
         maximum_solved = max(maximum_solved, solved)
-        maximum_time = max(maximum_time, x_values[-1])
-        if timeout_seconds is not None and timeout_seconds > x_values[-1]:
-            x_values.append(timeout_seconds)
-            y_values.append(solved)
+        maximum_time = max(maximum_time, wall_times[-1])
+        if timeout_seconds is not None and timeout_seconds > wall_times[-1]:
+            solved_counts.append(solved)
+            wall_times.append(timeout_seconds)
         axis.step(
-            x_values,
-            y_values,
+            solved_counts,
+            wall_times,
             where="post",
             linewidth=2,
             label="{} ({}/{})".format(METHOD_LABELS[method], solved, len(results)),
@@ -335,10 +335,10 @@ def plot_overlaid_cactus(
             fontsize=12,
         )
 
-    axis.set_xlim(0, maximum_time if maximum_time > 0 else 1)
-    axis.set_ylim(0, max(maximum_solved, 1))
-    axis.set_xlabel("wall-clock time (seconds)")
-    axis.set_ylabel("number of solved instances")
+    axis.set_xlim(0, max(maximum_solved, 1))
+    axis.set_ylim(0, maximum_time if maximum_time > 0 else 1)
+    axis.set_xlabel("number of solved instances")
+    axis.set_ylabel("individual wall runtime (seconds)")
     axis.set_title("{} — benchmark comparison".format(name))
     axis.legend(loc="lower right")
     axis.grid(alpha=0.25)

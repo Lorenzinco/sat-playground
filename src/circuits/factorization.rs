@@ -8,6 +8,7 @@ use crate::formula::literal::Literal;
 use std::io::Write;
 
 // CaDiCaL-FX's default factor bound requires a reduction of at least one clause.
+// Gate factoring makes the paper's targeted exception for clause-neutral XORs.
 pub(crate) const FACTOR_BOUND: usize = 1;
 pub(crate) const MAX_FACTOR_CLAUSE_SIZE: usize = 20;
 
@@ -49,7 +50,7 @@ impl Factorization {
     pub(crate) fn select(and_gate: Option<AndGate>, gate: Option<Gate>) -> Option<Self> {
         match (and_gate, gate) {
             (Some(and_gate), Some(gate)) => {
-                if gate.clause_saving() >= and_gate.clause_saving() {
+                if gate.factor_score() >= and_gate.factor_score() {
                     Some(Self::Gate(gate))
                 } else {
                     Some(Self::And(and_gate))
@@ -108,8 +109,15 @@ pub(crate) fn factor_eligible_clause(clause: &Clause) -> bool {
         && (clause.lbd != 0 || clause.bva_generated)
 }
 
-pub(crate) fn generated_clause(literals: Vec<Literal>) -> Clause {
+/// Registered definitions stay on GES's protected extension path.
+pub(crate) fn definition_clause(literals: Vec<Literal>) -> Clause {
     Clause::new(literals, 0, CreationType::BvaGenerated)
+}
+
+/// Quotients replace essential source clauses: permanent in the database, but
+/// eligible for ordinary GES rather than extension-definition compression.
+pub(crate) fn quotient_clause(literals: Vec<Literal>) -> Clause {
+    Clause::new(literals, -1, CreationType::BvaGenerated)
 }
 
 pub(crate) fn claim_clause(
@@ -163,9 +171,16 @@ mod tests {
     }
 
     #[test]
-    fn generated_clauses_are_marked_as_permanent_bva_clauses() {
-        let clause = generated_clause(vec![Literal::new(1), Literal::new(-2)]);
+    fn definitions_are_marked_as_protected_bva_clauses() {
+        let clause = definition_clause(vec![Literal::new(1), Literal::new(-2)]);
         assert_eq!(clause.lbd, 0);
+        assert!(clause.bva_generated);
+    }
+
+    #[test]
+    fn quotients_are_essential_bva_clauses_not_extension_axioms() {
+        let clause = quotient_clause(vec![Literal::new(1), Literal::new(-2)]);
+        assert_eq!(clause.lbd, -1);
         assert!(clause.bva_generated);
     }
 
