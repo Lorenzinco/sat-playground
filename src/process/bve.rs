@@ -69,12 +69,8 @@ fn elimination_candidate(
     let negative_literal = Literal::new(-(var as i32));
     formula.clean_occurrence(&positive_literal);
     formula.clean_occurrence(&negative_literal);
-    let pos = formula
-        .live_occurrences(&positive_literal)
-        .collect::<Vec<_>>();
-    let neg = formula
-        .live_occurrences(&negative_literal)
-        .collect::<Vec<_>>();
+    let pos = formula.occurrence_of(&positive_literal).collect::<Vec<_>>();
+    let neg = formula.occurrence_of(&negative_literal).collect::<Vec<_>>();
 
     if pos.is_empty() || neg.is_empty() {
         return Ok(None);

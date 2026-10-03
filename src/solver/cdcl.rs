@@ -52,7 +52,7 @@ pub fn solve_cdcl<'py, W: Write>(
     let initial_units: Vec<_> = formula
         .get_clauses()
         .filter(|(_, clause)| clause.len() == 1)
-        .map(|(idx, clause)| (idx, clause.get_literals()[0].clone()))
+        .map(|(idx, clause)| (idx, clause.get_literals()[0]))
         .collect();
 
     let mut initial_propagation = Vec::new();
@@ -83,7 +83,7 @@ pub fn solve_cdcl<'py, W: Write>(
 
         formula.add_decision(&decision_lit, &mut history);
 
-        let mut propagation = vec![decision_lit.clone()];
+        let mut propagation = vec![decision_lit];
         loop {
             let propagation_start = Instant::now();
             let conflict = propagate_from(formula, &mut history, propagation.drain(..));
@@ -215,7 +215,7 @@ fn learn_uip_clause<W: Write>(
     if let Some(unit) = formula
         .get_clause_at_idx(clause_idx)
         .get_unit_literal(&formula.assignment)
-        .cloned()
+        .copied()
     {
         if let AssignResult::Assigned(lit) =
             formula.assign_implication(unit, history, Some(clause_idx))
@@ -245,9 +245,16 @@ fn learn_dip_clauses<W: Write>(
     let z = extension_literal(formula, logger, &dip_a, &dip_b);
     observe_dip_extension(guidance, &dip_a, &dip_b, &z)?;
 
-    let raw_post_clause = prefixed_clause(z.negated(), post_clause_without_z, 0);
+    let first = z.negated();
+    let mut post_literals = Vec::with_capacity(post_clause_without_z.len() + 1);
+    post_literals.push(first);
+    post_literals.extend(
+        post_clause_without_z
+            .into_iter()
+            .filter(|literal| literal != &first),
+    );
     let (mut post_literals, minimized_literals, minimization_time) =
-        history.minimize_clause_literals(formula, raw_post_clause.get_literals().to_vec());
+        history.minimize_clause_literals(formula, post_literals);
     formula
         .stats
         .add_minimized_literals(minimized_literals as u64);
@@ -277,20 +284,16 @@ fn learn_dip_clauses<W: Write>(
         crate::formula::clause::CreationType::Learned,
     );
 
-    let post_label = format!(
-        "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={}",
-        dip_a, dip_b, z, actual_backtrack
-    );
     if post_clause.is_empty(&formula.assignment) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{} is conflicting immediately after backtrack: {:?}",
-            post_label, post_clause
+            "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={} is conflicting immediately after backtrack: {:?}",
+            dip_a, dip_b, z, actual_backtrack, post_clause
         )));
     }
     if !post_clause.is_unit(&formula.assignment) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{} is not asserting after backtrack: {:?}",
-            post_label, post_clause
+            "DIP post clause dip_a={:?} dip_b={:?} z={:?} backtrack_level={} is not asserting after backtrack: {:?}",
+            dip_a, dip_b, z, actual_backtrack, post_clause
         )));
     }
 
@@ -300,7 +303,7 @@ fn learn_dip_clauses<W: Write>(
     if let Some(post_unit) = formula
         .get_clause_at_idx(post_idx)
         .get_unit_literal(&formula.assignment)
-        .cloned()
+        .copied()
     {
         match formula.assign_implication(post_unit, history, Some(post_idx)) {
             AssignResult::Conflict if actual_backtrack == 0 => return Ok(None),
@@ -437,13 +440,6 @@ fn order_asserting_clause(literals: &mut [Literal], history: &History) {
     literals.swap(1, highest);
 }
 
-fn prefixed_clause(first: Literal, rest: Vec<Literal>, lbd: i16) -> Clause {
-    let mut literals = Vec::with_capacity(rest.len() + 1);
-    literals.push(first.clone());
-    literals.extend(rest.into_iter().filter(|literal| literal != &first));
-    Clause::from_literals(literals, lbd)
-}
-
 fn unsat<W: Write>(logger: &mut Option<DratLogger<W>>) -> PyResult<Option<Vec<bool>>> {
     if let Some(log) = logger {
         let _ = log.log_empty_clause();
@@ -528,6 +524,33 @@ fn scheduled_inprocessing(
         methods.extend(others);
     }
 
+    if let Some(preference_index) = methods
+        .iter()
+        .position(|process| *process == Process::Preference)
+    {
+        let trailing = methods.drain(preference_index + 1..).collect::<Vec<_>>();
+        let (ges, others): (Vec<_>, Vec<_>) = trailing
+            .into_iter()
+            .partition(|process| is_ges(process) || is_ges_modifier(process));
+        methods.splice(preference_index..preference_index, ges);
+        methods.extend(others);
+    }
+
+    if run_inprocessing
+        && let Some(bva_index) = methods.iter().position(|process| *process == Process::BVA)
+        && let Some(preference_index) = methods
+            .iter()
+            .position(|process| *process == Process::Preference)
+    {
+        let preference = methods.remove(preference_index);
+        let insertion = if preference_index < bva_index {
+            bva_index - 1
+        } else {
+            bva_index
+        };
+        methods.insert(insertion, preference);
+    }
+
     methods
 }
 
@@ -553,16 +576,55 @@ fn restart<W: Write>(
     if !methods.is_empty() {
         let inprocessing_start = Instant::now();
         let scope = global_inprocessing_scope(formula);
-        formula.process_in_phase(
-            methods,
-            &scope,
-            logger,
-            Some((py, steps)),
-            false,
-            Some(history),
-            reasoning_levels.as_deref(),
-            crate::process::ProcessPhase::Inprocessing,
-        )?;
+        if let Some(preference_index) = methods
+            .iter()
+            .position(|method| *method == Process::Preference)
+        {
+            let before = &methods[..preference_index];
+            let after = &methods[preference_index + 1..];
+            if !before.is_empty() {
+                formula.process_in_phase(
+                    before,
+                    &scope,
+                    logger,
+                    Some((py, steps)),
+                    false,
+                    Some(history),
+                    reasoning_levels.as_deref(),
+                    crate::process::ProcessPhase::Inprocessing,
+                )?;
+            }
+            if crate::process::preference::process_at_restart(formula, history, logger) {
+                formula
+                    .stats
+                    .record_inprocessing_time(inprocessing_start.elapsed());
+                formula.stats.record_restart_time(restart_start.elapsed());
+                return Ok(true);
+            }
+            if !after.is_empty() {
+                formula.process_in_phase(
+                    after,
+                    &scope,
+                    logger,
+                    Some((py, steps)),
+                    false,
+                    Some(history),
+                    reasoning_levels.as_deref(),
+                    crate::process::ProcessPhase::Inprocessing,
+                )?;
+            }
+        } else {
+            formula.process_in_phase(
+                &methods,
+                &scope,
+                logger,
+                Some((py, steps)),
+                false,
+                Some(history),
+                reasoning_levels.as_deref(),
+                crate::process::ProcessPhase::Inprocessing,
+            )?;
+        }
         formula
             .stats
             .record_inprocessing_time(inprocessing_start.elapsed());
@@ -718,6 +780,27 @@ mod tests {
                 true,
             ),
             vec![Process::GESUtility, Process::GESVSIDS, Process::BVA]
+        );
+        let with_preference = [Process::BVA, Process::Preference, Process::GESUtility];
+        assert_eq!(
+            scheduled_inprocessing(&with_preference, true, false),
+            vec![Process::GESUtility]
+        );
+        assert_eq!(
+            scheduled_inprocessing(&with_preference, false, true),
+            vec![Process::Preference, Process::BVA]
+        );
+        assert_eq!(
+            scheduled_inprocessing(&with_preference, true, true),
+            vec![Process::GESUtility, Process::Preference, Process::BVA]
+        );
+        assert_eq!(
+            scheduled_inprocessing(&[Process::Preference], false, true),
+            vec![Process::Preference]
+        );
+        assert_eq!(
+            scheduled_inprocessing(&[Process::Preference, Process::GESVSIDS], true, true),
+            vec![Process::GESVSIDS, Process::Preference]
         );
         let others = [
             Process::BVA,

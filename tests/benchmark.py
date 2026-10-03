@@ -78,7 +78,7 @@ ODS_NAMESPACES = {
     "table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
     "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
 }
-PROCESS_CHOICES = ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "subsumption")
+PROCESS_CHOICES = ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "preference", "subsumption")
 GES_ADDONS = ("ges_compress", "ges_trail")
 STATUS_NAMES = ("completed", "incorrect", "timeout", "error", "skipped")
 

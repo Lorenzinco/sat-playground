@@ -21,8 +21,8 @@ use clause::Clause;
 use literal::Literal;
 use pyo3::Python;
 use pyo3::prelude::PyResult;
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::time::Instant;
@@ -30,6 +30,7 @@ use std::time::Instant;
 const DB_REDUCTION_MIN_REMOVABLE_CLAUSES: usize = 15_000;
 const DB_REDUCTION_GARBAGE_RATIO: usize = 12;
 
+#[derive(Clone)]
 pub struct Formula {
     clauses: Vec<Clause>,
     garbage: Garbage,
@@ -39,6 +40,7 @@ pub struct Formula {
     occurrence_stale: Vec<usize>,
     pub stats: Stats,
     pub extensions: ExtensionMap,
+    retired_extension_variables: HashSet<usize>,
     pub(crate) vsids: Vsids,
     self_subsuming: bool,
     pub(crate) ges_cursor: usize,
@@ -50,32 +52,6 @@ pub struct Formula {
     ges_trail_seen: Vec<bool>,
     pub(crate) bva_preprocessing_budget: usize,
     pub(crate) bva_inprocessing_budget: usize,
-}
-
-impl Clone for Formula {
-    fn clone(&self) -> Self {
-        Formula {
-            clauses: self.clauses.clone(),
-            garbage: self.garbage.clone(),
-            assignment: self.assignment.clone(),
-            watch: self.watch.clone(),
-            occurrence: self.occurrence.clone(),
-            occurrence_stale: self.occurrence_stale.clone(),
-            stats: self.stats.clone(),
-            extensions: self.extensions.clone(),
-            vsids: self.vsids.clone(),
-            self_subsuming: self.self_subsuming,
-            ges_cursor: self.ges_cursor,
-            ges_clause_budget: self.ges_clause_budget,
-            ges_feedback_used: self.ges_feedback_used,
-            ges_feedback_deleted_unused: self.ges_feedback_deleted_unused,
-            ges_trail_tracking: self.ges_trail_tracking,
-            ges_trail_touched: self.ges_trail_touched.clone(),
-            ges_trail_seen: self.ges_trail_seen.clone(),
-            bva_preprocessing_budget: self.bva_preprocessing_budget,
-            bva_inprocessing_budget: self.bva_inprocessing_budget,
-        }
-    }
 }
 
 impl fmt::Debug for Formula {
@@ -135,6 +111,7 @@ impl Formula {
             occurrence_stale: vec![0; storage * 2],
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
+            retired_extension_variables: HashSet::new(),
             vsids: Vsids::new(storage),
             self_subsuming: false,
             ges_cursor: 0,
@@ -149,7 +126,9 @@ impl Formula {
         }
     }
 
-    pub fn from_clauses(clauses: &[Clause]) -> Self {
+    pub fn from_clauses(clauses: impl Into<Vec<Clause>>) -> Self {
+        let clauses = clauses.into();
+        let clause_count = clauses.len();
         let max_index = clauses
             .iter()
             .flat_map(|clause| clause.iter())
@@ -158,14 +137,15 @@ impl Formula {
             .expect("No literal in any formula found!");
 
         let mut formula = Formula {
-            clauses: clauses.to_owned(),
-            garbage: Garbage::new(clauses.len()),
+            clauses,
+            garbage: Garbage::new(clause_count),
             assignment: Assignment::new(max_index as usize + 1),
             watch: Watch::new(max_index as usize + 1),
             occurrence: vec![Vec::new(); (max_index as usize + 1) * 2],
             occurrence_stale: vec![0; (max_index as usize + 1) * 2],
             stats: Stats::new(),
             extensions: ExtensionMap::new(),
+            retired_extension_variables: HashSet::new(),
             vsids: Vsids::new(max_index as usize + 1),
             self_subsuming: false,
             ges_cursor: 0,
@@ -174,7 +154,7 @@ impl Formula {
             ges_feedback_deleted_unused: 0,
             ges_trail_tracking: false,
             ges_trail_touched: Vec::new(),
-            ges_trail_seen: vec![false; clauses.len()],
+            ges_trail_seen: vec![false; clause_count],
             bva_preprocessing_budget: 0,
             bva_inprocessing_budget: 0,
         };
@@ -202,7 +182,7 @@ impl Formula {
             clauses.push(Clause::from_literals(literals, -1));
         }
 
-        Formula::from_clauses(&clauses)
+        Formula::from_clauses(clauses)
     }
 
     /// Iterates over live clauses while preserving their physical indexes.
@@ -284,7 +264,7 @@ impl Formula {
     }
 
     pub fn get_stats(&self) -> Stats {
-        self.stats
+        self.stats.clone()
     }
 
     pub fn self_subsuming_enabled(&self) -> bool {
@@ -347,13 +327,6 @@ impl Formula {
             .get(lit.get_unsigned_index() as usize)
             .map(Vec::as_slice)
             .unwrap_or(&[])
-    }
-
-    pub fn live_occurrences<'a>(
-        &'a self,
-        lit: &Literal,
-    ) -> impl DoubleEndedIterator<Item = usize> + 'a {
-        self.occurrence_of(lit)
     }
 
     pub fn candidate_indices_for_clause(&mut self, clause: &Clause) -> Vec<usize> {
@@ -463,7 +436,7 @@ impl Formula {
 
     pub fn process<W: Write>(
         &mut self,
-        methods: Vec<Process>,
+        methods: &[Process],
         scope: &ClauseScope,
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
@@ -485,7 +458,7 @@ impl Formula {
 
     pub fn process_in_phase<W: Write>(
         &mut self,
-        methods: Vec<Process>,
+        methods: &[Process],
         scope: &ClauseScope,
         logger: &mut Option<DratLogger<W>>,
         signal: Option<(Python<'_>, &mut u64)>,
@@ -505,35 +478,26 @@ impl Formula {
             trail_first: methods.contains(&Process::GESTrail),
         };
 
-        let result: PyResult<()> = (|| -> PyResult<()> {
-            for method in methods {
-                match method {
-                    Process::BVA => {
-                        let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::bva::process_in_phase(self, scope, logger, signal, phase)?;
-                    }
-                    Process::BVE => {
-                        let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        process::bve::process(self, scope, logger, signal, history.as_deref_mut())?;
-                    }
-                    Process::GES
-                    | Process::GESAlways
-                    | Process::GESLBD
-                    | Process::GESPar
-                    | Process::GESRandom
-                    | Process::GESUtility
-                    | Process::GESVSIDS => {
-                        let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
-                        let process_ges = match method {
-                            Process::GESAlways => process::ges_always::process_with_options,
-                            Process::GESLBD => process::ges_lbd::process_with_options,
-                            Process::GESPar => process::ges_par::process_with_options,
-                            Process::GESRandom => process::ges_random::process_with_options,
-                            Process::GESUtility => process::ges_utility::process_with_options,
-                            Process::GESVSIDS => process::ges_vsids::process_with_options,
-                            _ => process::ges::process_with_options,
-                        };
-                        process_ges(
+        for &method in methods {
+            match method {
+                Process::BVA => {
+                    let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
+                    process::bva::process_in_phase(self, scope, logger, signal, phase)?;
+                }
+                Process::BVE => {
+                    let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
+                    process::bve::process(self, scope, logger, signal, history.as_deref_mut())?;
+                }
+                Process::GES
+                | Process::GESAlways
+                | Process::GESLBD
+                | Process::GESPar
+                | Process::GESRandom
+                | Process::GESUtility
+                | Process::GESVSIDS => {
+                    let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
+                    if method == Process::GESPar {
+                        process::ges_par::process_with_options(
                             self,
                             scope,
                             logger,
@@ -542,17 +506,38 @@ impl Formula {
                             reasoning_levels,
                             ges_options,
                         )?;
+                    } else {
+                        let policy = match method {
+                            Process::GESAlways => process::ges::Policy::Always,
+                            Process::GESLBD => process::ges::Policy::Lbd,
+                            Process::GESRandom => process::ges::Policy::Random,
+                            Process::GESUtility => process::ges::Policy::Utility,
+                            Process::GESVSIDS => process::ges::Policy::Vsids,
+                            _ => process::ges::Policy::Cursor,
+                        };
+                        process::ges::process_with_policy(
+                            self,
+                            scope,
+                            logger,
+                            signal,
+                            history.as_deref_mut(),
+                            reasoning_levels,
+                            policy,
+                            ges_options,
+                        )?;
                     }
-                    Process::GESCompress | Process::GESTrail => {}
-                    Process::Subsumption => process::subsumption::preprocess(self, scope, logger),
-                    _ => println!("Not yet implemented!"),
                 }
+                Process::Preference if phase == process::ProcessPhase::Inprocessing => {
+                    process::preference::process(self, logger)
+                }
+                Process::Preference => {}
+                Process::GESCompress | Process::GESTrail => {}
+                Process::Subsumption => process::subsumption::preprocess(self, scope, logger),
+                _ => println!("Not yet implemented!"),
             }
+        }
 
-            Ok(())
-        })();
-
-        result
+        Ok(())
     }
 
     pub fn delete_clause<W: Write>(
@@ -633,14 +618,10 @@ impl Formula {
 
         let old_clauses = std::mem::take(&mut self.clauses);
 
-        let surviving = old_clauses
+        self.clauses = old_clauses
             .into_iter()
             .enumerate()
             .filter(|(old_index, _)| !self.garbage.is_garbage(*old_index))
-            .collect::<Vec<_>>();
-
-        self.clauses = surviving
-            .into_iter()
             .enumerate()
             .map(|(new_index, (old_index, clause))| {
                 old_to_new[old_index] = Some(new_index);
@@ -799,6 +780,35 @@ impl Formula {
         self.revert_decision(history.get_decision_level(), history);
     }
 
+    /// Rewind only the root trail; clause locks must follow the removed reasons.
+    pub(crate) fn rewind_root_implications(&mut self, history: &mut History) {
+        for index in history.rewind_root_implications(&mut self.assignment) {
+            self.clauses[index].decrement_lock_count();
+        }
+    }
+
+    /// Restore a closed root trail after clauses or their reasons were retired.
+    /// Existing clauses must be scanned: new-clause-only propagation misses old units.
+    pub(crate) fn rebuild_root_implications(&mut self, history: &mut History) -> bool {
+        if self.get_clauses().any(|(_, clause)| clause.len() == 0) {
+            return true;
+        }
+        let mut queue = VecDeque::new();
+        let units = self
+            .get_clauses()
+            .filter(|(_, clause)| clause.len() == 1)
+            .map(|(index, clause)| (index, clause.get_literals()[0]))
+            .collect::<Vec<_>>();
+        for (index, literal) in units {
+            match self.assign_implication(literal, history, Some(index)) {
+                AssignResult::Conflict => return true,
+                AssignResult::Assigned(literal) => queue.push_back(literal),
+                AssignResult::AlreadyAssigned => {}
+            }
+        }
+        self.propagate_twl(history, &mut queue).is_some()
+    }
+
     pub fn get_empty_clauses(&self) -> Option<Vec<&Clause>> {
         let empty_clauses: Vec<&Clause> = self
             .get_clauses()
@@ -832,7 +842,6 @@ impl Formula {
     }
 
     pub fn get_pure_literals(&mut self) -> Vec<Literal> {
-        let clauses = self.get_unsatisfied_clauses();
         let assignment = &self.assignment;
 
         // variable_index -> bitmask
@@ -840,7 +849,10 @@ impl Formula {
         // 0b10 = negative seen
         let mut polarity: HashMap<usize, u8> = HashMap::new();
 
-        for (_, clause) in clauses {
+        for (_, clause) in self
+            .get_clauses()
+            .filter(|(_, clause)| !clause.is_satisfied(assignment))
+        {
             for lit in clause.get_unassigned_literals(assignment) {
                 let bit = if lit.is_negated() { 0b10 } else { 0b01 };
                 polarity
@@ -869,16 +881,16 @@ impl Formula {
     }
 
     pub fn get_unit_clauses(&self) -> Vec<(usize, &Clause)> {
-        self.get_unsatisfied_clauses()
-            .into_iter()
-            .filter(|(_, clause)| clause.is_unit(&self.assignment))
+        self.get_clauses()
+            .filter(|(_, clause)| {
+                !clause.is_satisfied(&self.assignment) && clause.is_unit(&self.assignment)
+            })
             .collect()
     }
 
     pub fn get_unit_clauses_mut(&mut self, assignment: &Assignment) -> Vec<(usize, &mut Clause)> {
-        self.get_unsatisfied_clauses_mut(assignment)
-            .into_iter()
-            .filter(|(_, clause)| clause.is_unit(assignment))
+        self.get_clauses_mut()
+            .filter(|(_, clause)| !clause.is_satisfied(assignment) && clause.is_unit(assignment))
             .collect()
     }
 
@@ -888,7 +900,7 @@ impl Formula {
             let mut found = None;
             for (idx, clause) in self.get_clauses() {
                 if let Some(unit) = clause.get_unit_literal(&self.assignment) {
-                    found = Some((idx, unit.clone()));
+                    found = Some((idx, *unit));
                     break;
                 }
             }
@@ -1134,9 +1146,17 @@ impl Formula {
             .find(|(_idx, clause)| clause.is_empty(assignment))
     }
 
+    pub(crate) fn is_retired_extension_variable(&self, variable: usize) -> bool {
+        self.retired_extension_variables.contains(&variable)
+    }
+
+    pub(crate) fn retire_extension_variable(&mut self, variable: usize) {
+        self.retired_extension_variables.insert(variable);
+    }
+
     pub fn get_unassigned_literal(&self) -> Option<Literal> {
         for i in 1..self.assignment.len() {
-            if self.assignment.get_value(i).is_none() {
+            if self.assignment.get_value(i).is_none() && !self.is_retired_extension_variable(i) {
                 return Some(Literal::new(i as i32));
             }
         }
@@ -1685,7 +1705,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let mut formula = Formula::from_clauses(&clauses);
+        let mut formula = Formula::from_clauses(clauses);
         formula.stats.clauses_kept = count as u64;
         let mut history = History::new();
 
@@ -1732,7 +1752,7 @@ mod tests {
         rewritten.ges_generated = true;
         rewritten.ges_protection = 0;
         clauses.push(rewritten);
-        let mut formula = Formula::from_clauses(&clauses);
+        let mut formula = Formula::from_clauses(clauses);
         formula.stats.clauses_kept = count as u64;
         formula
             .reduce_db::<Empty>(&mut History::new(), &mut None, None)
@@ -1764,7 +1784,7 @@ mod tests {
                 clause
             })
             .collect::<Vec<_>>();
-        let mut formula = Formula::from_clauses(&clauses);
+        let mut formula = Formula::from_clauses(clauses);
         formula.stats.clauses_kept = count as u64;
         let mut history = History::new();
 

@@ -7,7 +7,9 @@ use rand::rng;
 
 pub fn get_random_unassigned_literal(formula: &Formula) -> Option<Literal> {
     let unassigned: Vec<usize> = (1..formula.assignment.len())
-        .filter(|&i| formula.assignment.get_value(i).is_none())
+        .filter(|&i| {
+            formula.assignment.get_value(i).is_none() && !formula.is_retired_extension_variable(i)
+        })
         .collect();
 
     if unassigned.is_empty() {

@@ -4,6 +4,7 @@ use crate::circuits::factorization::{
 };
 use crate::drat::DratLogger;
 use crate::formula::Formula;
+use crate::formula::extension::ExtensionOrigin;
 use crate::formula::literal::Literal;
 
 use std::collections::{BTreeMap, HashMap};
@@ -181,9 +182,12 @@ impl AndGate {
             formula.stats.bva_binary_and_factors += 1;
             let first = Literal::new(self.literals[0]);
             let second = Literal::new(self.literals[1]);
-            formula
-                .extensions
-                .add_bva_substitution(&first, &second, &auxiliary);
+            formula.extensions.add_substitution_with_origin(
+                &first,
+                &second,
+                &auxiliary,
+                ExtensionOrigin::Bva,
+            );
             formula.add_clause_unchecked(
                 definition_clause(vec![auxiliary, first.negated(), second.negated()]),
                 logger,
@@ -198,7 +202,7 @@ impl AndGate {
 
         for partial in self.partials {
             let mut literals = Vec::with_capacity(partial.len() + 1);
-            literals.push(auxiliary.clone());
+            literals.push(auxiliary);
             literals.extend(partial.into_iter().map(Literal::new));
             formula.add_clause_unchecked(quotient_clause(literals), logger);
         }

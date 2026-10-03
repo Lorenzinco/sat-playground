@@ -587,7 +587,7 @@ mod tests {
             let scope = ClauseScope::range(0..formula.clause_slots_len());
             formula
                 .process_in_phase::<std::io::Empty>(
-                    vec![crate::process::Process::BVA],
+                    &[crate::process::Process::BVA],
                     &scope,
                     &mut None,
                     None,

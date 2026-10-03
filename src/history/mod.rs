@@ -135,6 +135,23 @@ impl History {
         self.revert_decision_collect_reasons(level, assignment);
     }
 
+    /// Clear root implications so inprocessing can retire their reason clauses.
+    /// The caller must replay unit propagation before search resumes.
+    pub(crate) fn rewind_root_implications(&mut self, assignment: &mut Assignment) -> Vec<usize> {
+        assert_eq!(
+            self.decision_levels.len(),
+            1,
+            "backtrack before rewinding root implications"
+        );
+        let root = std::mem::replace(&mut self.decision_levels[0], DecisionLevel::empty());
+        let removed_reasons = root.reason_indices().collect();
+        for literal in root.implied_literals_iter() {
+            assignment.unset(literal.get_index().unsigned_abs() as usize);
+            self.implication_levels_indexes.unset_level(literal);
+        }
+        removed_reasons
+    }
+
     pub fn revert_decision_collect_reasons(
         &mut self,
         level: usize,

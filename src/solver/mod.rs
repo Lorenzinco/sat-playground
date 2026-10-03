@@ -110,7 +110,7 @@ pub fn solve<'py, W: Write>(
     let mut preprocessing_steps = 0;
     let preprocessing_scope = ClauseScope::range(0..formula.clause_slots_len());
     formula.process_in_phase(
-        preprocess.clone(),
+        &preprocess,
         &preprocessing_scope,
         logger,
         Some((py, &mut preprocessing_steps)),

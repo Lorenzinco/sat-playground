@@ -1,11 +1,13 @@
 use crate::formula::clause::Clause;
+use crate::formula::extension::{ExtensionMap, ExtensionOrigin};
 use crate::guidance::GuidanceSummary;
 use pyo3::prelude::*;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use std::time::Instant;
 
 #[pyclass(from_py_object)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Stats {
     #[pyo3(get)]
     pub conflicts: u64,
@@ -102,6 +104,8 @@ pub struct Stats {
     #[pyo3(get)]
     pub ges_literals_removed: u64,
     #[pyo3(get)]
+    pub ges_literals_added: u64,
+    #[pyo3(get)]
     pub ges_binary_clauses_compressed: u64,
     #[pyo3(get)]
     pub ges_clauses_unrolled: u64,
@@ -155,6 +159,36 @@ pub struct Stats {
     pub ges_trail_cursor_selected: u64,
     #[pyo3(get)]
     pub ges_trail_duplicate_skips: u64,
+    /// Signed clause literal -> (extension origin, recursive unrolls, greedy choices).
+    #[pyo3(get)]
+    pub ges_extension_preference: BTreeMap<i32, (String, u64, u64)>,
+    #[pyo3(get)]
+    pub preference_passes: u64,
+    #[pyo3(get)]
+    pub preference_candidates: u64,
+    #[pyo3(get)]
+    pub preference_skipped_dependents: u64,
+    #[pyo3(get)]
+    pub preference_skipped_assigned: u64,
+    #[pyo3(get)]
+    pub preference_root_assigned_true: u64,
+    #[pyo3(get)]
+    pub preference_root_assigned_false: u64,
+    #[pyo3(get)]
+    pub preference_root_assigned_unique: u64,
+    #[pyo3(get)]
+    pub preference_root_rebuilds: u64,
+    preference_root_seen: HashSet<usize>,
+    #[pyo3(get)]
+    pub preference_skipped_unsafe: u64,
+    #[pyo3(get)]
+    pub preference_extensions_retired: u64,
+    #[pyo3(get)]
+    pub preference_clauses_added: u64,
+    #[pyo3(get)]
+    pub preference_clauses_removed: u64,
+    #[pyo3(get)]
+    pub preference_learned_positive_dropped: u64,
     pub learnt_clause_literals_kept: u64,
     pub preprocess_nanos: u128,
     pub solve_nanos: u128,
@@ -220,6 +254,7 @@ impl Stats {
             ges_vsids_improvements: 0,
             ges_utility_improvements: 0,
             ges_literals_removed: 0,
+            ges_literals_added: 0,
             ges_binary_clauses_compressed: 0,
             ges_clauses_unrolled: 0,
             ges_dip_extensions_unrolled: 0,
@@ -247,6 +282,21 @@ impl Stats {
             ges_trail_clauses_selected: 0,
             ges_trail_cursor_selected: 0,
             ges_trail_duplicate_skips: 0,
+            ges_extension_preference: BTreeMap::new(),
+            preference_passes: 0,
+            preference_candidates: 0,
+            preference_skipped_dependents: 0,
+            preference_skipped_assigned: 0,
+            preference_root_assigned_true: 0,
+            preference_root_assigned_false: 0,
+            preference_root_assigned_unique: 0,
+            preference_root_rebuilds: 0,
+            preference_root_seen: HashSet::new(),
+            preference_skipped_unsafe: 0,
+            preference_extensions_retired: 0,
+            preference_clauses_added: 0,
+            preference_clauses_removed: 0,
+            preference_learned_positive_dropped: 0,
             learnt_clause_literals_kept: 0,
             preprocess_nanos: 0,
             solve_nanos: 0,
@@ -261,6 +311,44 @@ impl Stats {
             time_start: None,
             time_stop: None,
         }
+    }
+
+    pub(crate) fn record_preference_root_assignment(&mut self, variable: usize, value: bool) {
+        if value {
+            self.preference_root_assigned_true += 1;
+        } else {
+            self.preference_root_assigned_false += 1;
+        }
+        if self.preference_root_seen.insert(variable) {
+            self.preference_root_assigned_unique += 1;
+        }
+    }
+
+    fn preference_entry(
+        &mut self,
+        literal: i32,
+        extensions: &ExtensionMap,
+    ) -> &mut (String, u64, u64) {
+        self.ges_extension_preference
+            .entry(literal)
+            .or_insert_with(|| {
+                let origin = match extensions
+                    .substitution_origin(&crate::formula::literal::Literal::new(literal))
+                {
+                    Some(ExtensionOrigin::Dip) => "dip",
+                    Some(ExtensionOrigin::Bva) => "bva",
+                    _ => "other",
+                };
+                (origin.to_owned(), 0, 0)
+            })
+    }
+
+    pub(crate) fn record_ges_extension_unroll(&mut self, literal: i32, extensions: &ExtensionMap) {
+        self.preference_entry(literal, extensions).1 += 1;
+    }
+
+    pub(crate) fn record_ges_extension_choice(&mut self, literal: i32, extensions: &ExtensionMap) {
+        self.preference_entry(literal, extensions).2 += 1;
     }
 
     /// Count each successful implication, including each active reason transferred
@@ -448,6 +536,11 @@ impl Stats {
         Self::new()
     }
 
+    #[getter]
+    pub fn preference(&self) -> BTreeMap<i32, (String, u64, u64)> {
+        self.ges_extension_preference.clone()
+    }
+
     pub fn __str__(&self) -> String {
         let red = "\x1b[31m";
         let blue = "\x1b[34m";
@@ -585,6 +678,7 @@ impl Stats {
             ("GES VSIDS improvements", self.ges_vsids_improvements),
             ("GES utility improvements", self.ges_utility_improvements),
             ("GES literals removed", self.ges_literals_removed),
+            ("GES literals added", self.ges_literals_added),
             ("GES binary compressed", self.ges_binary_clauses_compressed),
             ("GES clauses unrolled", self.ges_clauses_unrolled),
             (
@@ -643,6 +737,51 @@ impl Stats {
         .into_iter()
         .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
         .collect::<String>();
+        let preference_rows = [
+            ("Preference passes", self.preference_passes),
+            ("Preference candidates", self.preference_candidates),
+            (
+                "Preference skipped dependent",
+                self.preference_skipped_dependents,
+            ),
+            (
+                "Preference skipped assigned",
+                self.preference_skipped_assigned,
+            ),
+            (
+                "Preference skipped assigned",
+                self.preference_skipped_assigned,
+            ),
+            (
+                "Preference root true checks",
+                self.preference_root_assigned_true,
+            ),
+            (
+                "Preference root false checks",
+                self.preference_root_assigned_false,
+            ),
+            (
+                "Preference root unique",
+                self.preference_root_assigned_unique,
+            ),
+            ("Preference root rebuilds", self.preference_root_rebuilds),
+            (
+                "Preference extensions retired",
+                self.preference_extensions_retired,
+            ),
+            ("Preference clauses added", self.preference_clauses_added),
+            (
+                "Preference clauses removed",
+                self.preference_clauses_removed,
+            ),
+            (
+                "Preference learned + dropped",
+                self.preference_learned_positive_dropped,
+            ),
+        ]
+        .into_iter()
+        .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
+        .collect::<String>();
 
         format!(
             "c +------------------------------------------------------------------------+\n\
@@ -670,6 +809,7 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  {ges_rows}\
+                 {preference_rows}\
                  c +------------------------------------------------------------------------+\n\
                  c | {:^70} |\n\
                  c +------------------------------------------------------------------------+\n\
@@ -887,6 +1027,7 @@ mod tests {
             ("ges_vsids_improvements", "GES VSIDS improvements"),
             ("ges_utility_improvements", "GES utility improvements"),
             ("ges_literals_removed", "GES literals removed"),
+            ("ges_literals_added", "GES literals added"),
             ("ges_binary_clauses_compressed", "GES binary compressed"),
             ("ges_clauses_unrolled", "GES clauses unrolled"),
             ("ges_dip_extensions_unrolled", "GES DIP extensions unrolled"),
@@ -939,6 +1080,41 @@ mod tests {
                     .unwrap(),
                 u64::MAX
             );
+        });
+    }
+
+    #[test]
+    fn extension_preference_is_available_to_python_but_not_in_default_display() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut stats = Stats::new();
+            let mut extensions = ExtensionMap::new();
+            extensions.add_substitution_with_origin(
+                &crate::formula::literal::Literal::new(1),
+                &crate::formula::literal::Literal::new(2),
+                &crate::formula::literal::Literal::new(3),
+                ExtensionOrigin::Bva,
+            );
+            stats.record_ges_extension_unroll(-3, &extensions);
+            stats.record_ges_extension_choice(-3, &extensions);
+            stats.record_ges_extension_choice(-3, &extensions);
+            let display = stats.__str__();
+            let bound = Py::new(py, stats).unwrap();
+            let counts: BTreeMap<i32, (String, u64, u64)> = bound
+                .bind(py)
+                .getattr("ges_extension_preference")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(counts.get(&-3), Some(&("bva".to_owned(), 1, 2)));
+            let preference: BTreeMap<i32, (String, u64, u64)> = bound
+                .bind(py)
+                .getattr("preference")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(preference, counts);
+            assert!(!display.contains("GES ext -3 (bva)"));
         });
     }
 

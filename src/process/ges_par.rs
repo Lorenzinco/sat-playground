@@ -68,7 +68,7 @@ pub(crate) fn process_with_options<W: Write>(
     let extensions = &formula.extensions;
     let vsids = &formula.vsids;
     let mut replacements = Vec::new();
-    let mut reports = Vec::new();
+
     let clauses: Vec<_> = indices
         .into_iter()
         .map(|idx| (idx, formula.get_clause_at_idx(idx)))
@@ -93,23 +93,23 @@ pub(crate) fn process_with_options<W: Write>(
         })
         .collect();
     check_signal(&mut signal)?;
-    for block in blocks {
-        for (idx, evaluation) in block {
-            reports.push(evaluation.report);
-            if let Some(replacement) = evaluation.replacement {
-                replacements.push((idx, replacement));
-            }
-        }
+    let mut inspected = 0;
+    let mut unsuccessful = 0;
+    let mut accepted = 0;
+    for (_, evaluation) in blocks.iter().flatten() {
+        inspected += evaluation.report.inspected;
+        unsuccessful += evaluation
+            .report
+            .noop
+            .saturating_add(evaluation.report.rejected);
+        accepted += u64::from(evaluation.replacement.is_some());
     }
     check_signal(&mut signal)?;
-    let inspected = reports.iter().map(|report| report.inspected).sum();
-    let unsuccessful = reports
-        .iter()
-        .map(|report| report.noop.saturating_add(report.rejected))
-        .sum();
-    let accepted = replacements.len() as u64;
-    for report in reports {
-        report.merge_into(formula);
+    for (idx, evaluation) in blocks.into_iter().flatten() {
+        evaluation.report.merge_into(formula);
+        if let Some(replacement) = evaluation.replacement {
+            replacements.push((idx, replacement));
+        }
     }
     update_adaptive_clause_budget(formula, inspected, accepted, unsuccessful);
     commit_replacements(formula, replacements, logger, history);
@@ -198,6 +198,7 @@ mod tests {
             vsids_improvements: formula.stats.ges_vsids_improvements,
             utility_improvements: formula.stats.ges_utility_improvements,
             literals_removed: formula.stats.ges_literals_removed,
+            literals_added: formula.stats.ges_literals_added,
             binary_clauses_compressed: formula.stats.ges_binary_clauses_compressed,
             clauses_unrolled: formula.stats.ges_clauses_unrolled,
             dip_extensions_unrolled: formula.stats.ges_dip_extensions_unrolled,
@@ -213,6 +214,7 @@ mod tests {
             rerolled_rewrites_after_unrolling: formula.stats.ges_rerolled_rewrites_after_unrolling,
             unrolled_rewrites_rejected: formula.stats.ges_unrolled_rewrites_rejected,
             unrolled_rewrites_restored: formula.stats.ges_unrolled_rewrites_restored,
+            ..Default::default()
         }
     }
 
@@ -280,6 +282,10 @@ mod tests {
                         assert_eq!(state(&parallel), state(&sequential));
                         assert_eq!(actual, expected);
                         assert_eq!(report(&parallel), report(&sequential));
+                        assert_eq!(
+                            parallel.stats.ges_extension_preference,
+                            sequential.stats.ges_extension_preference
+                        );
                         assert_eq!(parallel.stats.ges_clauses_inspected, processed as u64);
                         assert_eq!(
                             parallel.stats.global_extension_substitution,

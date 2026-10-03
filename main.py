@@ -27,16 +27,16 @@ def parse_dimacs(filename: Path) -> List[List[int]]:
 
 
 def solve_example() -> None:
-    clauses = parse_dimacs(Path("tests/unsat/2bitadd_10.cnf"))
+    clauses = parse_dimacs(Path("tests/benchmark/tseitin-4-regular-or2/tseitin-n030-s5.cnf"))
     solver = clsat.Sat(clauses)
     print("c Solving SAT problem...", flush=True)
     solver.solve(
         algorithm="cdcl",
-        implication_point="dip",
+        implication_point="uip",
         preprocess=["bva"],
         heuristics="vsids",
         drat_path="proof.drat",
-        inprocessing=["bva","ges_vsids"],
+        inprocessing=["ges_vsids","bva"],
     )
 
     if solver.model is not None:
@@ -50,6 +50,13 @@ def solve_example() -> None:
 
     if solver.stats is not None:
         print(solver.stats)
+        #print("c GES extension preference (signed literal: origin, unrolled, chosen):")
+        #for literal in solver.stats.preference:
+        #    print(
+        #        f"x_{literal}: "
+        #        f"{solver.stats.preference[literal][0]} "
+        #        f"({solver.stats.preference[literal][1] / solver.stats.preference[literal][2] if solver.stats.preference[literal][2] > 0 else '-'})"
+        #    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

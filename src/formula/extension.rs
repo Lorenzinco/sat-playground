@@ -201,25 +201,7 @@ impl ExtensionMap {
         self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Other);
     }
 
-    pub(crate) fn add_dip_substitution(
-        &mut self,
-        lit1: &Literal,
-        lit2: &Literal,
-        substitute: &Literal,
-    ) {
-        self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Dip);
-    }
-
-    pub(crate) fn add_bva_substitution(
-        &mut self,
-        lit1: &Literal,
-        lit2: &Literal,
-        substitute: &Literal,
-    ) {
-        self.add_substitution_with_origin(lit1, lit2, substitute, ExtensionOrigin::Bva);
-    }
-
-    fn add_substitution_with_origin(
+    pub(crate) fn add_substitution_with_origin(
         &mut self,
         lit1: &Literal,
         lit2: &Literal,
@@ -231,8 +213,7 @@ impl ExtensionMap {
         if let Some(previous) = self.substitutions.get(&inputs).copied() {
             self.remove_substitution(previous);
         }
-        // The reverse index represents one active pair per signed replacement.
-        self.remove_substitution(replacement);
+
         self.substitutions.insert(inputs, replacement);
         for (input, partner) in [inputs, (inputs.1, inputs.0)] {
             self.substitution_partners
@@ -257,14 +238,15 @@ impl ExtensionMap {
     /// removed from the live formula. Its definition is intentionally retained
     /// for model reconstruction.
     pub fn remove_substitution_variable(&mut self, variable: usize) {
-        let Ok(variable) = i64::try_from(variable) else {
-            return;
-        };
-        for signed in [variable, -variable] {
-            if let Ok(replacement) = i32::try_from(signed) {
-                self.remove_substitution(replacement);
-            }
-        }
+        self.remove_substitution(variable as i32);
+    }
+
+    /// Retire an exact extension only after every live occurrence and dependent
+    /// definition has been removed from the formula.
+    pub(crate) fn retire_exact_extension(&mut self, replacement: &Literal) {
+        self.remove_substitution_variable(replacement.get_index().unsigned_abs() as usize);
+        self.definitions
+            .remove(&replacement.get_index().unsigned_abs());
     }
 
     fn remove_substitution(&mut self, replacement: i32) {
@@ -332,7 +314,9 @@ pub fn extension_literal<W: Write>(
 
     let z = formula.add_literal();
     formula.stats.add_extension_literal();
-    formula.extensions.add_dip_substitution(x, y, &z);
+    formula
+        .extensions
+        .add_substitution_with_origin(x, y, &z, ExtensionOrigin::Dip);
 
     formula.add_clause(
         Clause::from_literals(vec![z, x.negated(), y.negated()], 0),
@@ -442,50 +426,23 @@ mod tests {
     }
 
     #[test]
-    fn reused_replacement_removes_old_pair_from_all_indexes() {
+    fn invalidation_keeps_unrelated_pairs_and_definitions() {
         let mut extensions = ExtensionMap::new();
         add(&mut extensions, 1, 2, 10);
-        add(&mut extensions, 2, 3, 10);
-        assert_eq!(
-            extensions.substitute(&Literal::new(1), &Literal::new(2)),
-            None
-        );
-        assert!(partners(&extensions, 1).is_empty());
-        assert_eq!(partners(&extensions, 2), vec![(3, 10)]);
-        assert_eq!(partners(&extensions, 3), vec![(2, 10)]);
-        assert_eq!(
-            extensions.substitution_inputs(&Literal::new(10)),
-            Some((Literal::new(3), Literal::new(2)))
-        );
-    }
 
-    #[test]
-    fn invalidation_removes_both_replacement_signs_and_keeps_unrelated_pairs() {
-        let mut extensions = ExtensionMap::new();
-        add(&mut extensions, 1, 2, 10);
-        add(&mut extensions, 1, 3, -10);
         add(&mut extensions, 1, 4, 11);
         extensions.remove_substitution_variable(10);
         extensions.remove_substitution_variable(10);
         extensions.remove_substitution_variable(99);
         assert_eq!(partners(&extensions, 1), vec![(4, 11)]);
         assert!(partners(&extensions, 2).is_empty());
-        assert!(partners(&extensions, 3).is_empty());
-        for replacement in [10, -10] {
-            assert_eq!(
-                extensions.substitution_inputs(&Literal::new(replacement)),
-                None
-            );
-            assert!(extensions.definition(&Literal::new(replacement)).is_some());
-        }
+        assert_eq!(extensions.substitution_inputs(&Literal::new(10)), None);
+        assert!(extensions.definition(&Literal::new(10)).is_some());
         assert_eq!(
             extensions.substitute(&Literal::new(1), &Literal::new(2)),
             None
         );
-        assert_eq!(
-            extensions.substitute(&Literal::new(1), &Literal::new(3)),
-            None
-        );
+
         extensions.remove_substitution_variable(11);
         assert!(extensions.substitution_partners.is_empty());
         assert!(extensions.substitutions.is_empty());
@@ -513,8 +470,18 @@ mod tests {
     #[test]
     fn exact_substitutions_retain_their_creation_origin() {
         let mut extensions = ExtensionMap::new();
-        extensions.add_dip_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(10));
-        extensions.add_bva_substitution(&Literal::new(3), &Literal::new(4), &Literal::new(11));
+        extensions.add_substitution_with_origin(
+            &Literal::new(1),
+            &Literal::new(2),
+            &Literal::new(10),
+            ExtensionOrigin::Dip,
+        );
+        extensions.add_substitution_with_origin(
+            &Literal::new(3),
+            &Literal::new(4),
+            &Literal::new(11),
+            ExtensionOrigin::Bva,
+        );
         extensions.add_substitution(&Literal::new(5), &Literal::new(6), &Literal::new(12));
 
         assert_eq!(

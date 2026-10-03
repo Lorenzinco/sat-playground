@@ -1,12 +1,10 @@
 pub mod bva;
 pub mod bve;
 pub mod ges;
-pub mod ges_always;
-pub mod ges_lbd;
+
 pub mod ges_par;
-pub mod ges_random;
-pub mod ges_utility;
-pub mod ges_vsids;
+
+pub mod preference;
 pub mod subsumption;
 
 use crate::formula::clause::Clause;
@@ -27,6 +25,7 @@ pub enum Process {
     GESVSIDS,
     GESCompress,
     GESTrail,
+    Preference,
     Subsumption,
     Others,
 }
@@ -108,9 +107,10 @@ impl FromPyObject<'_, '_> for Process {
             "ges_vsids" => Ok(Process::GESVSIDS),
             "ges_compress" => Ok(Process::GESCompress),
             "ges_trail" => Ok(Process::GESTrail),
+            "preference" => Ok(Process::Preference),
             "subsumption" => Ok(Process::Subsumption),
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, subsumption",
+                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption",
                 preprocess
             ))),
         }

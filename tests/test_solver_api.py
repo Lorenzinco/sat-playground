@@ -20,7 +20,7 @@ class SolverApiTests(unittest.TestCase):
         self.assertEqual(solver.stats.bva_budget_exhaustions, 0)
 
     def test_ges_variants_are_accepted(self):
-        for process in ("ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail"):
+        for process in ("ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "preference"):
             for phase in ("preprocess", "inprocessing"):
                 for clauses, satisfiable in (([[1, 2], [-1, 2]], True), ([[1], [-1]], False)):
                     with self.subTest(process=process, phase=phase, satisfiable=satisfiable):
@@ -49,6 +49,17 @@ class SolverApiTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             solver.stats.ges_vsids_improvements = 1
 
+    def test_ges_literals_added_is_exposed_readonly_and_displayed(self):
+        solver = clsat.Sat([[1]])
+        solver.solve(
+            algorithm="cdcl", implication_point="uip", heuristics="vsids",
+            preprocess=[], inprocessing=[],
+        )
+        self.assertEqual(solver.stats.ges_literals_added, 0)
+        self.assertIn("GES literals added", str(solver.stats))
+        with self.assertRaises(AttributeError):
+            solver.stats.ges_literals_added = 1
+
     def test_utility_improvement_counter_is_zero_readonly_and_displayed(self):
         solver = clsat.Sat([[1]])
         solver.solve(
@@ -59,6 +70,35 @@ class SolverApiTests(unittest.TestCase):
         self.assertIn("GES utility improvements", str(solver.stats))
         with self.assertRaises(AttributeError):
             solver.stats.ges_utility_improvements = 1
+
+    def test_preference_counters_are_exposed_and_displayed(self):
+        solver = clsat.Sat([[1]])
+        solver.solve(
+            algorithm="cdcl", implication_point="uip", heuristics="vsids",
+            preprocess=[], inprocessing=["preference"],
+        )
+        for field in (
+            "preference_passes", "preference_candidates", "preference_skipped_dependents",
+            "preference_skipped_assigned", "preference_root_assigned_true",
+            "preference_root_assigned_false", "preference_root_assigned_unique",
+            "preference_root_rebuilds", "preference_skipped_unsafe",
+            "preference_extensions_retired", "preference_clauses_added",
+            "preference_clauses_removed", "preference_learned_positive_dropped",
+        ):
+            self.assertEqual(getattr(solver.stats, field), 0)
+            with self.assertRaises(AttributeError):
+                setattr(solver.stats, field, 1)
+        self.assertIn("Preference extensions retired", str(solver.stats))
+
+    def test_extension_preference_is_exposed_in_python_stats(self):
+        solver = clsat.Sat([[1]])
+        solver.solve(
+            algorithm="cdcl", implication_point="uip", heuristics="vsids",
+            preprocess=[], inprocessing=[],
+        )
+        self.assertEqual(solver.stats.ges_extension_preference, {})
+        self.assertEqual(solver.stats.preference, {})
+        self.assertNotIn("GES ext ", str(solver.stats))
 
     def test_unknown_process_lists_ges_variants(self):
         for phase in ("preprocess", "inprocessing"):
@@ -71,4 +111,4 @@ class SolverApiTests(unittest.TestCase):
                         heuristics="vsids", **options,
                     )
                 self.assertIn("unknown_process", str(error.exception))
-                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, subsumption", str(error.exception))
+                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption", str(error.exception))

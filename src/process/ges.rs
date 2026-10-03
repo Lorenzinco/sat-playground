@@ -42,10 +42,20 @@ pub(crate) struct GesOptions {
 #[derive(Clone, Copy)]
 pub(crate) enum Policy {
     Cursor,
+    /// Highest stored LBD first, oldest physical index first on ties.
     Lbd,
+    /// Sequential window starting at a random physical clause slot.
     Random,
+    /// Each replacement must be at least as active as both inputs. Final
+    /// descending activity scores must improve at their first differing entry;
+    /// dropping an equal-score suffix is not an improvement. The unexpanded
+    /// source is the baseline, and replacements may not grow the clause.
     Vsids,
+    /// Like VSIDS scoring, but uses signed propagation/conflict utility without
+    /// changing branching activity.
     Utility,
+    /// Accept changed, non-growing LBD reformulations without requiring LBD
+    /// improvement. Includes glue clauses, but keeps extension axioms protected.
     Always,
 }
 
@@ -72,26 +82,6 @@ pub(crate) fn process<W: Write>(
     history: Option<&mut History>,
     reasoning_levels: Option<&[Option<usize>]>,
 ) -> PyResult<()> {
-    process_with_options(
-        formula,
-        scope,
-        logger,
-        signal,
-        history,
-        reasoning_levels,
-        GesOptions::default(),
-    )
-}
-
-pub(crate) fn process_with_options<W: Write>(
-    formula: &mut Formula,
-    scope: &ClauseScope,
-    logger: &mut Option<DratLogger<W>>,
-    signal: Option<(Python<'_>, &mut u64)>,
-    history: Option<&mut History>,
-    reasoning_levels: Option<&[Option<usize>]>,
-    options: GesOptions,
-) -> PyResult<()> {
     process_with_policy(
         formula,
         scope,
@@ -100,7 +90,7 @@ pub(crate) fn process_with_options<W: Write>(
         history,
         reasoning_levels,
         Policy::Cursor,
-        options,
+        GesOptions::default(),
     )
 }
 
@@ -183,9 +173,11 @@ impl OriginCounts {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 struct RewriteTrace {
     unrolled: OriginCounts,
+    unrolled_literals: Vec<i32>,
+    chosen_literals: Vec<i32>,
     source_literals: u64,
     expanded_literals: u64,
     substitutions: OriginCounts,
@@ -199,6 +191,8 @@ impl RewriteTrace {
             inspected: 1,
             noop: u64::from(noop),
             rejected: u64::from(rejected),
+            unrolled_literals: self.unrolled_literals,
+            chosen_literals: self.chosen_literals,
             clauses_unrolled: u64::from(was_unrolled),
             dip_extensions_unrolled: self.unrolled.dip,
             bva_extensions_unrolled: self.unrolled.bva,
@@ -218,15 +212,18 @@ impl RewriteTrace {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvaluationReport {
     pub(crate) inspected: u64,
+    pub(crate) unrolled_literals: Vec<i32>,
+    pub(crate) chosen_literals: Vec<i32>,
     pub(crate) noop: u64,
     pub(crate) rejected: u64,
     pub(crate) lbd_improvements: u64,
     pub(crate) vsids_improvements: u64,
     pub(crate) utility_improvements: u64,
     pub(crate) literals_removed: u64,
+    pub(crate) literals_added: u64,
     pub(crate) binary_clauses_compressed: u64,
     pub(crate) clauses_unrolled: u64,
     pub(crate) dip_extensions_unrolled: u64,
@@ -246,6 +243,16 @@ pub(crate) struct EvaluationReport {
 
 impl EvaluationReport {
     pub(crate) fn merge_into(self, formula: &mut Formula) {
+        for literal in self.unrolled_literals {
+            formula
+                .stats
+                .record_ges_extension_unroll(literal, &formula.extensions);
+        }
+        for literal in self.chosen_literals {
+            formula
+                .stats
+                .record_ges_extension_choice(literal, &formula.extensions);
+        }
         formula.stats.ges_clauses_inspected += self.inspected;
         formula.stats.ges_noop_rewrites += self.noop;
         formula.stats.ges_rewrites_rejected += self.rejected;
@@ -253,6 +260,7 @@ impl EvaluationReport {
         formula.stats.ges_vsids_improvements += self.vsids_improvements;
         formula.stats.ges_utility_improvements += self.utility_improvements;
         formula.stats.ges_literals_removed += self.literals_removed;
+        formula.stats.ges_literals_added += self.literals_added;
         formula.stats.ges_binary_clauses_compressed += self.binary_clauses_compressed;
         formula.stats.ges_clauses_unrolled += self.clauses_unrolled;
         formula.stats.ges_dip_extensions_unrolled += self.dip_extensions_unrolled;
@@ -305,6 +313,7 @@ pub(crate) fn evaluate_clause(
 struct CachedExpansion {
     literals: Option<Vec<Literal>>,
     unrolled: OriginCounts,
+    unrolled_literals: Vec<i32>,
 }
 
 /// Borrows one immutable extension snapshot, so cached expansions cannot outlive it.
@@ -318,8 +327,8 @@ pub(crate) struct PassWorkspace<'a> {
     expansions: HashMap<i32, CachedExpansion>,
     cached_units: usize,
     unrolled: OriginCounts,
+    unrolled_literals: Vec<i32>,
     expanded: Vec<Literal>,
-    expanding: HashSet<i32>,
     literals: Vec<Literal>,
     literal_set: HashSet<Literal>,
     source_set: HashSet<Literal>,
@@ -348,8 +357,8 @@ impl<'a> PassWorkspace<'a> {
             expansions: HashMap::new(),
             cached_units: 0,
             unrolled: OriginCounts::default(),
+            unrolled_literals: Vec::new(),
             expanded: Vec::new(),
-            expanding: HashSet::new(),
             literals: Vec::new(),
             literal_set: HashSet::new(),
             source_set: HashSet::new(),
@@ -364,6 +373,7 @@ impl<'a> PassWorkspace<'a> {
         self.literals.clear();
         self.literal_set.clear();
         self.unrolled = OriginCounts::default();
+        self.unrolled_literals.clear();
         source
             .iter()
             .all(|&literal| self.append_source_expansion(literal))
@@ -377,6 +387,8 @@ impl<'a> PassWorkspace<'a> {
         let key = literal.get_index();
         if let Some(cached) = self.expansions.get(&key) {
             self.unrolled.merge(cached.unrolled);
+            self.unrolled_literals
+                .extend_from_slice(&cached.unrolled_literals);
             let Some(expansion) = cached.literals.as_deref() else {
                 return false;
             };
@@ -384,18 +396,17 @@ impl<'a> PassWorkspace<'a> {
         }
 
         self.expanded.clear();
-        self.expanding.clear();
-        // Only complete root expansions are cached. A subtree reached inside a
-        // cycle depends on the current recursion stack and cannot be reused.
         let mut unrolled = OriginCounts::default();
+        let mut unrolled_literals = Vec::new();
         let valid = unroll_literal(
             self.extensions,
             literal,
-            &mut self.expanding,
             &mut self.expanded,
             &mut unrolled,
+            &mut unrolled_literals,
         );
         self.unrolled.merge(unrolled);
+        self.unrolled_literals.extend_from_slice(&unrolled_literals);
 
         let units = if valid { self.expanded.len() + 1 } else { 1 };
         if units <= MAX_CACHED_EXPANSION_UNITS - self.cached_units {
@@ -404,6 +415,7 @@ impl<'a> PassWorkspace<'a> {
                 CachedExpansion {
                     literals: valid.then(|| self.expanded.clone()),
                     unrolled,
+                    unrolled_literals,
                 },
             );
             self.cached_units += units;
@@ -855,6 +867,9 @@ fn substitute_snapshot(
     } else {
         let valid = workspace.unroll(source);
         trace.unrolled = workspace.unrolled;
+        trace
+            .unrolled_literals
+            .clone_from(&workspace.unrolled_literals);
         trace.expanded_literals = workspace.literals.len() as u64;
         if !valid {
             return Evaluation {
@@ -942,6 +957,7 @@ fn substitute_snapshot(
         let Some((_, _, left_idx, right_idx, replacement)) = best else {
             break;
         };
+        trace.chosen_literals.push(replacement.get_index());
         if trace.unrolled.total() != 0 {
             trace.substitutions.record(
                 extensions
@@ -974,22 +990,21 @@ fn substitute_snapshot(
             report: trace.report(true, false, false),
         };
     }
-    if literals.len() > source.len() {
-        return Evaluation {
-            replacement: None,
-            report: trace.report(false, true, false),
-        };
-    }
+
     let score_improves = match objective {
-        Objective::Vsids => {
-            activities_improve(vsids, source, literals, source_activities, final_activities)
-        }
-        Objective::Utility => utilities_improve(
-            extensions,
+        Objective::Vsids => scores_improve(
             source,
             literals,
             source_activities,
             final_activities,
+            |literal| vsids.literal_activity(literal),
+        ),
+        Objective::Utility => scores_improve(
+            source,
+            literals,
+            source_activities,
+            final_activities,
+            |literal| extensions.literal_utility(literal),
         ),
         _ => true,
     };
@@ -1015,7 +1030,8 @@ fn substitute_snapshot(
             report: trace.report(false, true, false),
         };
     }
-    let literals_removed = (source.len() - literals.len()) as u64;
+    let literals_removed = source.len().saturating_sub(literals.len()) as u64;
+    let literals_added = literals.len().saturating_sub(source.len()) as u64;
     let lbd = match (objective, clause.lbd) {
         // Equivalent rewrites of original clauses remain irredundant.
         (_, -1) => -1,
@@ -1039,6 +1055,7 @@ fn substitute_snapshot(
     report.vsids_improvements = u64::from(objective == Objective::Vsids);
     report.utility_improvements = u64::from(objective == Objective::Utility);
     report.literals_removed = literals_removed;
+    report.literals_added = literals_added;
     Evaluation {
         replacement: Some(replacement),
         report,
@@ -1056,6 +1073,7 @@ fn direct_permanent_substitution(workspace: &mut PassWorkspace<'_>, clause: &Cla
     literals.clear();
     literals.extend_from_slice(clause.get_literals());
     let source_len = literals.len();
+    let mut chosen_literals = Vec::new();
 
     while literals.len() >= 2 {
         fill_substitution_pairs(extensions, literals, positions, pairs);
@@ -1073,6 +1091,7 @@ fn direct_permanent_substitution(workspace: &mut PassWorkspace<'_>, clause: &Cla
         let Some((left_idx, right_idx, replacement)) = best else {
             break;
         };
+        chosen_literals.push(replacement.get_index());
 
         literals.remove(right_idx);
         literals.remove(left_idx);
@@ -1087,6 +1106,7 @@ fn direct_permanent_substitution(workspace: &mut PassWorkspace<'_>, clause: &Cla
             report: EvaluationReport {
                 inspected: 1,
                 noop: 1,
+                chosen_literals,
                 ..EvaluationReport::default()
             },
         };
@@ -1100,43 +1120,12 @@ fn direct_permanent_substitution(workspace: &mut PassWorkspace<'_>, clause: &Cla
         replacement: Some(replacement),
         report: EvaluationReport {
             inspected: 1,
+            chosen_literals,
             literals_removed: (source_len - literals.len()) as u64,
             binary_clauses_compressed: u64::from(source_len == 2 && literals.len() == 1),
             ..EvaluationReport::default()
         },
     }
-}
-
-fn activities_improve(
-    vsids: &Vsids,
-    source: &[Literal],
-    candidate: &[Literal],
-    source_activities: &mut Vec<f64>,
-    final_activities: &mut Vec<f64>,
-) -> bool {
-    scores_improve(
-        source,
-        candidate,
-        source_activities,
-        final_activities,
-        |literal| vsids.literal_activity(literal),
-    )
-}
-
-fn utilities_improve(
-    extensions: &ExtensionMap,
-    source: &[Literal],
-    candidate: &[Literal],
-    source_utilities: &mut Vec<f64>,
-    final_utilities: &mut Vec<f64>,
-) -> bool {
-    scores_improve(
-        source,
-        candidate,
-        source_utilities,
-        final_utilities,
-        |literal| extensions.literal_utility(literal),
-    )
 }
 
 fn scores_improve(
@@ -1219,15 +1208,15 @@ fn apply_substitution(
 #[cfg(test)]
 fn unroll_clause(extensions: &ExtensionMap, literals: &[Literal]) -> Option<Vec<Literal>> {
     let mut unrolled = Vec::new();
-    let mut expanding = HashSet::new();
     let mut origins = OriginCounts::default();
+    let mut unrolled_literals = Vec::new();
     for &literal in literals {
         if !unroll_literal(
             extensions,
             literal,
-            &mut expanding,
             &mut unrolled,
             &mut origins,
+            &mut unrolled_literals,
         ) {
             return None;
         }
@@ -1244,19 +1233,27 @@ fn has_exact_expansion(extensions: &ExtensionMap, literal: Literal) -> bool {
 fn unroll_literal(
     extensions: &ExtensionMap,
     literal: Literal,
-    expanding: &mut HashSet<i32>,
     unrolled: &mut Vec<Literal>,
     origins: &mut OriginCounts,
+    unrolled_literals: &mut Vec<i32>,
 ) -> bool {
     let substitute = literal.negated();
-    if let Some((first, second, origin)) = extensions.substitution_inputs_with_origin(&substitute)
-        && expanding.insert(substitute.get_index())
-    {
+    if let Some((first, second, origin)) = extensions.substitution_inputs_with_origin(&substitute) {
         origins.record(origin);
-        let valid = unroll_literal(extensions, first.negated(), expanding, unrolled, origins)
-            && unroll_literal(extensions, second.negated(), expanding, unrolled, origins);
-        expanding.remove(&substitute.get_index());
-        return valid;
+        unrolled_literals.push(literal.get_index());
+        return unroll_literal(
+            extensions,
+            first.negated(),
+            unrolled,
+            origins,
+            unrolled_literals,
+        ) && unroll_literal(
+            extensions,
+            second.negated(),
+            unrolled,
+            origins,
+            unrolled_literals,
+        );
     }
 
     if unrolled.contains(&literal.negated()) {
@@ -1485,6 +1482,42 @@ mod tests {
     }
 
     #[test]
+    fn lbd_accepts_longer_representation_when_dynamic_lbd_improves() {
+        let mut formula = Formula::new(4);
+        formula
+            .extensions
+            .add_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(4));
+        let source = Clause::from_literals([-4, 3].map(Literal::new).to_vec(), 4);
+        let levels = [None, Some(1), Some(1), Some(1), Some(2)];
+        let evaluation = evaluate_clause(
+            &formula.extensions,
+            &formula.vsids,
+            &source,
+            false,
+            Some(&levels),
+        );
+        let replacement = evaluation
+            .replacement
+            .expect("lower LBD should permit growth");
+        assert_eq!(replacement.len(), 3);
+        assert_eq!(dynamic_lbd(replacement.get_literals(), Some(&levels)), 1);
+        assert_eq!(evaluation.report.lbd_improvements, 1);
+        assert_eq!(evaluation.report.literals_removed, 0);
+        assert_eq!(evaluation.report.literals_added, 1);
+    }
+
+    #[test]
+    fn vsids_accepts_longer_representation_when_activity_improves() {
+        let formula = vsids_fixture(&[(1, 2, 4)], &[0., 5., 5., 0., 1.]);
+        let source = Clause::from_literals([-4, 3].map(Literal::new).to_vec(), -1);
+        let evaluation = evaluate_vsids(&formula, &source, None);
+        assert_eq!(evaluation.replacement.unwrap().len(), 3);
+        assert_eq!(evaluation.report.vsids_improvements, 1);
+        assert_eq!(evaluation.report.literals_removed, 0);
+        assert_eq!(evaluation.report.literals_added, 1);
+    }
+
+    #[test]
     fn vsids_prefers_hottest_replacement_even_when_lbd_worsens() {
         let formula = vsids_fixture(&[(1, 2, 5), (1, 3, 6)], &[0., 1., 2., 3., 4., 9., 10.]);
         let clause = Clause::from_literals([-1, -2, -3, 4].map(Literal::new).to_vec(), 5);
@@ -1563,7 +1596,9 @@ mod tests {
         ] {
             let candidate: Vec<_> = candidate.into_iter().map(Literal::new).collect();
             assert_eq!(
-                activities_improve(&formula.vsids, &source, &candidate, &mut before, &mut after),
+                scores_improve(&source, &candidate, &mut before, &mut after, |literal| {
+                    formula.vsids.literal_activity(literal)
+                }),
                 expected
             );
         }
@@ -1575,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn vsids_compares_against_source_before_expansion_and_rejects_growth() {
+    fn vsids_compares_against_source_before_expansion_and_accepts_quality_growth() {
         let formula = vsids_fixture(&[(1, 2, 5), (1, 3, 6)], &[0., 1., 1., 1., 0., 100., 10.]);
         let clause = Clause::from_literals([-5, -3, 4].map(Literal::new).to_vec(), -1);
         // Recovering the original hot extension is a no-op, not an improvement.
@@ -1587,11 +1622,12 @@ mod tests {
         let replacement = evaluation.replacement.unwrap();
         assert_eq!(replacement.get_literals().len(), clause.len());
         assert_eq!(replacement.get_literals(), [-2, 4, -6].map(Literal::new));
-        // An activity gain solely from expanding to a larger clause is rejected.
+        // Activity gain now permits a larger final representation.
         let clause = Clause::from_literals([-5, 4].map(Literal::new).to_vec(), -1);
         let evaluation = evaluate_vsids(&formula, &clause, None);
-        assert!(evaluation.replacement.is_none());
-        assert_eq!(evaluation.report.rejected, 1);
+        assert_eq!(evaluation.replacement.unwrap().len(), 3);
+        assert_eq!(evaluation.report.vsids_improvements, 1);
+        assert_eq!(evaluation.report.literals_added, 1);
     }
 
     #[test]
@@ -1630,8 +1666,17 @@ mod tests {
         formula.vsids.activity[z.get_index() as usize] = 100.;
         formula.ges_cursor = 1;
         let scope = full_scope(&formula);
-        crate::process::ges_vsids::process(&mut formula, &scope, &mut logger, None, None, None)
-            .unwrap();
+        process_with_policy(
+            &mut formula,
+            &scope,
+            &mut logger,
+            None,
+            None,
+            None,
+            Policy::Vsids,
+            GesOptions::default(),
+        )
+        .unwrap();
         drop(logger);
         assert!(!formula.is_clause_garbage(0));
         assert!(!formula.is_clause_garbage(count - 1));
@@ -1718,20 +1763,23 @@ mod tests {
     #[test]
     fn compression_only_skips_unrolling_and_substitutes_existing_literals() {
         let mut formula = Formula::new(6);
-        formula.extensions.add_dip_substitution(
+        formula.extensions.add_substitution_with_origin(
             &Literal::new(1),
             &Literal::new(2),
             &Literal::new(4),
+            crate::formula::extension::ExtensionOrigin::Dip,
         );
-        formula.extensions.add_bva_substitution(
+        formula.extensions.add_substitution_with_origin(
             &Literal::new(1),
             &Literal::new(3),
             &Literal::new(5),
+            crate::formula::extension::ExtensionOrigin::Bva,
         );
-        formula.extensions.add_dip_substitution(
+        formula.extensions.add_substitution_with_origin(
             &Literal::new(2),
             &Literal::new(5),
             &Literal::new(6),
+            crate::formula::extension::ExtensionOrigin::Dip,
         );
         formula.vsids.activity[5] = 10.0;
         formula.vsids.activity[6] = 20.0;
@@ -1783,10 +1831,11 @@ mod tests {
     #[test]
     fn traces_unroll_reroll_round_trips_as_restored() {
         let mut formula = Formula::new(4);
-        formula.extensions.add_dip_substitution(
+        formula.extensions.add_substitution_with_origin(
             &Literal::new(1),
             &Literal::new(2),
             &Literal::new(3),
+            crate::formula::extension::ExtensionOrigin::Dip,
         );
         let clause = Clause::from_literals([-3, 4].map(Literal::new).to_vec(), -1);
         let evaluation =
@@ -1801,6 +1850,13 @@ mod tests {
         assert_eq!(evaluation.report.rewrites_after_unrolling, 0);
         assert_eq!(evaluation.report.rerolled_rewrites_after_unrolling, 0);
         assert_eq!(evaluation.report.unrolled_rewrites_restored, 1);
+        assert_eq!(evaluation.report.unrolled_literals, vec![-3]);
+        assert_eq!(evaluation.report.chosen_literals, vec![-3]);
+        evaluation.report.merge_into(&mut formula);
+        assert_eq!(
+            formula.stats.ges_extension_preference.get(&-3),
+            Some(&("dip".to_owned(), 1, 1))
+        );
     }
 
     #[test]
@@ -1827,7 +1883,7 @@ mod tests {
 
         formula
             .process(
-                vec![
+                &[
                     crate::process::Process::GES,
                     crate::process::Process::GESCompress,
                 ],
@@ -1857,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn always_wrapper_uses_cursor_budget_shared_commit_and_current_lbd() {
+    fn always_policy_uses_cursor_budget_shared_commit_and_current_lbd() {
         let mut formula = Formula::from_vec(vec![vec![-1, -2, 3, 4]]);
         formula.get_clause_at_idx_mut(0).lbd = 2;
         formula.get_clause_at_idx_mut(0).activity = 9;
@@ -1872,13 +1928,15 @@ mod tests {
         assert_eq!(extension, Literal::new(5));
         let levels = [None, Some(1), Some(1), Some(1), Some(2), Some(3)];
         let scope = full_scope(&formula);
-        crate::process::ges_always::process(
+        process_with_policy(
             &mut formula,
             &scope,
             &mut logger,
             None,
             None,
             Some(&levels),
+            Policy::Always,
+            GesOptions::default(),
         )
         .unwrap();
         drop(logger);
@@ -1898,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_expansions_match_uncached_order_for_signed_clauses_and_cycles() {
+    fn cached_expansions_match_uncached_order_for_signed_clauses() {
         let mut formula = Formula::new(8);
         for (a, b, z) in [(1, 2, 5), (5, 3, 6), (6, 5, 7), (-2, 4, 8)] {
             formula.extensions.add_substitution(
@@ -1907,43 +1965,47 @@ mod tests {
                 &Literal::new(z),
             );
         }
-        // Also exercise context-sensitive cycle guards: only complete root
-        // expansions may be reused, never partial recursive expansions.
-        for cyclic in [false, true] {
-            if cyclic {
-                formula.extensions.add_substitution(
-                    &Literal::new(7),
-                    &Literal::new(4),
-                    &Literal::new(1),
-                );
-            }
-            let mut workspace = PassWorkspace::new(&formula.extensions);
-            for a in -8..=8 {
-                for b in -8..=8 {
-                    for c in -8..=8 {
-                        if a == 0 || b == 0 || c == 0 {
-                            continue;
-                        }
-                        let source = [a, b, c].map(Literal::new);
-                        let expected = unroll_clause(&formula.extensions, &source);
-                        assert_eq!(workspace.unroll(&source), expected.is_some(), "{source:?}");
-                        if let Some(expected) = expected {
-                            assert_eq!(workspace.literals, expected, "{source:?}");
-                        }
+        let mut workspace = PassWorkspace::new(&formula.extensions);
+        for a in -8..=8 {
+            for b in -8..=8 {
+                for c in -8..=8 {
+                    if a == 0 || b == 0 || c == 0 {
+                        continue;
+                    }
+                    let source = [a, b, c].map(Literal::new);
+                    let expected = unroll_clause(&formula.extensions, &source);
+                    assert_eq!(workspace.unroll(&source), expected.is_some(), "{source:?}");
+                    if let Some(expected) = expected {
+                        assert_eq!(workspace.literals, expected, "{source:?}");
                     }
                 }
             }
-            assert!(!workspace.expansions.is_empty());
-            assert!(workspace.cached_units <= MAX_CACHED_EXPANSION_UNITS);
         }
+        assert!(!workspace.expansions.is_empty());
+        assert!(workspace.cached_units <= MAX_CACHED_EXPANSION_UNITS);
     }
 
     #[test]
     fn expansion_cache_recursively_flattens_dip_and_exact_bva_extensions() {
         let mut extensions = ExtensionMap::new();
-        extensions.add_dip_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(10));
-        extensions.add_bva_substitution(&Literal::new(3), &Literal::new(4), &Literal::new(11));
-        extensions.add_dip_substitution(&Literal::new(10), &Literal::new(11), &Literal::new(20));
+        extensions.add_substitution_with_origin(
+            &Literal::new(1),
+            &Literal::new(2),
+            &Literal::new(10),
+            crate::formula::extension::ExtensionOrigin::Dip,
+        );
+        extensions.add_substitution_with_origin(
+            &Literal::new(3),
+            &Literal::new(4),
+            &Literal::new(11),
+            crate::formula::extension::ExtensionOrigin::Bva,
+        );
+        extensions.add_substitution_with_origin(
+            &Literal::new(10),
+            &Literal::new(11),
+            &Literal::new(20),
+            crate::formula::extension::ExtensionOrigin::Dip,
+        );
         let mut workspace = PassWorkspace::new(&extensions);
 
         let expected = [-4, -3, -2, -1].map(Literal::new);
@@ -1951,6 +2013,7 @@ mod tests {
         assert_eq!(workspace.literals, expected);
         assert_eq!(workspace.unrolled.dip, 2);
         assert_eq!(workspace.unrolled.bva, 1);
+        assert_eq!(workspace.unrolled_literals, vec![-20, -11, -10]);
         assert_eq!(
             workspace.expansions[&-20].literals.as_deref(),
             Some(expected.as_slice())
@@ -1960,15 +2023,17 @@ mod tests {
         assert_eq!(workspace.literals, expected);
         assert_eq!(workspace.unrolled.dip, 2);
         assert_eq!(workspace.unrolled.bva, 1);
+        assert_eq!(workspace.unrolled_literals, vec![-20, -11, -10]);
     }
 
     #[test]
     fn exact_bva_expansion_that_rerolls_to_source_is_a_noop() {
         let mut formula = Formula::new(11);
-        formula.extensions.add_bva_substitution(
+        formula.extensions.add_substitution_with_origin(
             &Literal::new(3),
             &Literal::new(4),
             &Literal::new(11),
+            crate::formula::extension::ExtensionOrigin::Bva,
         );
         let clause = Clause::from_literals([-11, 5].map(Literal::new).to_vec(), -1);
 
@@ -1982,6 +2047,11 @@ mod tests {
         assert_eq!(evaluation.report.bva_extensions_unrolled, 1);
         assert_eq!(evaluation.report.substitutions_to_bva, 1);
         assert_eq!(evaluation.report.unrolled_rewrites_restored, 1);
+        evaluation.report.merge_into(&mut formula);
+        assert_eq!(
+            formula.stats.ges_extension_preference.get(&-11),
+            Some(&("bva".to_owned(), 1, 1))
+        );
     }
 
     #[test]
@@ -2110,34 +2180,6 @@ mod tests {
                 .is_some()
         );
         assert_eq!(capacities(&workspace), before);
-    }
-
-    #[test]
-    fn new_pass_observes_changed_extension_definitions() {
-        let mut formula = Formula::new(5);
-        formula
-            .extensions
-            .add_substitution(&Literal::new(1), &Literal::new(2), &Literal::new(5));
-        {
-            let mut workspace = PassWorkspace::new(&formula.extensions);
-            assert!(workspace.unroll(&[Literal::new(-5)]));
-            assert_eq!(
-                workspace.literals,
-                unroll_clause(&formula.extensions, &[Literal::new(-5)]).unwrap()
-            );
-            assert!(workspace.literals.contains(&Literal::new(-1)));
-        }
-        formula
-            .extensions
-            .add_substitution(&Literal::new(3), &Literal::new(4), &Literal::new(5));
-        let mut workspace = PassWorkspace::new(&formula.extensions);
-        assert!(workspace.unroll(&[Literal::new(-5)]));
-        assert_eq!(
-            workspace.literals,
-            unroll_clause(&formula.extensions, &[Literal::new(-5)]).unwrap()
-        );
-        assert!(workspace.literals.contains(&Literal::new(-3)));
-        assert!(!workspace.literals.contains(&Literal::new(-1)));
     }
 
     #[test]
@@ -2984,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_count_growth_even_when_unrolling_decreases_dynamic_lbd() {
+    fn accepts_count_growth_when_unrolling_decreases_dynamic_lbd() {
         let mut formula = Formula::new(6);
         let first = Literal::new(4);
         let second = Literal::new(5);
@@ -3013,8 +3055,9 @@ mod tests {
             false,
             Some(&levels),
         );
-        assert!(evaluation.replacement.is_none());
-        assert_eq!(evaluation.report.rejected, 1);
+        assert_eq!(evaluation.replacement.unwrap().len(), 4);
+        assert_eq!(evaluation.report.lbd_improvements, 1);
+        assert_eq!(evaluation.report.literals_added, 2);
     }
 
     #[test]
@@ -3092,12 +3135,14 @@ mod tests {
         assert!(evaluation.replacement.is_none());
         assert_eq!(evaluation.report.rejected, 1);
         assert_eq!(evaluation.report.literals_removed, 0);
+        assert_eq!(evaluation.report.chosen_literals, vec![-4]);
         let evaluation = evaluate_clause(&formula.extensions, &formula.vsids, &clause, false, None);
         assert!(evaluation.replacement.is_some());
         assert_eq!(
             evaluation.report,
             EvaluationReport {
                 inspected: 1,
+                chosen_literals: vec![-4],
                 lbd_improvements: 1,
                 literals_removed: 1,
                 ..EvaluationReport::default()

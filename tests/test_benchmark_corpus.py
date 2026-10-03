@@ -212,7 +212,7 @@ class BenchmarkParserTests(unittest.TestCase):
     def test_process_choices_include_all_ges_variants(self):
         self.assertEqual(
             PROCESS_CHOICES,
-            ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "subsumption"),
+            ("bva", "bve", "ges", "ges_always", "ges_lbd", "ges_par", "ges_random", "ges_vsids", "ges_utility", "ges_compress", "ges_trail", "preference", "subsumption"),
         )
 
     def test_ges_variants_are_preserved_by_parser(self):

@@ -222,7 +222,7 @@ mod tests {
         let scope = full_scope(&formula);
         formula
             .process::<std::io::Empty>(
-                vec![crate::process::Process::Subsumption],
+                &[crate::process::Process::Subsumption],
                 &scope,
                 &mut None,
                 None,
@@ -249,7 +249,7 @@ mod tests {
         let scope = full_scope(&formula);
         formula
             .process::<std::io::Empty>(
-                vec![crate::process::Process::Subsumption],
+                &[crate::process::Process::Subsumption],
                 &scope,
                 &mut None,
                 None,

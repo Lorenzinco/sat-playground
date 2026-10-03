@@ -153,7 +153,9 @@ impl Vsids {
         let mut best_score = -1.0;
 
         for i in 1..formula.assignment.len() {
-            if formula.assignment.get_value(i).is_none() {
+            if formula.assignment.get_value(i).is_none()
+                && !formula.is_retired_extension_variable(i)
+            {
                 let score = self.activity.get(i).copied().unwrap_or(0.0);
                 if score > best_score {
                     best_score = score;
