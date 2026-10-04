@@ -5,10 +5,11 @@ use crate::history::two_vertex_bottlenecks;
 use crate::history::uip;
 use crate::history::{ConflictLearnResult, History};
 
-// The fresh extension literal contributes one additional LBD block to the
-// learned post clause. At most one lower-level block therefore guarantees that
-// every accepted DIP post clause is unit or glue.
-const MAX_DIP_REMAINDER_LEVELS: i64 = 1;
+#[derive(Default)]
+pub(super) struct DipScratch {
+    bottlenecks: two_vertex_bottlenecks::BottleneckScratch,
+    pub(super) extraction: dip_clause::ExtractionScratch,
+}
 
 pub fn find_dip(
     history: &History,
@@ -33,12 +34,22 @@ pub(super) fn learn_from_analysis(
     analysis: &ConflictAnalysis,
     history: &History,
     formula: &mut Formula,
-    conflict_clause_index: usize,
+    _conflict_clause_index: usize,
 ) -> Option<ConflictLearnResult> {
-    let pair =
-        two_vertex_bottlenecks::find_middle_pair(&analysis.predecessors, &analysis.pred_index)?;
-    let (dip_a, dip_b, clause) =
-        dip_clause::extract(analysis, history, formula, conflict_clause_index, pair)?;
+    // The conflict's lower frontier is unavoidable for every pair. Count an
+    // LBD rejection here, but not a found candidate: no pair search took place.
+    if dip_clause::conflict_frontier_has_two_levels(analysis, history)? {
+        formula.stats.dip_lbd_rejections += 1;
+        return None;
+    }
+    let mut scratch = history.dip_scratch.borrow_mut();
+    // analyze_conflict_graph validates the topological CSR while constructing it.
+    let pair = two_vertex_bottlenecks::find_middle_pair_with_scratch(
+        &analysis.predecessors,
+        &analysis.pred_index,
+        &mut scratch.bottlenecks,
+    )?;
+    let (dip_a, dip_b) = dip_clause::graph_pair(analysis, pair)?;
     formula.stats.dip_candidates_found += 1;
 
     // A reused, assigned extension makes the post clause non-asserting: if z is
@@ -53,15 +64,22 @@ pub(super) fn learn_from_analysis(
         return None;
     }
 
-    if clause.post_lbd > MAX_DIP_REMAINDER_LEVELS {
-        formula.stats.dip_lbd_rejections += 1;
-        return None;
-    }
+    // The fresh extension adds one LBD block. Extraction stops immediately if
+    // the post region has more than one nonroot lower-level block.
+    let post =
+        match dip_clause::extract_with_scratch(analysis, history, pair, &mut scratch.extraction) {
+            Ok(clause) => clause,
+            Err(dip_clause::ExtractionRejection::Lbd) => {
+                formula.stats.dip_lbd_rejections += 1;
+                return None;
+            }
+            Err(dip_clause::ExtractionRejection::InvalidGraph) => return None,
+        };
 
     Some(ConflictLearnResult::Dip {
         dip_a,
         dip_b,
-        post_clause_without_z: clause.post,
+        post_clause_without_z: post,
     })
 }
 #[cfg(test)]
@@ -335,10 +353,11 @@ mod tests {
         let pair =
             two_vertex_bottlenecks::find_middle_pair(&analysis.predecessors, &analysis.pred_index)
                 .expect("Figure 1 middle DIP");
-        let (dip_a, dip_b, clauses) =
-            dip_clause::extract(&analysis, &history, &formula, conflict_idx, pair)
+        let (dip_a, dip_b) = dip_clause::graph_pair(&analysis, pair).unwrap();
+        let mut scratch = history.dip_scratch.borrow_mut();
+        let post =
+            dip_clause::extract_with_scratch(&analysis, &history, pair, &mut scratch.extraction)
                 .expect("Figure 1 DIP clauses");
-        let post = clauses.post;
 
         // The middle heuristic chooses the third row of Figure 2.
         assert_eq!(
@@ -482,7 +501,8 @@ mod tests {
             history.analyze_conflict(&mut formula, 4, ImplicationPoint::DIP),
             ConflictLearnResult::Uip { .. }
         ));
-        assert_eq!(formula.stats.dip_candidates_found, 1);
+        // The conflict frontier proves rejection before searching for a pair.
+        assert_eq!(formula.stats.dip_candidates_found, 0);
         assert_eq!(formula.stats.dip_unit_post_clauses, 0);
         assert_eq!(formula.stats.dip_glue_post_clauses, 0);
         assert_eq!(formula.stats.dip_lbd_rejections, 1);

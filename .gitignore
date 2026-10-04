@@ -16,5 +16,6 @@ benchmark_bva
 benchmark_bva_pimped
 sat_2021
 benchmark_runs
+benchmark_runs_optimized
 benchmark_runs_rescheduled
 benchmark_runs_rescheduled_2_dip_glue

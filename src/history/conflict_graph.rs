@@ -83,8 +83,7 @@ pub fn graph_from_conflict(
                     if lit == &first_uip {
                         return vec![]; // Stop backward exploration at 1UIP
                     }
-                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
-                    {
+                    if let Some(reason_idx) = history.get_reason(lit) {
                         let reason = formula.get_clause_at_idx(reason_idx);
                         reason
                             .get_literals()
@@ -441,8 +440,7 @@ pub fn find_clauses_from_dip_pair<W>(
             if let Some(NodeType::Literal(lit)) = graph.get_node(node) {
                 let lit_level = history.get_literal_level(lit).unwrap_or(0);
                 if lit_level == current_level {
-                    if let Some(reason_idx) = history.decision_levels[current_level].get_reason(lit)
-                    {
+                    if let Some(reason_idx) = history.get_reason(lit) {
                         let reason = formula.get_clause_at_idx(reason_idx);
                         for reason_lit in reason.get_literals() {
                             if reason_lit == lit {

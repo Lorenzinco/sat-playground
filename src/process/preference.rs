@@ -46,14 +46,16 @@ pub(crate) fn process_at_restart<W: Write>(
             .stats
             .record_preference_root_assignment(variable, value);
     }
-    let rewind = !root_candidates.is_empty() && history.decision_levels.len() == 1 && {
-        let root = &history.decision_levels[0];
-        root.trail_len()
+    let rewind = !root_candidates.is_empty()
+        && history.get_decision_level() == 0
+        && history.trail().len()
             == (1..formula.assignment.len())
                 .filter(|&var| formula.assignment.get_value(var).is_some())
                 .count()
-            && (0..root.trail_len()).all(|index| root.trail_reason(index).is_some())
-    };
+        && history
+            .trail()
+            .iter()
+            .all(|literal| history.get_reason(literal).is_some());
     if rewind {
         formula.rewind_root_implications(history);
         formula.stats.preference_root_rebuilds += 1;

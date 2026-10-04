@@ -44,6 +44,7 @@ pub struct Formula {
     pub(crate) vsids: Vsids,
     self_subsuming: bool,
     pub(crate) ges_cursor: usize,
+    pub(crate) vivification_cursor: usize,
     pub(crate) ges_clause_budget: usize,
     pub(crate) ges_feedback_used: u64,
     pub(crate) ges_feedback_deleted_unused: u64,
@@ -115,6 +116,7 @@ impl Formula {
             vsids: Vsids::new(storage),
             self_subsuming: false,
             ges_cursor: 0,
+            vivification_cursor: 0,
             ges_clause_budget: 0,
             ges_feedback_used: 0,
             ges_feedback_deleted_unused: 0,
@@ -149,6 +151,7 @@ impl Formula {
             vsids: Vsids::new(max_index as usize + 1),
             self_subsuming: false,
             ges_cursor: 0,
+            vivification_cursor: 0,
             ges_clause_budget: 0,
             ges_feedback_used: 0,
             ges_feedback_deleted_unused: 0,
@@ -484,6 +487,16 @@ impl Formula {
                     let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
                     process::bva::process_in_phase(self, scope, logger, signal, phase)?;
                 }
+                Process::Vivification => {
+                    let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
+                    process::vivification::process(
+                        self,
+                        scope,
+                        logger,
+                        signal,
+                        history.as_deref_mut(),
+                    )?;
+                }
                 Process::BVE => {
                     let signal = signal.as_mut().map(|(py, steps)| (*py, &mut **steps));
                     process::bve::process(self, scope, logger, signal, history.as_deref_mut())?;
@@ -637,6 +650,12 @@ impl Formula {
             .chain(old_to_new.iter().take(self.ges_cursor))
             .find_map(|&index| index)
             .unwrap_or(0);
+        self.vivification_cursor = old_to_new
+            .iter()
+            .skip(self.vivification_cursor)
+            .chain(old_to_new.iter().take(self.vivification_cursor))
+            .find_map(|&index| index)
+            .unwrap_or(0);
         self.ges_trail_touched = self
             .ges_trail_touched
             .iter()
@@ -769,7 +788,7 @@ impl Formula {
 
     pub fn revert_decision(&mut self, level: usize, history: &mut History) {
         let removed_reasons = history.revert_decision_collect_reasons(level, &mut self.assignment);
-        for idx in removed_reasons {
+        for &idx in removed_reasons {
             if let Some(clause) = self.clauses.get_mut(idx) {
                 clause.decrement_lock_count();
             }
@@ -782,7 +801,7 @@ impl Formula {
 
     /// Rewind only the root trail; clause locks must follow the removed reasons.
     pub(crate) fn rewind_root_implications(&mut self, history: &mut History) {
-        for index in history.rewind_root_implications(&mut self.assignment) {
+        for &index in history.rewind_root_implications(&mut self.assignment) {
             self.clauses[index].decrement_lock_count();
         }
     }
@@ -943,7 +962,25 @@ impl Formula {
         history: &mut History,
         queue: &mut VecDeque<Literal>,
     ) -> Option<usize> {
+        self.propagate_twl_with_mode::<false>(history, queue, usize::MAX, &mut 0, u64::MAX)
+            .expect("search propagation has no work limit")
+    }
+
+    // The const mode eliminates probe bookkeeping from the search hot path.
+    // Probe limits are checked at watch-entry boundaries; one clause scan may
+    // overshoot, but every exit restores the complete unprocessed watch tail.
+    pub(crate) fn propagate_twl_with_mode<const PROBING: bool>(
+        &mut self,
+        history: &mut History,
+        queue: &mut VecDeque<Literal>,
+        ignored_clause: usize,
+        ticks: &mut u64,
+        limit: u64,
+    ) -> Result<Option<usize>, ()> {
         while let Some(lit) = queue.pop_front() {
+            if PROBING && *ticks >= limit {
+                return Err(());
+            }
             let false_lit = lit.negated();
 
             // Take ownership of this literal's watchlist. We reuse this same
@@ -958,8 +995,23 @@ impl Formula {
             let mut write_idx = 0;
 
             while read_idx < original_len {
+                if PROBING && *ticks >= limit {
+                    watching_clauses.copy_within(read_idx..original_len, write_idx);
+                    watching_clauses.truncate(write_idx + original_len - read_idx);
+                    self.watch.set(&false_lit, watching_clauses);
+                    return Err(());
+                }
                 let mut entry = watching_clauses[read_idx];
                 let clause_usize = entry.clause_idx;
+                if PROBING {
+                    *ticks += 1;
+                    if clause_usize == ignored_clause {
+                        watching_clauses[write_idx] = entry;
+                        write_idx += 1;
+                        read_idx += 1;
+                        continue;
+                    }
+                }
 
                 // take_live has removed garbage before this clause-body-free check.
                 // A former watch is still a valid blocker after literal swaps.
@@ -1007,7 +1059,7 @@ impl Formula {
                         };
 
                         let other_idx = 1 - false_idx;
-                        let other_lit = clause.get_literals()[other_idx].clone();
+                        let other_lit = clause.get_literals()[other_idx];
                         let other_value = other_lit.eval(&self.assignment);
                         entry.blocker = other_lit;
 
@@ -1026,6 +1078,9 @@ impl Formula {
                             let mut replacement = None;
 
                             for candidate_idx in 2..clause.len() {
+                                if PROBING {
+                                    *ticks += 1;
+                                }
                                 let candidate = &clause.get_literals()[candidate_idx];
 
                                 if candidate.eval(&self.assignment) != Some(false) {
@@ -1035,12 +1090,7 @@ impl Formula {
                             }
 
                             if let Some(replacement_idx) = replacement {
-                                /*
-                                 * Clone before modifying the clause because
-                                 * replace_watched_literal mutably borrows it.
-                                 */
-                                let replacement_lit =
-                                    clause.get_literals()[replacement_idx].clone();
+                                let replacement_lit = clause.get_literals()[replacement_idx];
 
                                 clause.replace_watched_literal(false_idx, replacement_idx);
 
@@ -1072,17 +1122,18 @@ impl Formula {
                                         );
 
                                         history.add_implication(&other_lit, Some(clause_usize));
-                                        self.extensions.bump_propagation_utility(&other_lit);
-
-                                        if self.ges_trail_tracking
-                                            && !self.ges_trail_seen[clause_usize]
-                                        {
-                                            self.ges_trail_seen[clause_usize] = true;
-                                            self.ges_trail_touched.push(clause_usize);
-                                            self.stats.ges_trail_unique_touches += 1;
+                                        if !PROBING {
+                                            self.extensions.bump_propagation_utility(&other_lit);
+                                            if self.ges_trail_tracking
+                                                && !self.ges_trail_seen[clause_usize]
+                                            {
+                                                self.ges_trail_seen[clause_usize] = true;
+                                                self.ges_trail_touched.push(clause_usize);
+                                                self.stats.ges_trail_unique_touches += 1;
+                                            }
+                                            self.stats.record_ges_reason_use(clause);
                                         }
                                         clause.increment_lock_count();
-                                        self.stats.record_ges_reason_use(clause);
                                         queue.push_back(other_lit);
                                     }
 
@@ -1125,7 +1176,7 @@ impl Formula {
 
                     self.watch.set(&false_lit, watching_clauses);
 
-                    return Some(clause_usize);
+                    return Ok(Some(clause_usize));
                 }
             }
 
@@ -1133,7 +1184,7 @@ impl Formula {
             self.watch.set(&false_lit, watching_clauses);
         }
 
-        None
+        Ok(None)
     }
 
     pub fn contains_empty_clause(&self, assignment: &Assignment) -> bool {
@@ -1352,10 +1403,7 @@ mod tests {
             None
         );
         assert_eq!(formula.assignment.get_value(3), Some(true));
-        assert_eq!(
-            history.decision_levels[2].get_reason(&Literal::new(3)),
-            Some(0)
-        );
+        assert_eq!(history.get_reason(&Literal::new(3)), Some(0));
         assert_eq!(formula.get_clause_at_idx(0).lock_count, 1);
         assert_eq!(
             formula.watch.get_watched(&Literal::new(1))[0].blocker,
@@ -1392,10 +1440,7 @@ mod tests {
             vec![None, Some(0)]
         );
         assert_watchlists_consistent(&formula);
-        assert_eq!(
-            history.decision_levels[2].get_reason(&Literal::new(3)),
-            Some(0)
-        );
+        assert_eq!(history.get_reason(&Literal::new(3)), Some(0));
         formula.revert_decision(1, &mut history);
         assert_eq!(formula.get_clause_at_idx(0).lock_count, 0);
     }
@@ -1426,6 +1471,52 @@ mod tests {
         assert_eq!(formula.assignment.get_value(4), Some(true));
         assert_eq!(formula.assignment.get_value(5), Some(true));
         assert_watchlists_consistent(&formula);
+    }
+
+    #[test]
+    fn probe_budget_preserves_watch_tail_after_movement() {
+        let mut formula = Formula::from_vec(vec![vec![-1, 2, 3], vec![-1, 4], vec![-1, 5]]);
+        let tail = formula.watch.get_watched(&Literal::new(-1))[1..].to_vec();
+        let mut history = History::new();
+        formula.add_decision(&Literal::new(1), &mut history);
+        let mut ticks = 0;
+        assert_eq!(
+            formula.propagate_twl_with_mode::<true>(
+                &mut history,
+                &mut VecDeque::from([Literal::new(1)]),
+                usize::MAX,
+                &mut ticks,
+                2,
+            ),
+            Err(())
+        );
+        assert_eq!(formula.watch.get_watched(&Literal::new(-1)), &tail);
+        assert_watchlists_consistent(&formula);
+        formula.revert_decision(1, &mut history);
+        formula.add_decision(&Literal::new(1), &mut history);
+        assert_eq!(
+            formula.propagate_twl(&mut history, &mut VecDeque::from([Literal::new(1)])),
+            None
+        );
+        assert_eq!(formula.assignment.get_value(4), Some(true));
+        assert_eq!(formula.assignment.get_value(5), Some(true));
+        assert_watchlists_consistent(&formula);
+    }
+
+    #[test]
+    fn compaction_remaps_vivification_cursor_to_next_survivor() {
+        let mut formula = Formula::from_vec(vec![vec![1, 2, 3], vec![2, 3, 4], vec![3, 4, 5]]);
+        formula.vivification_cursor = 1;
+        formula.delete_clause::<Empty>(1, &mut None);
+        formula.collect_garbage(None);
+        assert_eq!(formula.vivification_cursor, 1);
+        assert_eq!(
+            formula.get_clause_at_idx(1).get_literals(),
+            [Literal::new(3), Literal::new(4), Literal::new(5)]
+        );
+        formula.delete_clause::<Empty>(1, &mut None);
+        formula.collect_garbage(None);
+        assert_eq!(formula.vivification_cursor, 0);
     }
 
     #[test]
@@ -1666,10 +1757,7 @@ mod tests {
 
         assert_eq!(formula.assignment.get_value(2), None);
         assert_eq!(formula.assignment.get_value(3), Some(true));
-        assert_eq!(
-            history.decision_levels[1].get_reason(&Literal::new(3)),
-            Some(1)
-        );
+        assert_eq!(history.get_reason(&Literal::new(3)), Some(1));
     }
 
     #[test]

@@ -29,8 +29,8 @@ class Sat:
         self, 
         algorithm: Literal["dpll", "cdcl"], 
         implication_point: Literal["uip","dip"], 
-        preprocess: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","ges_utility","ges_compress","ges_trail","preference","subsumption"]],
-        inprocessing: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","ges_utility","ges_compress","ges_trail","preference","subsumption"]],
+        preprocess: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","ges_utility","ges_compress","ges_trail","preference","subsumption","vivification","vivify"]],
+        inprocessing: list[Literal["bva","bve","ges","ges_always","ges_lbd","ges_par","ges_random","ges_vsids","ges_utility","ges_compress","ges_trail","preference","subsumption","vivification","vivify"]],
         heuristics: Literal["vsids","random"], 
         drat_path: str|None = None,
         extension_guidance: dict[str, object]|None = None,
@@ -41,8 +41,8 @@ class Sat:
         Args:
             algorithm: The algorithm to use ("dpll" or "cdcl").
             implication_point: UIP/DIP mode for CDCL.
-            preprocess: Preprocessing techniques to apply. GES modifiers are "ges_compress" (substitution only) and "ges_trail" (trail-touched clauses, then cursor fallback).
-            inprocessing: Inprocessing techniques to apply. "preference" retires exact extensions unrolled more often than chosen by GES on the normal inprocessing schedule, immediately before BVA if enabled. GES modifiers are "ges_compress" (substitution only) and "ges_trail" (trail-touched clauses, then cursor fallback).
+            preprocess: Preprocessing techniques to apply. "vivification" (alias "vivify") enables clause vivification. GES modifiers are "ges_compress" (substitution only) and "ges_trail" (trail-touched clauses, then cursor fallback).
+            inprocessing: Inprocessing techniques to apply. "vivification" (alias "vivify") is opt-in on the normal inprocessing schedule, before BVA and its immediately preceding preference pass. "preference" retires exact extensions unrolled more often than chosen by GES on the normal inprocessing schedule, immediately before BVA if enabled. GES modifiers are "ges_compress" (substitution only) and "ges_trail" (trail-touched clauses, then cursor fallback).
             heuristics: Literal selection heuristic.
             drat_path: If given, write a DRAT proof to this path.
             extension_guidance: Optional compact guidance dictionary from Reduction.
@@ -90,6 +90,21 @@ class Stats:
     """
     The number of exact subset checks performed by lazy subsumption.
     """
+
+    @property
+    def vivification_passes(self)->int: ...
+    @property
+    def vivification_clauses_tried(self)->int: ...
+    @property
+    def vivification_clauses_strengthened(self)->int: ...
+    @property
+    def vivification_literals_removed(self)->int: ...
+    @property
+    def vivification_propagation_ticks(self)->int: ...
+    @property
+    def vivification_budget_exhaustions(self)->int: ...
+    @property
+    def vivification_units(self)->int: ...
 
     @property
     def minimized_literals(self)->int: ...

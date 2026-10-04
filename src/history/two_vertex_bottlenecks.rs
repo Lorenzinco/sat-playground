@@ -29,17 +29,24 @@ impl Default for VertexInfo {
 #[derive(Clone, Copy)]
 struct Pivot {
     vertex: u32,
+    path_position: u32,
     reach_other: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Candidate {
     vertex: u32,
+    path_position: u32,
     min_pair: u32,
     max_pair: u32,
 }
 
-struct CompressedCandidates {
+#[derive(Default)]
+pub(super) struct BottleneckScratch {
+    vertices: Vec<VertexInfo>,
+    stack: Vec<u32>,
+    direct: Vec<[u32; 2]>,
+    pivots: [Vec<Pivot>; 2],
     // Both paths run from the source to the sink. Candidate lists run in the
     // opposite order and hold inclusive index ranges into the other list.
     paths: [Vec<u32>; 2],
@@ -64,8 +71,24 @@ struct CompressedCandidates {
 /// max-flow network is constructed.
 pub fn find_middle_pair(predecessors: &[u32], pred_index: &[u32]) -> Option<(u32, u32)> {
     let n = validate_csr(predecessors, pred_index)?;
-    let compressed = calculate_candidates(predecessors, pred_index, n)?;
-    compressed.middle_pair()
+    let mut scratch = BottleneckScratch::default();
+    calculate_candidates(predecessors, pred_index, n, &mut scratch)?;
+    scratch.middle_pair()
+}
+
+/// Internal fast path: callers must supply construction-validated, topologically
+/// ordered CSR with the source at the final vertex (no trailing CSR offset).
+pub(super) fn find_middle_pair_with_scratch(
+    predecessors: &[u32],
+    pred_index: &[u32],
+    scratch: &mut BottleneckScratch,
+) -> Option<(u32, u32)> {
+    let n = pred_index.len();
+    if n < 2 {
+        return None;
+    }
+    calculate_candidates(predecessors, pred_index, n, scratch)?;
+    scratch.middle_pair()
 }
 
 fn validate_csr(predecessors: &[u32], pred_index: &[u32]) -> Option<usize> {
@@ -97,11 +120,31 @@ fn calculate_candidates(
     predecessors: &[u32],
     pred_index: &[u32],
     n: usize,
-) -> Option<CompressedCandidates> {
+    scratch: &mut BottleneckScratch,
+) -> Option<()> {
+    let BottleneckScratch {
+        vertices,
+        stack,
+        direct,
+        pivots,
+        paths,
+        lists,
+    } = scratch;
     let source = (n - 1) as u32;
-    let mut vertices = vec![VertexInfo::default(); n];
+    vertices.resize(n, VertexInfo::default());
+    vertices.fill(VertexInfo::default());
+    stack.clear();
+    for path in paths.iter_mut() {
+        path.clear();
+    }
+    for pivot in pivots.iter_mut() {
+        pivot.clear();
+    }
+    for list in lists.iter_mut() {
+        list.clear();
+    }
 
-    // Phase A: choose an arbitrary initial sink-to-source path.
+    // Phase A: choose the same initial sink-to-source path as xMaple.
     let mut current = 0u32;
     vertices[0].status |= ON_FIRST;
     while current != source {
@@ -111,40 +154,32 @@ fn calculate_candidates(
         current = next;
     }
 
-    // Phase B: augment the initial path without building a flow network.
-    let second_path_top = find_two_disjoint_paths(predecessors, pred_index, &mut vertices, source)?;
+    // Phase B: augment without constructing a flow network.
+    let second_path_top =
+        find_two_disjoint_paths(predecessors, pred_index, vertices, source, stack)?;
+    label_and_collect_paths(vertices, second_path_top, source, paths)?;
 
-    let paths = label_and_collect_paths(&mut vertices, second_path_top, source)?;
-
-    // Phase C: direct reachability through vertices outside the two paths.
-    let direct = direct_path_reach(predecessors, pred_index, &vertices, source);
+    // Phase C: reachability outside the two paths.
+    direct_path_reach(predecessors, pred_index, vertices, source, direct);
     if direct[0][0] == source || direct[0][1] == source {
         return None;
     }
 
-    // Phases D/E: remove bypassed vertices and encode all valid pairs as
-    // inclusive ranges into the opposite candidate list.
-    let pivots = [
-        non_bypassed_pivots(&paths[0], 1, &direct, source),
-        non_bypassed_pivots(&paths[1], 0, &direct, source),
-    ];
+    // Phases D/E: retain candidates and encode compatible ranges.
+    non_bypassed_pivots(&paths[0], 1, direct, source, &mut pivots[0]);
+    non_bypassed_pivots(&paths[1], 0, direct, source, &mut pivots[1]);
     if pivots[0].len() <= 1 || pivots[1].len() <= 1 {
         return None;
     }
-
-    let mut lists = [
-        candidate_bounds(&pivots[0], &pivots[1], source),
-        candidate_bounds(&pivots[1], &pivots[0], source),
-    ];
+    candidate_bounds(&pivots[0], &pivots[1], source, &mut lists[0]);
+    candidate_bounds(&pivots[1], &pivots[0], source, &mut lists[1]);
     if lists[0].is_empty() || lists[1].is_empty() {
         return None;
     }
-
     let (left, right) = lists.split_at_mut(1);
     bounds_to_indices(&mut left[0], &right[0])?;
     bounds_to_indices(&mut right[0], &left[0])?;
-
-    Some(CompressedCandidates { paths, lists })
+    Some(())
 }
 
 fn find_two_disjoint_paths(
@@ -152,11 +187,11 @@ fn find_two_disjoint_paths(
     pred_index: &[u32],
     vertices: &mut [VertexInfo],
     source: u32,
+    stack: &mut Vec<u32>,
 ) -> Option<u32> {
     let mut dfs_start = 0u32;
     let mut furthest_on_first = 0u32;
     let mut furthest_from = NONE;
-    let mut stack = Vec::new();
 
     loop {
         stack.push(dfs_start);
@@ -225,8 +260,9 @@ fn label_and_collect_paths(
     vertices: &mut [VertexInfo],
     second_path_top: u32,
     source: u32,
-) -> Option<[Vec<u32>; 2]> {
-    let mut second = Vec::new();
+    paths: &mut [Vec<u32>; 2],
+) -> Option<()> {
+    let [second, first] = paths;
     second.push(source);
     vertices[source as usize].status |= ON_SECOND;
 
@@ -243,7 +279,6 @@ fn label_and_collect_paths(
     vertices[0].status |= ON_SECOND;
     second.push(0);
 
-    let mut first = Vec::new();
     current = source;
     loop {
         if vertices[current as usize].status & ON_FIRST == 0 {
@@ -261,7 +296,7 @@ fn label_and_collect_paths(
 
     // Match xMaple's list/path association: list A uses the augmented second
     // path, list B the remaining first path.
-    Some([second, first])
+    Some(())
 }
 
 fn direct_path_reach(
@@ -269,8 +304,9 @@ fn direct_path_reach(
     pred_index: &[u32],
     vertices: &[VertexInfo],
     source: u32,
-) -> Vec<[u32; 2]> {
-    let mut direct = vec![[0u32; 2]; vertices.len()];
+    direct: &mut Vec<[u32; 2]>,
+) {
+    direct.resize(vertices.len(), [0; 2]);
     direct[source as usize] = [source, source];
 
     for vertex in (0..source as usize).rev() {
@@ -294,8 +330,6 @@ fn direct_path_reach(
         }
         direct[vertex] = reach;
     }
-
-    direct
 }
 
 fn non_bypassed_pivots(
@@ -303,17 +337,18 @@ fn non_bypassed_pivots(
     path_bit: usize,
     direct: &[[u32; 2]],
     source: u32,
-) -> Vec<Pivot> {
+    result: &mut Vec<Pivot>,
+) {
     let other_bit = 1 - path_bit;
-    let mut result = Vec::with_capacity(path.len());
     let mut reach_same = direct[0][path_bit];
     let mut reach_other = direct[0][other_bit];
 
     // Paths are source-to-sink, while pivots and candidates are sink-to-source.
-    for &vertex in path[1..path.len() - 1].iter().rev() {
+    for (position, &vertex) in path.iter().enumerate().take(path.len() - 1).skip(1).rev() {
         if vertex >= reach_same {
             result.push(Pivot {
                 vertex,
+                path_position: position as u32,
                 reach_other,
             });
         }
@@ -323,13 +358,12 @@ fn non_bypassed_pivots(
 
     result.push(Pivot {
         vertex: source,
+        path_position: 0,
         reach_other: source,
     });
-    result
 }
 
-fn candidate_bounds(this: &[Pivot], other: &[Pivot], source: u32) -> Vec<Candidate> {
-    let mut result = Vec::with_capacity(this.len().saturating_sub(1));
+fn candidate_bounds(this: &[Pivot], other: &[Pivot], source: u32, result: &mut Vec<Candidate>) {
     let last_internal_other = other[other.len() - 2].vertex;
     let mut other_idx = 0usize;
 
@@ -346,13 +380,12 @@ fn candidate_bounds(this: &[Pivot], other: &[Pivot], source: u32) -> Vec<Candida
         if lower <= upper && (upper < source || lower <= last_internal_other) {
             result.push(Candidate {
                 vertex: pivot.vertex,
+                path_position: pivot.path_position,
                 min_pair: lower,
                 max_pair: upper,
             });
         }
     }
-
-    result
 }
 
 fn bounds_to_indices(this: &mut [Candidate], other: &[Candidate]) -> Option<()> {
@@ -375,7 +408,7 @@ fn bounds_to_indices(this: &mut [Candidate], other: &[Candidate]) -> Option<()> 
     Some(())
 }
 
-impl CompressedCandidates {
+impl BottleneckScratch {
     fn middle_pair(&self) -> Option<(u32, u32)> {
         // xMaple first chooses the candidate nearest the midpoint of the
         // longer complete path, then the compatible candidate nearest the
@@ -383,23 +416,23 @@ impl CompressedCandidates {
         let longest = usize::from(self.paths[0].len() <= self.paths[1].len());
         let shortest = 1 - longest;
 
-        let longest_positions = candidate_positions(&self.paths[longest], &self.lists[longest])?;
-        let shortest_positions = candidate_positions(&self.paths[shortest], &self.lists[shortest])?;
+        let longest_candidates = &self.lists[longest];
+        let shortest_candidates = &self.lists[shortest];
         let longest_idx = closest_to_middle(
-            &longest_positions,
+            longest_candidates,
             self.paths[longest].len(),
             0,
-            longest_positions.len() - 1,
+            longest_candidates.len() - 1,
         );
 
         let chosen = self.lists[longest][longest_idx];
         let min_short = chosen.min_pair as usize;
         let max_short = chosen.max_pair as usize;
-        if min_short > max_short || max_short >= shortest_positions.len() {
+        if min_short > max_short || max_short >= shortest_candidates.len() {
             return None;
         }
         let shortest_idx = closest_to_middle(
-            &shortest_positions,
+            shortest_candidates,
             self.paths[shortest].len(),
             min_short,
             max_short,
@@ -413,26 +446,13 @@ impl CompressedCandidates {
     }
 }
 
-fn candidate_positions(path: &[u32], candidates: &[Candidate]) -> Option<Vec<u32>> {
-    let mut positions = Vec::with_capacity(candidates.len());
-    let mut path_idx = path.len().checked_sub(1)?;
-
-    for candidate in candidates {
-        while path.get(path_idx).copied()? != candidate.vertex {
-            path_idx = path_idx.checked_sub(1)?;
-        }
-        positions.push(u32::try_from(path_idx).ok()?);
-    }
-    Some(positions)
-}
-
-fn closest_to_middle(positions: &[u32], path_len: usize, start: usize, end: usize) -> usize {
+fn closest_to_middle(candidates: &[Candidate], path_len: usize, start: usize, end: usize) -> usize {
     let middle = path_len / 2;
     let mut best = start;
-    let mut best_distance = middle.abs_diff(positions[start] as usize);
+    let mut best_distance = middle.abs_diff(candidates[start].path_position as usize);
 
     for idx in start + 1..=end {
-        let distance = middle.abs_diff(positions[idx] as usize);
+        let distance = middle.abs_diff(candidates[idx].path_position as usize);
         if distance < best_distance {
             best = idx;
             best_distance = distance;
@@ -479,6 +499,52 @@ mod tests {
             }
         }
         reachable[0]
+    }
+
+    #[test]
+    fn public_entry_point_rejects_malformed_csr() {
+        for (predecessors, index) in [
+            (vec![], vec![]),
+            (vec![1], vec![1, 1]),
+            (vec![1], vec![0, 0]),
+            (vec![0], vec![0, 1]),
+            (vec![2], vec![0, 1]),
+            (vec![], vec![0, 0]),
+            (vec![2, 2], vec![0, 3, 2]),
+        ] {
+            assert_eq!(find_middle_pair(&predecessors, &index), None);
+        }
+    }
+
+    #[test]
+    fn reused_scratch_preserves_middle_pair_and_resets_after_rejection() {
+        let mut scratch = super::BottleneckScratch::default();
+        let graphs = [
+            (4, vec![(3, 1), (1, 0), (3, 2), (2, 0)]),
+            (5, vec![(4, 1), (1, 0), (4, 2), (2, 0), (4, 3), (3, 0)]),
+            (
+                8,
+                vec![
+                    (7, 5),
+                    (5, 3),
+                    (3, 1),
+                    (1, 0),
+                    (7, 6),
+                    (6, 4),
+                    (4, 2),
+                    (2, 0),
+                ],
+            ),
+        ];
+        for _ in 0..2 {
+            for (n, edges) in &graphs {
+                let (predecessors, pred_index) = csr(*n, edges);
+                assert_eq!(
+                    super::find_middle_pair_with_scratch(&predecessors, &pred_index, &mut scratch),
+                    find_middle_pair(&predecessors, &pred_index),
+                );
+            }
+        }
     }
 
     #[test]

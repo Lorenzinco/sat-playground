@@ -6,6 +6,7 @@ pub mod ges_par;
 
 pub mod preference;
 pub mod subsumption;
+pub mod vivification;
 
 use crate::formula::clause::Clause;
 use pyo3::prelude::*;
@@ -27,6 +28,7 @@ pub enum Process {
     GESTrail,
     Preference,
     Subsumption,
+    Vivification,
     Others,
 }
 
@@ -109,8 +111,9 @@ impl FromPyObject<'_, '_> for Process {
             "ges_trail" => Ok(Process::GESTrail),
             "preference" => Ok(Process::Preference),
             "subsumption" => Ok(Process::Subsumption),
+            "vivification" | "vivify" => Ok(Process::Vivification),
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption",
+                "Unknown process technique for cdcl solver {}, allowed values are: bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption, vivification, vivify",
                 preprocess
             ))),
         }

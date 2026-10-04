@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(state(&parallel), state(&sequential));
         assert_eq!(actual, expected);
         assert_eq!(report(&parallel), report(&sequential));
-        assert_eq!(ph.decision_levels[0].get_reason(&Literal::new(3)), Some(4));
+        assert_eq!(ph.get_reason(&Literal::new(3)), Some(4));
         assert_eq!(parallel.get_clause_at_idx(4).lock_count, 1);
         assert!(parallel.is_clause_garbage(0));
     }

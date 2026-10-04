@@ -38,6 +38,48 @@ class SolverApiTests(unittest.TestCase):
                                 for clause in clauses
                             ))
 
+    def test_vivification_names_and_solve_modes_are_accepted(self):
+        for process in ("vivification", "vivify"):
+            for phase in ("preprocess", "inprocessing"):
+                for mode in ("uip", "dip"):
+                    for clauses, satisfiable in (
+                        ([[1, 2], [-1, 2]], True),
+                        ([[1, 2], [-1, 2], [1, -2], [-1, -2]], False),
+                    ):
+                        with self.subTest(process=process, phase=phase, mode=mode,
+                                          satisfiable=satisfiable):
+                            options = {"preprocess": [], "inprocessing": []}
+                            options[phase] = [process]
+                            solver = clsat.Sat(clauses)
+                            solver.solve(algorithm="cdcl", implication_point=mode,
+                                         heuristics="vsids", **options)
+                            self.assertEqual(solver.model is not None, satisfiable)
+                            if satisfiable:
+                                self.assertTrue(all(
+                                    any(solver.model[abs(lit)] == (lit > 0)
+                                        for lit in clause)
+                                    for clause in clauses
+                                ))
+
+    def test_vivification_counters_are_zero_readonly_and_displayed_by_default(self):
+        solver = clsat.Sat([[1]])
+        solver.solve(algorithm="cdcl", implication_point="uip", heuristics="vsids",
+                     preprocess=[], inprocessing=[])
+        for field, label in (
+            ("vivification_passes", "Vivification passes"),
+            ("vivification_clauses_tried", "Vivification clauses tried"),
+            ("vivification_clauses_strengthened", "Vivification strengthened"),
+            ("vivification_literals_removed", "Vivification lits removed"),
+            ("vivification_propagation_ticks", "Vivification prop ticks"),
+            ("vivification_budget_exhaustions", "Vivification budget exhaust"),
+            ("vivification_units", "Vivification units"),
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(getattr(solver.stats, field), 0)
+                self.assertIn(label, str(solver.stats))
+                with self.assertRaises(AttributeError):
+                    setattr(solver.stats, field, 1)
+
     def test_vsids_improvement_counter_is_zero_readonly_and_displayed(self):
         solver = clsat.Sat([[1]])
         solver.solve(
@@ -111,4 +153,4 @@ class SolverApiTests(unittest.TestCase):
                         heuristics="vsids", **options,
                     )
                 self.assertIn("unknown_process", str(error.exception))
-                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption", str(error.exception))
+                self.assertIn("bva, bve, ges, ges_always, ges_lbd, ges_par, ges_random, ges_vsids, ges_utility, ges_compress, ges_trail, preference, subsumption, vivification, vivify", str(error.exception))

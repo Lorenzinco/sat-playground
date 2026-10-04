@@ -22,6 +22,20 @@ pub struct Stats {
     #[pyo3(get)]
     pub subsumption_checks: u64,
     #[pyo3(get)]
+    pub vivification_passes: u64,
+    #[pyo3(get)]
+    pub vivification_clauses_tried: u64,
+    #[pyo3(get)]
+    pub vivification_clauses_strengthened: u64,
+    #[pyo3(get)]
+    pub vivification_literals_removed: u64,
+    #[pyo3(get)]
+    pub vivification_propagation_ticks: u64,
+    #[pyo3(get)]
+    pub vivification_budget_exhaustions: u64,
+    #[pyo3(get)]
+    pub vivification_units: u64,
+    #[pyo3(get)]
     pub minimized_literals: u64,
     #[pyo3(get)]
     pub clauses_kept: u64,
@@ -213,6 +227,13 @@ impl Stats {
             clauses_deleted: 0,
             clauses_subsumed: 0,
             subsumption_checks: 0,
+            vivification_passes: 0,
+            vivification_clauses_tried: 0,
+            vivification_clauses_strengthened: 0,
+            vivification_literals_removed: 0,
+            vivification_propagation_ticks: 0,
+            vivification_budget_exhaustions: 0,
+            vivification_units: 0,
             minimized_literals: 0,
             clauses_kept: 0,
             literals_learnt: 0,
@@ -604,6 +625,33 @@ impl Stats {
         .into_iter()
         .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
         .collect::<String>();
+        let vivification_rows = [
+            ("Vivification passes", self.vivification_passes),
+            (
+                "Vivification clauses tried",
+                self.vivification_clauses_tried,
+            ),
+            (
+                "Vivification strengthened",
+                self.vivification_clauses_strengthened,
+            ),
+            (
+                "Vivification lits removed",
+                self.vivification_literals_removed,
+            ),
+            (
+                "Vivification prop ticks",
+                self.vivification_propagation_ticks,
+            ),
+            (
+                "Vivification budget exhaust",
+                self.vivification_budget_exhaustions,
+            ),
+            ("Vivification units", self.vivification_units),
+        ]
+        .into_iter()
+        .map(|(label, value)| format!("c | {label:<27} | {value:>40} |\n"))
+        .collect::<String>();
         let bva_lits_s = format!("{:>40}", self.bva_literals);
         let bva_rows = [
             ("BVA candidates attempted", self.bva_candidates_attempted),
@@ -805,6 +853,7 @@ impl Stats {
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\
                  {dip_rows}\
+                 {vivification_rows}\
                  {bva_rows}\
                  c | {:<27} | {} |\n\
                  c | {:<27} | {} |\n\

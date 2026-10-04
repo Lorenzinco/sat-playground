@@ -3293,10 +3293,7 @@ mod tests {
             &[Literal::new(3), extension.negated()]
         );
         assert_eq!(formula.get_clause_at_idx(4).lock_count, 1);
-        assert_eq!(
-            history.decision_levels[0].get_reason(&Literal::new(3)),
-            Some(4)
-        );
+        assert_eq!(history.get_reason(&Literal::new(3)), Some(4));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::formula::Formula;
 use crate::formula::clause::Clause;
 use crate::formula::clause::CreationType;
-use crate::history::conflict_analysis::{ConflictAnalysis, analyze_conflict_graph};
+use crate::history::conflict_analysis::{ConflictAnalysis, analyze_uip};
 use crate::history::{ConflictLearnResult, History};
 
 pub fn find_1uip(
@@ -11,7 +11,7 @@ pub fn find_1uip(
     formula: &Formula,
     conflict_clause_index: usize,
 ) -> ConflictLearnResult {
-    let Some(analysis) = analyze_conflict_graph(history, formula, conflict_clause_index) else {
+    let Some(analysis) = analyze_uip(history, formula, conflict_clause_index) else {
         return empty_result();
     };
 

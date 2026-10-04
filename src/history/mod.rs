@@ -1,10 +1,10 @@
 pub mod clause_minimization;
 pub mod conflict_analysis;
 pub mod conflict_graph;
-pub mod decision_level;
+
 pub mod dip;
 mod dip_clause;
-pub mod implication_level;
+
 mod lbd;
 pub mod two_vertex_bottlenecks;
 pub mod uip;
@@ -15,8 +15,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::history::conflict_analysis::analyze_conflict;
-use crate::history::decision_level::DecisionLevel;
-use crate::history::implication_level::ImplicationLevels;
 
 use crate::formula::Formula;
 use crate::formula::assignment::Assignment;
@@ -60,52 +58,93 @@ impl FromPyObject<'_, '_> for ImplicationPoint {
 }
 
 pub struct History {
-    pub decision_levels: Vec<DecisionLevel>,
-    pub implication_levels_indexes: implication_level::ImplicationLevels,
+    trail: Vec<Literal>,
+    // Start of each nonroot level; root has no decision or limit entry.
+    limits: Vec<usize>,
+    reasons: Vec<Option<usize>>,
+    levels: Vec<Option<usize>>,
+    removed_reasons: Vec<usize>,
     // Each LBD operation borrows only this scratch, leaving level lookups shared.
     lbd_scratch: RefCell<lbd::LevelCounter>,
+    analysis_scratch: RefCell<conflict_analysis::AnalysisScratch>,
+    dip_scratch: RefCell<dip::DipScratch>,
+    minimization_scratch: RefCell<clause_minimization::MinimizationScratch>,
 }
 
 impl History {
-    /// History contains the pile of decisions made, as well as a hashmap that goes from literal to eventually which level it was implied.
     pub fn new() -> Self {
-        let mut decision_levels: Vec<DecisionLevel> = Vec::new();
-        decision_levels.push(DecisionLevel::empty());
         Self {
-            decision_levels: decision_levels,
-            implication_levels_indexes: ImplicationLevels::new(),
-            lbd_scratch: RefCell::new(lbd::LevelCounter::default()),
+            trail: Vec::new(),
+            limits: Vec::new(),
+            reasons: Vec::new(),
+            levels: Vec::new(),
+            removed_reasons: Vec::new(),
+            lbd_scratch: RefCell::default(),
+            analysis_scratch: RefCell::default(),
+            dip_scratch: RefCell::default(),
+            minimization_scratch: RefCell::default(),
         }
+    }
+
+    pub fn trail(&self) -> &[Literal] {
+        &self.trail
+    }
+
+    /// Includes the decision at nonroot levels and all root implications at zero.
+    /// Panics if `level` is beyond the current decision level.
+    pub fn level_trail(&self, level: usize) -> &[Literal] {
+        assert!(level <= self.get_decision_level(), "invalid decision level");
+        let start = if level == 0 {
+            0
+        } else {
+            self.limits[level - 1]
+        };
+        let end = self.limits.get(level).copied().unwrap_or(self.trail.len());
+        &self.trail[start..end]
+    }
+
+    pub fn get_reason(&self, literal: &Literal) -> Option<usize> {
+        self.reasons
+            .get(literal.get_index().unsigned_abs() as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn append_literal(&mut self, literal: &Literal, reason: Option<usize>) {
+        let variable = literal.get_index().unsigned_abs() as usize;
+        if variable >= self.levels.len() {
+            let len = variable + 1;
+            self.levels.resize(len, None);
+            self.reasons.resize(len, None);
+        }
+        self.levels[variable] = Some(self.get_decision_level());
+        self.reasons[variable] = reason;
+
+        self.trail.push(*literal);
     }
 
     /// Adds a decision and a new decision level, a decision is an arbitrary value choice for a variable.
     pub fn add_decision(&mut self, literal: &Literal) {
-        self.decision_levels.push(DecisionLevel::new(literal));
-        self.implication_levels_indexes
-            .set_level(literal, self.get_decision_level());
+        assert!(
+            self.get_literal_level(literal).is_none(),
+            "decision variable already on trail"
+        );
+        self.limits.push(self.trail.len());
+        self.append_literal(literal, None);
     }
 
-    /// Adds an implication inside the last level of decision, also keeps track of which clause this implication appears in
-    /// Returns a literal if this decision created a conflict with that literal
+    /// Append at the current level. A missing reason supports root facts and
+    /// multiple vivification assumptions sharing one level.
+    /// Returns the negation if the variable is already recorded (either polarity).
     pub fn add_implication(
         &mut self,
         literal: &Literal,
         clause_index: Option<usize>,
     ) -> Option<Literal> {
-        if self.implication_levels_indexes.get_level(literal).is_some() {
+        if self.get_literal_level(literal).is_some() {
             return Some(literal.negated());
         }
-
-        let level = self.decision_levels.last_mut().expect("No decisions yet!");
-
-        level.add_implied_literal(literal, clause_index);
-        self.implication_levels_indexes.set_level(
-            literal,
-            self.decision_levels
-                .len()
-                .checked_sub(1)
-                .expect("No decisions yet!"),
-        );
+        self.append_literal(literal, clause_index);
 
         None
     }
@@ -129,58 +168,58 @@ impl History {
         }
     }
 
-    /// Unsets inside the assignments all of the implications starting from level <level> onwards, also modifies the decision levels and implication levels undoing what's beyond <level>.
+    /// Remove level `level` and higher, retaining root. Zero is a no-op.
+    /// Formula callers must use the reason-collecting variant to release locks.
     pub fn revert_decision(&mut self, level: usize, assignment: &mut Assignment) {
-        // Does the same thing but also pushes reasons vars inside a vec, little to no overhead
         self.revert_decision_collect_reasons(level, assignment);
     }
 
     /// Clear root implications so inprocessing can retire their reason clauses.
     /// The caller must replay unit propagation before search resumes.
-    pub(crate) fn rewind_root_implications(&mut self, assignment: &mut Assignment) -> Vec<usize> {
+    pub(crate) fn rewind_root_implications(&mut self, assignment: &mut Assignment) -> &[usize] {
         assert_eq!(
-            self.decision_levels.len(),
-            1,
+            self.get_decision_level(),
+            0,
             "backtrack before rewinding root implications"
         );
-        let root = std::mem::replace(&mut self.decision_levels[0], DecisionLevel::empty());
-        let removed_reasons = root.reason_indices().collect();
-        for literal in root.implied_literals_iter() {
-            assignment.unset(literal.get_index().unsigned_abs() as usize);
-            self.implication_levels_indexes.unset_level(literal);
-        }
-        removed_reasons
+        self.truncate_trail(0, assignment)
     }
 
+    /// Returned indices preserve lock multiplicity and borrow a reusable buffer.
+    /// Consume them before the next mutation of History.
     pub fn revert_decision_collect_reasons(
         &mut self,
         level: usize,
         assignment: &mut Assignment,
-    ) -> Vec<usize> {
+    ) -> &[usize] {
         if level == 0 {
-            return Vec::new();
+            self.removed_reasons.clear();
+            return &self.removed_reasons;
         }
 
-        let to_revert = self.decision_levels.split_off(level);
-        let mut removed_reasons = Vec::new();
+        assert!(level - 1 <= self.limits.len(), "invalid rollback level");
+        let start = self
+            .limits
+            .get(level - 1)
+            .copied()
+            .unwrap_or(self.trail.len());
+        self.limits.truncate(level - 1);
+        self.truncate_trail(start, assignment)
+    }
 
-        for decision in to_revert {
-            if let Some(lit) = decision.get_decision_literal() {
-                assignment.unset(lit.get_index().abs() as usize);
-                self.implication_levels_indexes.unset_level(lit);
+    fn truncate_trail(&mut self, start: usize, assignment: &mut Assignment) -> &[usize] {
+        self.removed_reasons.clear();
+        for literal in &self.trail[start..] {
+            let variable = literal.get_index().unsigned_abs() as usize;
+            assignment.unset(variable);
+            if let Some(reason) = self.reasons[variable].take() {
+                // Locks count assignments, so repeated clause indices must survive.
+                self.removed_reasons.push(reason);
             }
-
-            for reason_idx in decision.reason_indices() {
-                removed_reasons.push(reason_idx);
-            }
-
-            for implication in decision.implied_literals_iter() {
-                assignment.unset(implication.get_index().abs() as usize);
-                self.implication_levels_indexes.unset_level(implication);
-            }
+            self.levels[variable] = None;
         }
-
-        removed_reasons
+        self.trail.truncate(start);
+        &self.removed_reasons
     }
 
     pub fn revert_last_decision(&mut self, assignment: &mut Assignment) {
@@ -188,46 +227,53 @@ impl History {
     }
 
     pub fn get_decision_level(&self) -> usize {
-        self.decision_levels.len() - 1
+        self.limits.len()
     }
 
     pub fn get_literal_level(&self, lit: &Literal) -> Option<usize> {
-        self.implication_levels_indexes.get_level(lit)
+        self.levels
+            .get(lit.get_index().unsigned_abs() as usize)
+            .copied()
+            .flatten()
     }
 
     pub(crate) fn snapshot_literal_levels(&self, variable_count: usize) -> Vec<Option<usize>> {
-        (0..variable_count)
-            .map(|variable| {
-                (variable != 0)
-                    .then(|| Literal::new(variable as i32))
-                    .and_then(|literal| self.get_literal_level(&literal))
-            })
-            .collect()
+        let mut levels = self.levels[..variable_count.min(self.levels.len())].to_vec();
+        levels.resize(variable_count, None);
+        if let Some(zero) = levels.first_mut() {
+            *zero = None;
+        }
+        levels
     }
 
     pub fn last_decision_literal(&self) -> Option<&Literal> {
-        self.decision_levels
+        self.limits
             .last()
-            .expect("at least one")
-            .get_decision_literal()
+            .and_then(|&position| self.trail.get(position))
     }
 
     pub fn active_reason_indices(&self) -> HashSet<usize> {
-        self.decision_levels
+        self.trail
             .iter()
-            .flat_map(|level| level.reason_indices())
+            .filter_map(|literal| self.get_reason(literal))
             .collect()
     }
 
     pub fn replace_reason_clause(&mut self, old_index: usize, new_index: usize) {
-        for level in &mut self.decision_levels {
-            level.replace_reason_clause(old_index, new_index);
+        for literal in &self.trail {
+            let reason = &mut self.reasons[literal.get_index().unsigned_abs() as usize];
+            if *reason == Some(old_index) {
+                *reason = Some(new_index);
+            }
         }
     }
 
     pub fn remap_clause_indices(&mut self, old_to_new: &[Option<usize>]) {
-        for level in &mut self.decision_levels {
-            level.remap_clause_indices(old_to_new);
+        for literal in &self.trail {
+            let reason = &mut self.reasons[literal.get_index().unsigned_abs() as usize];
+            if let Some(index) = *reason {
+                *reason = old_to_new.get(index).copied().flatten();
+            }
         }
     }
 
@@ -246,6 +292,202 @@ impl History {
 mod history {
     use super::*;
     use crate::formula::Formula;
+
+    #[test]
+    fn flat_lifecycle_preserves_root_and_collects_repeated_locks() {
+        let mut history = History::new();
+        let mut assignment = Assignment::new(8);
+        let literals = [1, -2, 3, -4, 5, -6].map(Literal::new);
+        for literal in &literals {
+            assignment.assign_literal(*literal);
+        }
+        history.add_implication(&literals[0], Some(7));
+        history.add_implication(&literals[1], Some(7));
+        history.add_decision(&literals[2]);
+        history.add_implication(&literals[3], None);
+        history.add_implication(&literals[4], Some(8));
+        history.add_decision(&literals[5]);
+        assert_eq!(history.level_trail(0), &literals[..2]);
+        assert_eq!(history.level_trail(1), &literals[2..5]);
+        assert_eq!(history.level_trail(2), &literals[5..]);
+        assert_eq!(history.last_decision_literal(), Some(&literals[5]));
+        assert!(
+            history
+                .revert_decision_collect_reasons(0, &mut assignment)
+                .is_empty()
+        );
+        assert!(
+            history
+                .revert_decision_collect_reasons(3, &mut assignment)
+                .is_empty()
+        );
+        assert_eq!(
+            history.revert_decision_collect_reasons(1, &mut assignment),
+            vec![8]
+        );
+        assert_eq!(history.trail(), &literals[..2]);
+        assert_eq!(history.get_decision_level(), 0);
+        assert_eq!(history.last_decision_literal(), None);
+        for literal in &literals[2..] {
+            assert_eq!(history.get_literal_level(literal), None);
+            assert_eq!(history.get_reason(literal), None);
+
+            assert_eq!(
+                assignment.get_value(literal.get_index().unsigned_abs() as usize),
+                None
+            );
+        }
+        assert_eq!(
+            history.rewind_root_implications(&mut assignment),
+            vec![7, 7]
+        );
+        assert!(history.trail().is_empty());
+        assert!(history.active_reason_indices().is_empty());
+        assert_eq!(assignment.get_value(1), None);
+        assert_eq!(assignment.get_value(2), None);
+    }
+
+    #[test]
+    fn formula_rollback_releases_each_reason_lock() {
+        let mut formula = Formula::from_vec(vec![vec![1, 2, 3]]);
+        let mut history = History::new();
+        formula.assign_implication(Literal::new(1), &mut history, Some(0));
+        formula.add_decision(&Literal::new(-2), &mut history);
+        formula.assign_implication(Literal::new(3), &mut history, Some(0));
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 2);
+        formula.revert_decision(1, &mut history);
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 1);
+        assert_eq!(history.get_reason(&Literal::new(-1)), Some(0));
+        assert_eq!(history.get_reason(&Literal::new(-3)), None);
+        formula.rewind_root_implications(&mut history);
+        assert_eq!(formula.get_clause_at_idx(0).lock_count, 0);
+        assert!(history.trail().is_empty());
+    }
+
+    #[test]
+    fn flat_metadata_growth_polarity_replacement_and_remapping() {
+        let mut history = History::new();
+        let root = Literal::new(-1);
+        let extension = Literal::new(-100_000);
+        history.add_implication(&root, Some(2));
+        history.add_decision(&Literal::new(2));
+        history.add_implication(&extension, Some(2));
+        assert_eq!(history.levels.len(), 100_001);
+        assert_eq!(history.get_literal_level(&extension.negated()), Some(1));
+        assert_eq!(history.get_reason(&extension.negated()), Some(2));
+
+        assert_eq!(history.get_reason(&Literal::new(3)), None);
+
+        assert_eq!(
+            history.add_implication(&extension, None),
+            Some(extension.negated())
+        );
+        assert_eq!(history.trail().len(), 3);
+        history.replace_reason_clause(2, 4);
+        assert_eq!(history.active_reason_indices(), HashSet::from([4]));
+        history.remap_clause_indices(&[None, None, None, None, Some(1)]);
+        assert_eq!(history.get_reason(&root), Some(1));
+        assert_eq!(history.get_reason(&extension), Some(1));
+        assert_eq!(
+            history.snapshot_literal_levels(4),
+            vec![None, Some(0), Some(1), None]
+        );
+        assert!(history.snapshot_literal_levels(0).is_empty());
+        let grown_snapshot = history.snapshot_literal_levels(history.levels.len() + 2);
+        assert_eq!(grown_snapshot[100_000], Some(1));
+        assert_eq!(&grown_snapshot[history.levels.len()..], &[None, None]);
+        history.remap_clause_indices(&[Some(0), None]);
+        assert_eq!(history.get_reason(&root), None);
+        assert_eq!(history.get_reason(&extension), None);
+    }
+
+    #[test]
+    fn flat_rollback_and_root_rewind_reuse_allocations() {
+        let mut history = History::new();
+        let mut assignment = Assignment::new(100_001);
+        let root = Literal::new(1);
+        let high = Literal::new(-100_000);
+        assignment.assign_literal(root);
+        assignment.assign_literal(high);
+        assignment.assign_literal(Literal::new(2));
+        history.add_implication(&root, Some(3));
+        history.add_decision(&high);
+        history.add_implication(&Literal::new(2), Some(9));
+        let pointers = (
+            history.trail.as_ptr(),
+            history.limits.as_ptr(),
+            history.reasons.as_ptr(),
+            history.levels.as_ptr(),
+        );
+        let capacities = (
+            history.trail.capacity(),
+            history.limits.capacity(),
+            history.reasons.capacity(),
+            history.levels.capacity(),
+        );
+        assert_eq!(
+            history.revert_decision_collect_reasons(1, &mut assignment),
+            vec![9]
+        );
+        let removed_reasons_pointer = history.removed_reasons.as_ptr();
+        let removed_reasons_capacity = history.removed_reasons.capacity();
+        assert_eq!(history.rewind_root_implications(&mut assignment), &[3]);
+        assert_eq!(history.removed_reasons.as_ptr(), removed_reasons_pointer);
+        assert_eq!(history.removed_reasons.capacity(), removed_reasons_capacity);
+        assert!(
+            history
+                .revert_decision_collect_reasons(0, &mut assignment)
+                .is_empty()
+        );
+        assert_eq!(history.removed_reasons.as_ptr(), removed_reasons_pointer);
+        assert_eq!(history.removed_reasons.capacity(), removed_reasons_capacity);
+        assignment.assign_literal(high);
+        history.add_decision(&high);
+        assignment.assign_literal(root);
+        history.add_implication(&root, None);
+        assignment.assign_literal(Literal::new(2));
+        history.add_implication(&Literal::new(2), None);
+        assert_eq!(history.get_reason(&root), None);
+        assert_eq!(history.get_literal_level(&root.negated()), Some(1));
+
+        assert_eq!(
+            pointers,
+            (
+                history.trail.as_ptr(),
+                history.limits.as_ptr(),
+                history.reasons.as_ptr(),
+                history.levels.as_ptr()
+            )
+        );
+        assert_eq!(
+            capacities,
+            (
+                history.trail.capacity(),
+                history.limits.capacity(),
+                history.reasons.capacity(),
+                history.levels.capacity()
+            )
+        );
+        history.revert_decision(1, &mut assignment);
+        assignment.assign_literal(high);
+        assignment.assign_literal(root);
+        history.add_decision(&high);
+        history.add_implication(&root, Some(9));
+        assert_eq!(
+            history.revert_decision_collect_reasons(1, &mut assignment),
+            &[9]
+        );
+        assert_eq!(history.removed_reasons.as_ptr(), removed_reasons_pointer);
+        assert_eq!(history.removed_reasons.capacity(), removed_reasons_capacity);
+    }
+
+    #[test]
+    #[should_panic(expected = "backtrack before rewinding root implications")]
+    fn root_rewind_rejects_nonroot_history() {
+        let mut history = History::new();
+        history.add_decision(&Literal::new(1));
+        history.rewind_root_implications(&mut Assignment::new(2));
+    }
 
     #[test]
     fn no_decisions() {
@@ -314,8 +556,7 @@ mod history {
         let lit2 = Literal::new(2);
         assert!(
             history
-                .implication_levels_indexes
-                .get_level(&lit2)
+                .get_literal_level(&lit2)
                 .is_some_and(|level| level == 1)
         );
         assert!(
